@@ -1,0 +1,2730 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Numerics;
+using System.Text;
+
+namespace MiniDynLang
+{
+    // Exceptions
+    public class MiniDynException : Exception
+    {
+        public int Line { get; }
+        public int Column { get; }
+        public MiniDynException(string message, int line = -1, int column = -1) : base(message)
+        {
+            Line = line; Column = column;
+        }
+        public override string ToString()
+        {
+            if (Line >= 0) return $"{Message} at {Line}:{Column}";
+            return Message;
+        }
+    }
+    public sealed class MiniDynLexError : MiniDynException { public MiniDynLexError(string msg, int l, int c) : base(msg, l, c) { } }
+    public sealed class MiniDynParseError : MiniDynException { public MiniDynParseError(string msg, int l, int c) : base(msg, l, c) { } }
+    public sealed class MiniDynRuntimeError : MiniDynException { public MiniDynRuntimeError(string msg) : base(msg) { } }
+
+    // Value system
+    public enum ValueType { Number, String, Boolean, Nil, Function, Array, Object }
+
+    public readonly struct NumberValue
+    {
+        public enum NumKind { Int, Double, BigInt }
+        public NumKind Kind { get; }
+        public long I64 { get; }
+        public double Dbl { get; }
+        public BigInteger BigInt { get; }
+
+        private NumberValue(long i) { Kind = NumKind.Int; I64 = i; Dbl = 0; BigInt = default; }
+        private NumberValue(double d) { Kind = NumKind.Double; Dbl = d; I64 = 0; BigInt = default; }
+        private NumberValue(BigInteger b) { Kind = NumKind.BigInt; BigInt = b; I64 = 0; Dbl = 0; }
+
+        public static NumberValue FromLong(long i) => new NumberValue(i);
+        public static NumberValue FromDouble(double d) => new NumberValue(d);
+        public static NumberValue FromBigInt(BigInteger b) => new NumberValue(b);
+
+        public static bool TryFromString(string s, out NumberValue nv)
+        {
+            if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+            {
+                nv = FromLong(i); return true;
+            }
+            if (BigInteger.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bi))
+            {
+                nv = FromBigInt(bi); return true;
+            }
+            if (double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var d))
+            {
+                nv = FromDouble(d); return true;
+            }
+            nv = default; return false;
+        }
+
+        public override string ToString()
+        {
+            return Kind switch
+            {
+                NumKind.Int => I64.ToString(CultureInfo.InvariantCulture),
+                NumKind.Double => Dbl.ToString("R", CultureInfo.InvariantCulture),
+                NumKind.BigInt => BigInt.ToString(CultureInfo.InvariantCulture),
+                _ => "0"
+            };
+        }
+
+        private static bool IsIntegralDouble(double d) => Math.Floor(d) == d && !double.IsInfinity(d) && !double.IsNaN(d);
+
+        public NumberValue ToDoubleNV()
+        {
+            return Kind switch
+            {
+                NumKind.Double => this,
+                NumKind.Int => FromDouble((double)I64),
+                NumKind.BigInt => FromDouble((double)BigInt),
+                _ => FromDouble(0)
+            };
+        }
+        public NumberValue ToBigIntNV()
+        {
+            return Kind switch
+            {
+                NumKind.BigInt => this,
+                NumKind.Int => FromBigInt(new BigInteger(I64)),
+                NumKind.Double => IsIntegralDouble(Dbl) ? FromBigInt(new BigInteger(Dbl)) : FromDouble(Dbl),
+                _ => FromBigInt(BigInteger.Zero)
+            };
+        }
+
+        public static void Promote(NumberValue a, NumberValue b, out NumberValue A, out NumberValue B)
+        {
+            if (a.Kind == NumKind.Double || b.Kind == NumKind.Double)
+            {
+                A = a.ToDoubleNV();
+                B = b.ToDoubleNV();
+                return;
+            }
+            if (a.Kind == NumKind.BigInt || b.Kind == NumKind.BigInt)
+            {
+                A = a.ToBigIntNV();
+                B = b.ToBigIntNV();
+                return;
+            }
+            A = a; B = b;
+        }
+
+        public static NumberValue FromBool(bool b) => FromLong(b ? 1 : 0);
+        public static NumberValue Neg(in NumberValue x)
+        {
+            return x.Kind switch
+            {
+                NumKind.Int => FromLong(-x.I64),
+                NumKind.BigInt => FromBigInt(-x.BigInt),
+                NumKind.Double => FromDouble(-x.Dbl),
+                _ => FromLong(0)
+            };
+        }
+        public static NumberValue Add(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Int => FromLong(A.I64 + B.I64),
+                NumKind.BigInt => FromBigInt(A.BigInt + B.BigInt),
+                NumKind.Double => FromDouble(A.Dbl + B.Dbl),
+                _ => FromLong(0)
+            };
+        }
+        public static NumberValue Sub(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Int => FromLong(A.I64 - B.I64),
+                NumKind.BigInt => FromBigInt(A.BigInt - B.BigInt),
+                NumKind.Double => FromDouble(A.Dbl - B.Dbl),
+                _ => FromLong(0)
+            };
+        }
+        public static NumberValue Mul(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Int => FromLong(A.I64 * B.I64),
+                NumKind.BigInt => FromBigInt(A.BigInt * B.BigInt),
+                NumKind.Double => FromDouble(A.Dbl * B.Dbl),
+                _ => FromLong(0)
+            };
+        }
+        public static NumberValue Div(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Double => (B.Dbl == 0) ? throw new MiniDynRuntimeError("Division by zero") : FromDouble(A.Dbl / B.Dbl),
+                NumKind.BigInt =>
+                    B.BigInt.IsZero ? throw new MiniDynRuntimeError("Division by zero") :
+                    (A.BigInt % B.BigInt == 0 ? FromBigInt(A.BigInt / B.BigInt) : FromDouble((double)A.BigInt / (double)B.BigInt)),
+                NumKind.Int =>
+                    (B.I64 == 0) ? throw new MiniDynRuntimeError("Division by zero") :
+                    (A.I64 % B.I64 == 0 ? FromLong(A.I64 / B.I64) : FromDouble((double)A.I64 / (double)B.I64)),
+                _ => FromLong(0)
+            };
+        }
+        public static NumberValue Mod(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Double => (B.Dbl == 0) ? throw new MiniDynRuntimeError("Division by zero") : FromDouble(A.Dbl % B.Dbl),
+                NumKind.BigInt => B.BigInt.IsZero ? throw new MiniDynRuntimeError("Division by zero") : FromBigInt(A.BigInt % B.BigInt),
+                NumKind.Int => (B.I64 == 0) ? throw new MiniDynRuntimeError("Division by zero") : FromLong(A.I64 % B.I64),
+                _ => FromLong(0)
+            };
+        }
+        public static int Compare(in NumberValue a, in NumberValue b)
+        {
+            Promote(a, b, out var A, out var B);
+            return A.Kind switch
+            {
+                NumKind.Int => A.I64.CompareTo(B.I64),
+                NumKind.BigInt => A.BigInt.CompareTo(B.BigInt),
+                NumKind.Double => A.Dbl.CompareTo(B.Dbl),
+                _ => 0
+            };
+        }
+
+        public override int GetHashCode()
+        {
+            return Kind switch
+            {
+                NumKind.Int => I64.GetHashCode(),
+                NumKind.Double => Dbl.GetHashCode(),
+                NumKind.BigInt => BigInt.GetHashCode(),
+                _ => 0
+            };
+        }
+        public override bool Equals(object obj)
+        {
+            if (obj is not NumberValue n) return false;
+            if (Kind == n.Kind)
+            {
+                return Kind switch
+                {
+                    NumKind.Int => I64 == n.I64,
+                    NumKind.Double => Dbl.Equals(n.Dbl),
+                    NumKind.BigInt => BigInt.Equals(n.BigInt),
+                    _ => false
+                };
+            }
+            return Compare(this, n) == 0;
+        }
+    }
+
+    public sealed class ArrayValue
+    {
+        public readonly List<Value> Items;
+        public ArrayValue() { Items = new List<Value>(); }
+        public ArrayValue(IEnumerable<Value> items) { Items = new List<Value>(items); }
+        public int Length => Items.Count;
+        public Value this[int idx]
+        {
+            get => Items[idx];
+            set => Items[idx] = value;
+        }
+        public ArrayValue Clone() => new ArrayValue(Items);
+        public override string ToString()
+        {
+            var sb = new StringBuilder();
+            sb.Append('[');
+            for (int i = 0; i < Items.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(Items[i].ToString());
+            }
+            sb.Append(']');
+            return sb.ToString();
+        }
+    }
+
+    public sealed class ObjectValue
+    {
+        public readonly Dictionary<string, Value> Props;
+        public ObjectValue() { Props = new Dictionary<string, Value>(); }
+        public ObjectValue(Dictionary<string, Value> dict) { Props = dict ?? new Dictionary<string, Value>(); }
+        public bool TryGet(string key, out Value v) => Props.TryGetValue(key, out v);
+        public void Set(string key, Value v) => Props[key] = v;
+        public bool Remove(string key) => Props.Remove(key);
+        public int Count => Props.Count;
+        public ObjectValue CloneShallow()
+        {
+            return new ObjectValue(new Dictionary<string, Value>(Props));
+        }
+        public override string ToString()
+        {
+            var sb = new StringBuilder();
+            sb.Append('{');
+            bool first = true;
+            foreach (var kv in Props)
+            {
+                if (!first) sb.Append(", ");
+                first = false;
+                sb.Append(kv.Key);
+                sb.Append(": ");
+                sb.Append(kv.Value.ToString());
+            }
+            sb.Append('}');
+            return sb.ToString();
+        }
+    }
+
+    public sealed class Value
+    {
+        public ValueType Type { get; }
+        private readonly NumberValue _num;
+        private readonly string _str;
+        private readonly bool _bool;
+        private readonly ICallable _func;
+        private readonly ArrayValue _arr;
+        private readonly ObjectValue _obj;
+
+        private static readonly Value TrueVal = new Value(ValueType.Boolean, default, null, true, null, null, null);
+        private static readonly Value FalseVal = new Value(ValueType.Boolean, default, null, false, null, null, null);
+        private static readonly Value NilVal = new Value(ValueType.Nil, default, null, false, null, null, null);
+
+        private Value(ValueType t, NumberValue n, string s, bool b, ICallable f, ArrayValue a, ObjectValue o)
+        {
+            Type = t; _num = n; _str = s; _bool = b; _func = f; _arr = a; _obj = o;
+        }
+
+        public static Value Number(NumberValue n) => new Value(ValueType.Number, n, null, false, null, null, null);
+        public static Value String(string s) => new Value(ValueType.String, default, s ?? "", false, null, null, null);
+        public static Value Boolean(bool b) => b ? TrueVal : FalseVal;
+        public static Value Nil() => NilVal;
+        public static Value Function(ICallable f) => new Value(ValueType.Function, default, null, false, f, null, null);
+        public static Value Array(ArrayValue a) => new Value(ValueType.Array, default, null, false, null, a ?? new ArrayValue(), null);
+        public static Value Object(ObjectValue o) => new Value(ValueType.Object, default, null, false, null, null, o ?? new ObjectValue());
+
+        public NumberValue AsNumber() => Type == ValueType.Number ? _num : throw new MiniDynRuntimeError("Expected number");
+        public string AsString() => Type == ValueType.String ? _str : throw new MiniDynRuntimeError("Expected string");
+        public bool AsBoolean() => Type == ValueType.Boolean ? _bool : throw new MiniDynRuntimeError("Expected boolean");
+        public ICallable AsFunction() => Type == ValueType.Function ? _func : throw new MiniDynRuntimeError("Expected function");
+        public ArrayValue AsArray() => Type == ValueType.Array ? _arr : throw new MiniDynRuntimeError("Expected array");
+        public ObjectValue AsObject() => Type == ValueType.Object ? _obj : throw new MiniDynRuntimeError("Expected object");
+
+        public override string ToString()
+        {
+            return Type switch
+            {
+                ValueType.Number => _num.ToString(),
+                ValueType.String => _str,
+                ValueType.Boolean => _bool ? "true" : "false",
+                ValueType.Function => _func.ToString(),
+                ValueType.Array => _arr.ToString(),
+                ValueType.Object => _obj.ToString(),
+                _ => "nil"
+            };
+        }
+
+        public static bool IsTruthy(Value v)
+        {
+            return v.Type switch
+            {
+                ValueType.Nil => false,
+                ValueType.Boolean => v._bool,
+                ValueType.Number => NumberValue.Compare(v._num, NumberValue.FromLong(0)) != 0,
+                ValueType.String => !string.IsNullOrEmpty(v._str),
+                ValueType.Function => true,
+                ValueType.Array => v._arr.Length != 0,
+                ValueType.Object => v._obj.Count != 0,
+                _ => false
+            };
+        }
+
+        public override bool Equals(object obj)
+        {
+            if (obj is not Value o || o.Type != Type) return false;
+            return Type switch
+            {
+                ValueType.Nil => true,
+                ValueType.Boolean => _bool == o._bool,
+                ValueType.Number => NumberValue.Compare(_num, o._num) == 0,
+                ValueType.String => _str == o._str,
+                ValueType.Function => ReferenceEquals(_func, o._func),
+                ValueType.Array => ReferenceEquals(_arr, o._arr),
+                ValueType.Object => ReferenceEquals(_obj, o._obj),
+                _ => false
+            };
+        }
+        public override int GetHashCode()
+        {
+            return Type switch
+            {
+                ValueType.Nil => 0,
+                ValueType.Boolean => _bool.GetHashCode(),
+                ValueType.Number => _num.GetHashCode(),
+                ValueType.String => _str?.GetHashCode() ?? 0,
+                ValueType.Function => _func.GetHashCode(),
+                ValueType.Array => _arr.GetHashCode(),
+                ValueType.Object => _obj.GetHashCode(),
+                _ => 0
+            };
+        }
+    }
+
+    // Lexer
+    public enum TokenType
+    {
+        EOF,
+        Identifier,
+        Number,
+        String,
+
+        Var,
+        Let,
+        Const,
+
+        If,
+        Else,
+        While,
+        Break,
+        Continue,
+
+        True,
+        False,
+        Nil,
+        And,
+        Or,
+        Not,
+
+        Fn,
+        Return,
+
+        Plus, Minus, Star, Slash, Percent,
+        PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign,
+
+        LParen, RParen,
+        LBrace, RBrace,
+        LBracket, RBracket,
+        Semicolon, Comma,
+        Assign, // =
+        Equal, NotEqual, Less, LessEq, Greater, GreaterEq,
+        Question, Colon, // ternary
+        Ellipsis, // ...
+        Dot // .
+    }
+
+    public class Token
+    {
+        public TokenType Type { get; }
+        public string Lexeme { get; }
+        public object Literal { get; }
+        public int Position { get; }
+        public int Line { get; }
+        public int Column { get; }
+
+        public Token(TokenType type, string lexeme, object literal, int pos, int line, int column)
+        {
+            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column;
+        }
+        public override string ToString() => $"{Type} '{Lexeme}' @ {Line}:{Column}";
+    }
+
+    public class Lexer
+    {
+        private readonly string _src;
+        private int _pos;
+        private int _line = 1;
+        private int _col = 1;
+
+        private static readonly Dictionary<string, TokenType> Keywords = new()
+        {
+            ["var"] = TokenType.Var,
+            ["let"] = TokenType.Let,
+            ["const"] = TokenType.Const,
+            ["if"] = TokenType.If,
+            ["else"] = TokenType.Else,
+            ["while"] = TokenType.While,
+            ["break"] = TokenType.Break,
+            ["continue"] = TokenType.Continue,
+            ["true"] = TokenType.True,
+            ["false"] = TokenType.False,
+            ["nil"] = TokenType.Nil,
+            ["and"] = TokenType.And,
+            ["or"] = TokenType.Or,
+            ["not"] = TokenType.Not,
+            ["fn"] = TokenType.Fn,
+            ["return"] = TokenType.Return,
+        };
+
+        public Lexer(string src) { _src = src ?? ""; }
+
+        private bool IsAtEnd => _pos >= _src.Length;
+        private char Peek() => IsAtEnd ? '\0' : _src[_pos];
+        private char PeekNext() => (_pos + 1 < _src.Length) ? _src[_pos + 1] : '\0';
+        private char PeekNext2() => (_pos + 2 < _src.Length) ? _src[_pos + 2] : '\0';
+
+        private char Advance()
+        {
+            char c = _src[_pos++];
+            if (c == '\n') { _line++; _col = 1; }
+            else { _col++; }
+            return c;
+        }
+
+        private void SkipWhitespaceAndComments()
+        {
+            while (!IsAtEnd)
+            {
+                char c = Peek();
+                if (char.IsWhiteSpace(c)) { Advance(); }
+                else if (c == '/' && PeekNext() == '/')
+                {
+                    while (!IsAtEnd && Peek() != '\n') Advance();
+                }
+                else if (c == '/' && PeekNext() == '*')
+                {
+                    // block comment /* ... */
+                    Advance(); Advance();
+                    while (!IsAtEnd && !(Peek() == '*' && PeekNext() == '/')) Advance();
+                    if (IsAtEnd) throw new MiniDynLexError("Unterminated block comment", _line, _col);
+                    Advance(); Advance(); // consume */
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+
+        private Token MakeToken(TokenType t, string lexeme, object lit, int startPos, int startLine, int startCol)
+            => new Token(t, lexeme, lit, startPos, startLine, startCol);
+
+        public Token NextToken()
+        {
+            SkipWhitespaceAndComments();
+            int start = _pos;
+            int startLine = _line;
+            int startCol = _col;
+
+            if (IsAtEnd) return MakeToken(TokenType.EOF, "", null, _pos, _line, _col);
+
+            char c = Advance();
+            switch (c)
+            {
+                case '(':
+                    return MakeToken(TokenType.LParen, "(", null, start, startLine, startCol);
+                case ')':
+                    return MakeToken(TokenType.RParen, ")", null, start, startLine, startCol);
+                case '{':
+                    return MakeToken(TokenType.LBrace, "{", null, start, startLine, startCol);
+                case '}':
+                    return MakeToken(TokenType.RBrace, "}", null, start, startLine, startCol);
+                case '[':
+                    return MakeToken(TokenType.LBracket, "[", null, start, startLine, startCol);
+                case ']':
+                    return MakeToken(TokenType.RBracket, "]", null, start, startLine, startCol);
+                case ';':
+                    return MakeToken(TokenType.Semicolon, ";", null, start, startLine, startCol);
+                case ',':
+                    return MakeToken(TokenType.Comma, ",", null, start, startLine, startCol);
+                case '+':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.PlusAssign, "+=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Plus, "+", null, start, startLine, startCol);
+                case '-':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.MinusAssign, "-=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Minus, "-", null, start, startLine, startCol);
+                case '*':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.StarAssign, "*=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Star, "*", null, start, startLine, startCol);
+                case '/':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.SlashAssign, "/=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Slash, "/", null, start, startLine, startCol);
+                case '%':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.PercentAssign, "%=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Percent, "%", null, start, startLine, startCol);
+                case '?':
+                    return MakeToken(TokenType.Question, "?", null, start, startLine, startCol);
+                case ':':
+                    return MakeToken(TokenType.Colon, ":", null, start, startLine, startCol);
+                case '.':
+                    if (Peek() == '.' && PeekNext() == '.')
+                    {
+                        Advance(); Advance();
+                        return MakeToken(TokenType.Ellipsis, "...", null, start, startLine, startCol);
+                    }
+                    return MakeToken(TokenType.Dot, ".", null, start, startLine, startCol);
+                case '!':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.NotEqual, "!=", null, start, startLine, startCol); }
+                    throw new MiniDynLexError("Unexpected '!'", startLine, startCol);
+                case '=':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.Equal, "==", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Assign, "=", null, start, startLine, startCol);
+                case '<':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.LessEq, "<=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Less, "<", null, start, startLine, startCol);
+                case '>':
+                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.GreaterEq, ">=", null, start, startLine, startCol); }
+                    return MakeToken(TokenType.Greater, ">", null, start, startLine, startCol);
+                case '"':
+                    return StringToken(start, startLine, startCol);
+            }
+
+            if (char.IsDigit(c))
+            {
+                return NumberToken(start, startLine, startCol);
+            }
+
+            if (char.IsLetter(c) || c == '_')
+            {
+                return IdentifierToken(start, startLine, startCol);
+            }
+
+            throw new MiniDynLexError($"Unexpected character '{c}'", startLine, startCol);
+        }
+
+        private Token StringToken(int start, int startLine, int startCol)
+        {
+            StringBuilder sb = new();
+            while (!IsAtEnd && Peek() != '"')
+            {
+                char c = Advance();
+                if (c == '\\' && !IsAtEnd)
+                {
+                    char e = Advance();
+                    c = e switch
+                    {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '"' => '"',
+                        '\\' => '\\',
+                        '0' => '\0',
+                        _ => e
+                    };
+                }
+                sb.Append(c);
+            }
+            if (IsAtEnd) throw new MiniDynLexError("Unterminated string", startLine, startCol);
+            Advance(); // closing "
+            string text = sb.ToString();
+            return MakeToken(TokenType.String, text, text, start, startLine, startCol);
+        }
+
+        private Token NumberToken(int start, int startLine, int startCol)
+        {
+            bool hasDot = false;
+            while (true)
+            {
+                char p = Peek();
+                if (char.IsDigit(p)) { Advance(); continue; }
+                if (!hasDot && p == '.' && char.IsDigit(PeekNext()))
+                {
+                    hasDot = true; Advance(); continue;
+                }
+                break;
+            }
+            string text = _src.Substring(start, _pos - start);
+            object lit;
+            if (hasDot)
+            {
+                double d = double.Parse(text, CultureInfo.InvariantCulture);
+                lit = NumberValue.FromDouble(d);
+            }
+            else
+            {
+                if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+                    lit = NumberValue.FromLong(i);
+                else
+                    lit = NumberValue.FromBigInt(BigInteger.Parse(text, CultureInfo.InvariantCulture));
+            }
+            return MakeToken(TokenType.Number, text, lit, start, startLine, startCol);
+        }
+
+        private Token IdentifierToken(int start, int startLine, int startCol)
+        {
+            while (char.IsLetterOrDigit(Peek()) || Peek() == '_') Advance();
+            string text = _src.Substring(start, _pos - start);
+            if (Keywords.TryGetValue(text, out var kw))
+                return MakeToken(kw, text, null, start, startLine, startCol);
+            return MakeToken(TokenType.Identifier, text, text, start, startLine, startCol);
+        }
+    }
+
+    // AST
+    public abstract class Expr
+    {
+        public interface IVisitor<T>
+        {
+            T VisitLiteral(Literal e);
+            T VisitVariable(Variable e);
+            T VisitAssign(Assign e);
+            T VisitUnary(Unary e);
+            T VisitBinary(Binary e);
+            T VisitLogical(Logical e);
+            T VisitCall(Call e);
+            T VisitGrouping(Grouping e);
+            T VisitFunction(Function e);
+            T VisitTernary(Ternary e);
+            T VisitIndex(Index e);
+            T VisitArrayLiteral(ArrayLiteral e);
+            T VisitObjectLiteral(ObjectLiteral e);
+            T VisitProperty(Property e);
+            T VisitDestructuringAssign(DestructuringAssign e);
+        }
+        public abstract T Accept<T>(IVisitor<T> v);
+
+        public sealed class Literal : Expr
+        {
+            public Value Value;
+            public Literal(Value v) { Value = v; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitLiteral(this);
+        }
+        public sealed class Variable : Expr
+        {
+            public string Name;
+            public Variable(string name) { Name = name; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitVariable(this);
+        }
+        public sealed class Assign : Expr
+        {
+            public Expr Target; // Variable | Property | Index
+            public Token Op;    // =, +=, -=, *=, /=, %=
+            public Expr Value;
+            public Assign(Expr target, Token op, Expr value) { Target = target; Op = op; Value = value; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitAssign(this);
+        }
+        public sealed class Unary : Expr
+        {
+            public Token Op; public Expr Right;
+            public Unary(Token op, Expr right) { Op = op; Right = right; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitUnary(this);
+        }
+        public sealed class Binary : Expr
+        {
+            public Expr Left; public Token Op; public Expr Right;
+            public Binary(Expr l, Token op, Expr r) { Left = l; Op = op; Right = r; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitBinary(this);
+        }
+        public sealed class Logical : Expr
+        {
+            public Expr Left; public Token Op; public Expr Right;
+            public Logical(Expr l, Token op, Expr r) { Left = l; Op = op; Right = r; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitLogical(this);
+        }
+        public sealed class Call : Expr
+        {
+            public Expr Callee; public List<Expr> Args;
+            public Call(Expr callee, List<Expr> args) { Callee = callee; Args = args; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitCall(this);
+        }
+        public sealed class Grouping : Expr
+        {
+            public Expr Inner;
+            public Grouping(Expr inner) { Inner = inner; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitGrouping(this);
+        }
+        public sealed class Function : Expr
+        {
+            public List<Param> Parameters;
+            public Stmt.Block Body;
+            public Function(List<Param> parameters, Stmt.Block body) { Parameters = parameters; Body = body; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitFunction(this);
+        }
+        public sealed class Ternary : Expr
+        {
+            public Expr Cond, Then, Else;
+            public Ternary(Expr cond, Expr thenE, Expr elseE) { Cond = cond; Then = thenE; Else = elseE; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitTernary(this);
+        }
+        public sealed class Index : Expr
+        {
+            public Expr Target;
+            public Expr IndexExpr;
+            public Index(Expr t, Expr i) { Target = t; IndexExpr = i; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitIndex(this);
+        }
+        public sealed class ArrayLiteral : Expr
+        {
+            public List<Expr> Elements;
+            public ArrayLiteral(List<Expr> elems) { Elements = elems; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitArrayLiteral(this);
+        }
+        public sealed class ObjectLiteral : Expr
+        {
+            public sealed class Entry
+            {
+                public string KeyName; // when identifier key or string literal
+                public Expr KeyExpr;   // when computed key
+                public Expr ValueExpr;
+                public Entry(string keyName, Expr keyExpr, Expr valueExpr) { KeyName = keyName; KeyExpr = keyExpr; ValueExpr = valueExpr; }
+            }
+            public List<Entry> Entries;
+            public ObjectLiteral(List<Entry> entries) { Entries = entries; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitObjectLiteral(this);
+        }
+        public sealed class Property : Expr
+        {
+            public Expr Target;
+            public string Name;
+            public Property(Expr target, string name) { Target = target; Name = name; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitProperty(this);
+        }
+
+        // Destructuring assignment expression: pattern = value
+        public sealed class DestructuringAssign : Expr
+        {
+            public Pattern Pat;
+            public Expr Value;
+            public DestructuringAssign(Pattern pat, Expr val) { Pat = pat; Value = val; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitDestructuringAssign(this);
+        }
+
+        // Patterns for destructuring
+        public abstract class Pattern
+        {
+            public abstract void Bind(Interpreter interp, Value source, Action<string, Value> assignLocal, bool allowConstReassign);
+        }
+
+        public sealed class PatternIdentifier : Pattern
+        {
+            public string Name;
+            public PatternIdentifier(string n) { Name = n; }
+            public override void Bind(Interpreter interp, Value source, Action<string, Value> assignLocal, bool allowConstReassign)
+            {
+                assignLocal(Name, source);
+            }
+        }
+
+        public sealed class PatternArray : Pattern
+        {
+            public sealed class Elem
+            {
+                public Pattern Inner;
+                public Expr Default; // optional
+                public Elem(Pattern inner, Expr def) { Inner = inner; Default = def; }
+            }
+            public List<Elem> Elements;
+            public bool HasRest;
+            public Pattern RestPattern; // PatternIdentifier or nested
+            public PatternArray(List<Elem> elements, bool hasRest = false, Pattern rest = null)
+            {
+                Elements = elements; HasRest = hasRest; RestPattern = rest;
+            }
+
+            public override void Bind(Interpreter interp, Value source, Action<string, Value> assignLocal, bool allowConstReassign)
+            {
+                var arr = source.Type == ValueType.Array ? source.AsArray() : new ArrayValue();
+                int idx = 0;
+                foreach (var el in Elements)
+                {
+                    Value v;
+                    if (idx < arr.Length)
+                    {
+                        v = arr[idx];
+                        if (v.Type == ValueType.Nil && el.Default != null)
+                            v = interp.EvaluateWithEnv(el.Default, interp.CurrentEnv);
+                    }
+                    else
+                    {
+                        v = el.Default != null
+                            ? interp.EvaluateWithEnv(el.Default, interp.CurrentEnv)
+                            : Value.Nil();
+                    }
+                    el.Inner.Bind(interp, v, assignLocal, allowConstReassign);
+                    idx++;
+                }
+                if (HasRest && RestPattern != null)
+                {
+                    var rest = new ArrayValue();
+                    for (; idx < arr.Length; idx++) rest.Items.Add(arr[idx]);
+                    RestPattern.Bind(interp, Value.Array(rest), assignLocal, allowConstReassign);
+                }
+            }
+        }
+
+        public sealed class PatternObject : Pattern
+        {
+            public sealed class Prop
+            {
+                public string SourceKey;
+                public Pattern TargetPattern; // often PatternIdentifier
+                public Expr Default;
+                public Prop(string key, Pattern pat, Expr def) { SourceKey = key; TargetPattern = pat; Default = def; }
+            }
+
+            public List<Prop> Props;
+            public bool HasRest;
+            public Pattern RestPattern; // binds remaining keys as object
+            public PatternObject(List<Prop> props, bool hasRest = false, Pattern rest = null)
+            {
+                Props = props; HasRest = hasRest; RestPattern = rest;
+            }
+
+            public override void Bind(Interpreter interp, Value source, Action<string, Value> assignLocal, bool allowConstReassign)
+            {
+                var obj = source.Type == ValueType.Object ? source.AsObject() : new ObjectValue();
+                var used = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var p in Props)
+                {
+                    Value v;
+                    if (obj.TryGet(p.SourceKey, out var vv))
+                    {
+                        used.Add(p.SourceKey);
+                        v = vv;
+                    }
+                    else if (p.Default != null)
+                        v = interp.EvaluateWithEnv(p.Default, interp.CurrentEnv);
+                    else
+                        v = Value.Nil();
+                    p.TargetPattern.Bind(interp, v, assignLocal, allowConstReassign);
+                }
+                if (HasRest && RestPattern != null)
+                {
+                    var rest = new ObjectValue();
+                    foreach (var kv in obj.Props)
+                    {
+                        if (!used.Contains(kv.Key)) rest.Set(kv.Key, kv.Value);
+                    }
+                    RestPattern.Bind(interp, Value.Object(rest), assignLocal, allowConstReassign);
+                }
+            }
+        }
+
+        public sealed class PatternLValue : Pattern
+        {
+            public Expr LValue;
+            public PatternLValue(Expr lv) { LValue = lv; }
+            public override void Bind(Interpreter interp, Value source, Action<string, Value> assignLocal, bool allowConstReassign)
+            {
+                // reuse the same assignment machinery as for := by creating a temporary Assign expr
+                // However we need to perform direct assignment into the lvalue.
+                // Build a fake Assign with '=' and evaluate it in current env:
+                var assign = new Expr.Assign(LValue, new Token(TokenType.Assign, "=", null, 0, 0, 0), new Expr.Literal(source));
+                interp.EvaluateWithEnv(assign, interp.CurrentEnv);
+            }
+        }
+        public sealed class Param
+        {
+            public string Name;
+            public Expr Default;
+            public bool IsRest;
+            public Param(string name, Expr def = null, bool isRest = false)
+            {
+                Name = name; Default = def; IsRest = isRest;
+            }
+        }
+    }
+
+    public abstract class Stmt
+    {
+        public interface IVisitor<T>
+        {
+            T VisitExpr(ExprStmt s);
+            T VisitVar(Var s);
+            T VisitLet(Let s);
+            T VisitConst(Const s);
+            T VisitBlock(Block s);
+            T VisitIf(If s);
+            T VisitWhile(While s);
+            T VisitFunction(Function s);
+            T VisitReturn(Return s);
+            T VisitBreak(Break s);
+            T VisitContinue(Continue s);
+            T VisitDestructuringDecl(DestructuringDecl s);
+        }
+        public abstract T Accept<T>(IVisitor<T> v);
+
+        public sealed class ExprStmt : Stmt
+        {
+            public Expr Expression;
+            public ExprStmt(Expr e) { Expression = e; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitExpr(this);
+        }
+        public sealed class Var : Stmt
+        {
+            public string Name; public Expr Initializer;
+            public Var(string name, Expr init) { Name = name; Initializer = init; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitVar(this);
+        }
+        public sealed class Let : Stmt
+        {
+            public string Name; public Expr Initializer;
+            public Let(string name, Expr init) { Name = name; Initializer = init; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitLet(this);
+        }
+        public sealed class Const : Stmt
+        {
+            public string Name; public Expr Initializer;
+            public Const(string name, Expr init) { Name = name; Initializer = init; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitConst(this);
+        }
+        public sealed class DestructuringDecl : Stmt
+        {
+            public Expr.Pattern Pattern;
+            public Expr Initializer;
+            public enum Kind { Var, Let, Const }
+            public Kind DeclKind;
+            public DestructuringDecl(Expr.Pattern pat, Expr init, Kind kind) { Pattern = pat; Initializer = init; DeclKind = kind; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitDestructuringDecl(this);
+        }
+        public sealed class Block : Stmt
+        {
+            public List<Stmt> Statements;
+            public Block(List<Stmt> st) { Statements = st; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitBlock(this);
+        }
+        public sealed class If : Stmt
+        {
+            public Expr Condition; public Stmt Then; public Stmt Else;
+            public If(Expr cond, Stmt thenS, Stmt elseS) { Condition = cond; Then = thenS; Else = elseS; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitIf(this);
+        }
+        public sealed class While : Stmt
+        {
+            public Expr Condition; public Stmt Body;
+            public While(Expr cond, Stmt body) { Condition = cond; Body = body; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitWhile(this);
+        }
+        public sealed class Function : Stmt
+        {
+            public string Name;
+            public Expr.Function FuncExpr;
+            public Function(string name, Expr.Function expr) { Name = name; FuncExpr = expr; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitFunction(this);
+        }
+        public sealed class Return : Stmt
+        {
+            public Expr Value;
+            public Return(Expr value) { Value = value; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitReturn(this);
+        }
+        public sealed class Break : Stmt
+        {
+            public override T Accept<T>(IVisitor<T> v) => v.VisitBreak(this);
+        }
+        public sealed class Continue : Stmt
+        {
+            public override T Accept<T>(IVisitor<T> v) => v.VisitContinue(this);
+        }
+    }
+
+    // Parser
+    public class Parser
+    {
+        private readonly List<Token> _tokens;
+        private int _current;
+
+        public Parser(Lexer lexer)
+        {
+            _tokens = new List<Token>();
+            Token t;
+            do { t = lexer.NextToken(); _tokens.Add(t); } while (t.Type != TokenType.EOF);
+        }
+
+        private Expr.Pattern ParseAliasPatternOrLValue()
+        {
+            if (!Check(TokenType.Identifier))
+                return ParseSinglePattern();
+
+            var baseTok = Advance();
+            Expr expr = new Expr.Variable((string)baseTok.Literal);
+            
+            bool hasAccessor = false;          // did we see '.' or '[' ?
+
+            while (true)
+            {
+                if (Match(TokenType.Dot))
+                {
+                    var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
+                    expr = new Expr.Property(expr, (string)nameTok.Literal);
+                    hasAccessor = true;
+                }
+                else if (Match(TokenType.LBracket))
+                {
+                    var idx = Expression();
+                    Consume(TokenType.RBracket, "Expected ']'");
+                    expr = new Expr.Index(expr, idx);
+                    hasAccessor = true;
+                }
+                else break;
+            }
+
+            // simple alias like "bb" - declare a new variable
+            if (!hasAccessor)
+                return new Expr.PatternIdentifier((string)baseTok.Literal);
+
+            return new Expr.PatternLValue(expr);
+        }
+
+        private Token Peek() => _tokens[_current];
+        private Token Previous() => _tokens[_current - 1];
+        private bool IsAtEnd => Peek().Type == TokenType.EOF;
+        private bool Check(TokenType t) => !IsAtEnd && Peek().Type == t;
+        private Token Advance()
+        {
+            if (!IsAtEnd) _current++;
+            return Previous();
+        }
+        private bool Match(params TokenType[] types)
+        {
+            foreach (var t in types)
+            {
+                if (Check(t)) { Advance(); return true; }
+            }
+            return false;
+        }
+        private Token Consume(TokenType t, string msg)
+        {
+            if (Check(t)) return Advance();
+            var p = Peek();
+            throw new MiniDynParseError(msg, p.Line, p.Column);
+        }
+
+        public List<Stmt> Parse()
+        {
+            List<Stmt> stmts = new();
+            while (!IsAtEnd) stmts.Add(Declaration());
+            return stmts;
+        }
+
+        private Stmt Declaration()
+        {
+            if (Match(TokenType.Fn)) return FunctionDecl("function");
+            if (Match(TokenType.Const)) return ConstDeclOrDestructuring();
+            if (Match(TokenType.Let)) return LetDeclOrDestructuring();
+            if (Match(TokenType.Var)) return VarDeclOrDestructuring();
+            return Statement();
+        }
+
+        private List<Expr.Param> ParseParamList()
+        {
+            List<Expr.Param> parameters = new();
+            if (!Check(TokenType.RParen))
+            {
+                bool sawRest = false;
+                do
+                {
+                    Token nameTok = null;
+                    if (Match(TokenType.Ellipsis))
+                    {
+                        nameTok = Consume(TokenType.Identifier, "Expected rest parameter name after '...'");
+                        parameters.Add(new Expr.Param((string)nameTok.Literal, null, isRest: true));
+                        sawRest = true;
+                        break; // rest must be last
+                    }
+                    nameTok = Consume(TokenType.Identifier, "Expected parameter name");
+                    Expr def = null;
+                    if (Match(TokenType.Assign))
+                    {
+                        def = Expression();
+                    }
+                    parameters.Add(new Expr.Param((string)nameTok.Literal, def, false));
+                } while (Match(TokenType.Comma));
+                if (sawRest && Match(TokenType.Comma))
+                    throw new MiniDynParseError("Rest parameter must be the last parameter", Previous().Line, Previous().Column);
+            }
+            return parameters;
+        }
+
+        private Stmt FunctionDecl(string kind)
+        {
+            var nameTok = Consume(TokenType.Identifier, $"Expected {kind} name");
+            Consume(TokenType.LParen, "Expected '('");
+            var parameters = ParseParamList();
+            Consume(TokenType.RParen, "Expected ')'");
+            Consume(TokenType.LBrace, "Expected '{' before function body");
+            var body = BlockStatementInternal();
+            return new Stmt.Function((string)nameTok.Literal, new Expr.Function(parameters, body));
+        }
+
+        // Destructuring patterns
+        private Expr.Pattern ParsePattern()
+        {
+            if (Match(TokenType.LBracket))
+            {
+                var elements = new List<Expr.PatternArray.Elem>();
+                bool hasRest = false;
+                Expr.Pattern rest = null;
+                if (!Check(TokenType.RBracket))
+                {
+                    do
+                    {
+                        if (Match(TokenType.Ellipsis))
+                        {
+                            rest = ParseSinglePattern();
+                            hasRest = true;
+                            break;
+                        }
+                        var pat = ParseSinglePattern();
+                        Expr def = null;
+                        if (Match(TokenType.Assign))
+                        {
+                            def = Expression();
+                        }
+                        elements.Add(new Expr.PatternArray.Elem(pat, def));
+                    } while (Match(TokenType.Comma));
+                }
+                Consume(TokenType.RBracket, "Expected ']'");
+                return new Expr.PatternArray(elements, hasRest, rest);
+            }
+            else if (Match(TokenType.LBrace))
+            {
+                var props = new List<Expr.PatternObject.Prop>();
+                bool hasRest = false;
+                Expr.Pattern rest = null;
+                if (!Check(TokenType.RBrace))
+                {
+                    do
+                    {
+                        if (Match(TokenType.Ellipsis))
+                        {
+                            rest = ParseSinglePattern();
+                            hasRest = true;
+                            break;
+                        }
+                        // key [: aliasPattern] [= default]
+                        string key;
+                        if (Match(TokenType.Identifier))
+                            key = (string)Previous().Literal;
+                        else if (Match(TokenType.String))
+                            key = (string)Previous().Literal;
+                        else
+                            throw new MiniDynParseError("Expected property name in object pattern", Peek().Line, Peek().Column);
+
+                        Expr.Pattern aliasPat;
+                        if (Match(TokenType.Colon))
+                        {
+                            aliasPat = ParseAliasPatternOrLValue();
+                        }
+                        else
+                        {
+                            aliasPat = new Expr.PatternIdentifier(key);
+                        }
+                        Expr def = null;
+                        if (Match(TokenType.Assign))
+                        {
+                            def = Expression();
+                        }
+                        props.Add(new Expr.PatternObject.Prop(key, aliasPat, def));
+                    } while (Match(TokenType.Comma));
+                }
+                Consume(TokenType.RBrace, "Expected '}'");
+                return new Expr.PatternObject(props, hasRest, rest);
+            }
+            else
+            {
+                return ParseSinglePattern();
+            }
+        }
+
+        private Expr.Pattern ParseSinglePattern()
+        {
+            if (Match(TokenType.Identifier))
+            {
+                return new Expr.PatternIdentifier((string)Previous().Literal);
+            }
+            else if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                return ParsePattern();
+            }
+            throw new MiniDynParseError("Invalid pattern: expected identifier, array pattern, or object pattern", Peek().Line, Peek().Column);
+        }
+
+        private Stmt VarDeclOrDestructuring()
+        {
+            // var <pattern or name> [= initializer] ;
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                var pat = ParsePattern();
+                Expr init = null;
+                if (Match(TokenType.Assign)) init = Expression();
+                else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
+                Consume(TokenType.Semicolon, "Expected ';'");
+                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var);
+            }
+            var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+            Expr init2 = null;
+            if (Match(TokenType.Assign))
+                init2 = Expression();
+            Consume(TokenType.Semicolon, "Expected ';'");
+            return new Stmt.Var((string)nameTok.Literal, init2);
+        }
+
+        private Stmt LetDeclOrDestructuring()
+        {
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                var pat = ParsePattern();
+                Expr init = null;
+                if (Match(TokenType.Assign)) init = Expression();
+                else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
+                Consume(TokenType.Semicolon, "Expected ';'");
+                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let);
+            }
+            var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+            Expr init2 = null;
+            if (Match(TokenType.Assign))
+                init2 = Expression();
+            Consume(TokenType.Semicolon, "Expected ';'");
+            return new Stmt.Let((string)nameTok.Literal, init2);
+        }
+
+        private Stmt ConstDeclOrDestructuring()
+        {
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                var pat = ParsePattern();
+                var init = ParseInitializerRequired();
+                Consume(TokenType.Semicolon, "Expected ';'");
+                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Const);
+            }
+            var nameTok = Consume(TokenType.Identifier, "Expected constant name");
+            Consume(TokenType.Assign, "Expected '=' after const name");
+            var init2 = Expression();
+            Consume(TokenType.Semicolon, "Expected ';'");
+            return new Stmt.Const((string)nameTok.Literal, init2);
+        }
+
+        private Expr ParseInitializerRequired()
+        {
+            Consume(TokenType.Assign, "Expected '=' for initializer");
+            return Expression();
+        }
+
+        private Stmt Statement()
+        {
+            if (Match(TokenType.If)) return IfStatement();
+            if (Match(TokenType.While)) return WhileStatement();
+            if (Match(TokenType.Break)) { Consume(TokenType.Semicolon, "Expected ';' after break"); return new Stmt.Break(); }
+            if (Match(TokenType.Continue)) { Consume(TokenType.Semicolon, "Expected ';' after continue"); return new Stmt.Continue(); }
+
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                // Destructuring assignment statement: [a,b] = expr; or {x,y} = expr;
+                var pat = ParsePattern();
+                Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
+                var val = Expression();
+                Consume(TokenType.Semicolon, "Expected ';'");
+                return new Stmt.ExprStmt(new Expr.DestructuringAssign(pat, val));
+            }
+            // Plain block statement
+            if (Match(TokenType.LBrace))
+                return new Stmt.Block(BlockStatementInternal().Statements);
+            return ExprStatement();
+        }
+
+        private Stmt IfStatement()
+        {
+            Consume(TokenType.LParen, "Expected '(' after if");
+            var cond = Expression();
+            Consume(TokenType.RParen, "Expected ')'");
+            var thenS = Statement();
+            Stmt elseS = null;
+            if (Match(TokenType.Else)) elseS = Statement();
+            return new Stmt.If(cond, thenS, elseS);
+        }
+
+        private Stmt WhileStatement()
+        {
+            Consume(TokenType.LParen, "Expected '(' after while");
+            var cond = Expression();
+            Consume(TokenType.RParen, "Expected ')'");
+            var body = Statement();
+            return new Stmt.While(cond, body);
+        }
+
+        private Stmt.Block BlockStatementInternal()
+        {
+            List<Stmt> stmts = new();
+            while (!Check(TokenType.RBrace) && !IsAtEnd)
+                stmts.Add(Declaration());
+            Consume(TokenType.RBrace, "Expected '}'");
+            return new Stmt.Block(stmts);
+        }
+
+        private Stmt ExprStatement()
+        {
+            var expr = Expression();
+            Consume(TokenType.Semicolon, "Expected ';'");
+            return new Stmt.ExprStmt(expr);
+        }
+
+        // expression -> assignment
+        private Expr Expression() => Ternary();
+
+        // ternary -> or ('?' expression ':' expression)?
+        private Expr Ternary()
+        {
+            var cond = Assignment();
+            if (Match(TokenType.Question))
+            {
+                var thenE = Expression();
+                Consume(TokenType.Colon, "Expected ':' in ternary expression");
+                var elseE = Expression();
+                return new Expr.Ternary(cond, thenE, elseE);
+            }
+            return cond;
+        }
+
+        // assignment -> lvalue ( '=' | op_assign ) assignment | logic_or
+        // lvalue can be Variable, Property, Index, or Pattern (for destructuring)
+        private Expr Assignment()
+        {
+            var expr = Or();
+
+            if (Match(TokenType.Assign, TokenType.PlusAssign, TokenType.MinusAssign, TokenType.StarAssign, TokenType.SlashAssign, TokenType.PercentAssign))
+            {
+                Token op = Previous();
+                // handle destructuring assign e.g. [a,b] = RHS
+                if (expr is Expr.Index || expr is Expr.Property || expr is Expr.Variable)
+                {
+                    var value = Assignment();
+                    return new Expr.Assign(expr, op, value);
+                }
+                else if (expr is Expr.Grouping g && (g.Inner is Expr.Index || g.Inner is Expr.Property || g.Inner is Expr.Variable))
+                {
+                    var value = Assignment();
+                    return new Expr.Assign(g.Inner, op, value);
+                }
+                else
+                {
+                    // allow [a,b] = ...
+                    if (expr is Expr.ArrayLiteral || expr is Expr.ObjectLiteral)
+                    {
+                        // Convert literals-as-patterns? We only allow explicit patterns in statements; here support [a,b] or {x:y} in expressions by treating them as patterns-like is complex.
+                        throw new MiniDynParseError("Invalid assignment target", Previous().Line, Previous().Column);
+                    }
+                    throw new MiniDynParseError("Invalid assignment target", Previous().Line, Previous().Column);
+                }
+            }
+            return expr;
+        }
+
+        private Expr Or()
+        {
+            var expr = And();
+            while (Match(TokenType.Or))
+            {
+                var op = Previous();
+                var right = And();
+                expr = new Expr.Logical(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr And()
+        {
+            var expr = Equality();
+            while (Match(TokenType.And))
+            {
+                var op = Previous();
+                var right = Equality();
+                expr = new Expr.Logical(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr Equality()
+        {
+            var expr = Comparison();
+            while (Match(TokenType.Equal, TokenType.NotEqual))
+            {
+                var op = Previous();
+                var right = Comparison();
+                expr = new Expr.Binary(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr Comparison()
+        {
+            var expr = Term();
+            while (Match(TokenType.Less, TokenType.LessEq, TokenType.Greater, TokenType.GreaterEq))
+            {
+                var op = Previous();
+                var right = Term();
+                expr = new Expr.Binary(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr Term()
+        {
+            var expr = Factor();
+            while (Match(TokenType.Plus, TokenType.Minus))
+            {
+                var op = Previous();
+                var right = Factor();
+                expr = new Expr.Binary(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr Factor()
+        {
+            var expr = Unary();
+            while (Match(TokenType.Star, TokenType.Slash, TokenType.Percent))
+            {
+                var op = Previous();
+                var right = Unary();
+                expr = new Expr.Binary(expr, op, right);
+            }
+            return expr;
+        }
+
+        private Expr Unary()
+        {
+            if (Match(TokenType.Plus, TokenType.Minus, TokenType.Not))
+            {
+                var op = Previous();
+                var right = Unary();
+                return new Expr.Unary(op, right);
+            }
+            return Member();
+        }
+
+        private Expr Member()
+        {
+            var expr = Call();
+            while (true)
+            {
+                if (Match(TokenType.Dot))
+                {
+                    var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
+                    expr = new Expr.Property(expr, (string)nameTok.Literal);
+                }
+                else if (Match(TokenType.LBracket))
+                {
+                    var idx = Expression();
+                    Consume(TokenType.RBracket, "Expected ']'");
+                    expr = new Expr.Index(expr, idx);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return expr;
+        }
+
+        private Expr Call()
+        {
+            var expr = Primary();
+            while (true)
+            {
+                if (Match(TokenType.LParen))
+                {
+                    var args = new List<Expr>();
+                    if (!Check(TokenType.RParen))
+                    {
+                        do
+                        {
+                            args.Add(Expression());
+                        } while (Match(TokenType.Comma));
+                    }
+                    Consume(TokenType.RParen, "Expected ')'");
+                    expr = new Expr.Call(expr, args);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return expr;
+        }
+
+        private Expr Primary()
+        {
+            if (Match(TokenType.Number))
+                return new Expr.Literal(Value.Number((NumberValue)Previous().Literal));
+            if (Match(TokenType.String))
+                return new Expr.Literal(Value.String((string)Previous().Literal));
+            if (Match(TokenType.True))
+                return new Expr.Literal(Value.Boolean(true));
+            if (Match(TokenType.False))
+                return new Expr.Literal(Value.Boolean(false));
+            if (Match(TokenType.Nil))
+                return new Expr.Literal(Value.Nil());
+            if (Match(TokenType.LBracket))
+            {
+                var elems = new List<Expr>();
+
+                // We may be looking at "]" right away – empty literal "[]"
+                while (!Check(TokenType.RBracket))
+                {
+                    // Support elisions:        [1, , 3]  or  [, 2]
+                    if (Check(TokenType.Comma))
+                    {
+                        // a hole – treat it as explicit nil
+                        elems.Add(new Expr.Literal(Value.Nil()));
+                    }
+                    else
+                    {
+                        elems.Add(Expression());
+                    }
+
+                    // If there is a comma, consume it and loop again.
+                    // If the next token is ']', the loop will exit.
+                    Match(TokenType.Comma);
+                }
+
+                Consume(TokenType.RBracket, "Expected ']'");
+                return new Expr.ArrayLiteral(elems);
+            }
+            if (Match(TokenType.LBrace))
+            {
+                var entries = new List<Expr.ObjectLiteral.Entry>();
+                if (!Check(TokenType.RBrace))
+                {
+                    do
+                    {
+                        // key: value
+                        if (Check(TokenType.Identifier))
+                        {
+                            var keyTok = Advance();
+                            string keyName = (string)keyTok.Literal;
+                            if (Match(TokenType.Colon))
+                            {
+                                var valExpr = Expression();
+                                entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, valExpr));
+                            }
+                            else
+                            {
+                                // shorthand { a } -> { a: a }
+                                entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, new Expr.Variable(keyName)));
+                            }
+                        }
+                        else if (Check(TokenType.String))
+                        {
+                            var keyTok = Advance();
+                            string keyName = (string)keyTok.Literal;
+                            Consume(TokenType.Colon, "Expected ':' after string key");
+                            var valExpr = Expression();
+                            entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, valExpr));
+                        }
+                        else if (Match(TokenType.LBracket))
+                        {
+                            // computed key [expr] : value
+                            var keyExpr = Expression();
+                            Consume(TokenType.RBracket, "Expected ']'");
+                            Consume(TokenType.Colon, "Expected ':' after computed key");
+                            var valExpr = Expression();
+                            entries.Add(new Expr.ObjectLiteral.Entry(null, keyExpr, valExpr));
+                        }
+                        else
+                        {
+                            throw new MiniDynParseError("Invalid object literal entry", Peek().Line, Peek().Column);
+                        }
+                    } while (Match(TokenType.Comma));
+                }
+                Consume(TokenType.RBrace, "Expected '}'");
+                return new Expr.ObjectLiteral(entries);
+            }
+            if (Match(TokenType.Identifier))
+                return new Expr.Variable((string)Previous().Literal);
+            if (Match(TokenType.LParen))
+            {
+                var e = Expression();
+                Consume(TokenType.RParen, "Expected ')'");
+                return new Expr.Grouping(e);
+            }
+            throw new MiniDynParseError("Expected expression", Peek().Line, Peek().Column);
+        }
+    }
+
+    // Environment
+    public class Environment
+    {
+        private readonly Dictionary<string, Value> _values = new();
+        private readonly HashSet<string> _consts = new();
+        private readonly HashSet<string> _lets = new(); // tracks block-scoped let/const by name
+        public Environment Enclosing { get; }
+
+        public Environment(Environment enclosing = null) { Enclosing = enclosing; }
+
+        public void DefineVar(string name, Value value) => _values[name] = value;
+        public void DefineLet(string name, Value value)
+        {
+            _values[name] = value;
+            _lets.Add(name);
+        }
+        public void DefineConst(string name, Value value)
+        {
+            _values[name] = value;
+            _lets.Add(name);
+            _consts.Add(name);
+        }
+
+        public void Assign(string name, Value value)
+        {
+            if (_values.ContainsKey(name))
+            {
+                if (_consts.Contains(name))
+                    throw new MiniDynRuntimeError($"Cannot assign to const '{name}'");
+                _values[name] = value; return;
+            }
+            if (Enclosing != null) { Enclosing.Assign(name, value); return; }
+            throw new MiniDynRuntimeError($"Undefined variable '{name}'");
+        }
+
+        public Value Get(string name)
+        {
+            if (_values.TryGetValue(name, out var v)) return v;
+            if (Enclosing != null) return Enclosing.Get(name);
+            throw new MiniDynRuntimeError($"Undefined variable '{name}'");
+        }
+
+        public bool IsDeclaredHere(string name) => _values.ContainsKey(name) && _lets.Contains(name);
+    }
+
+    public interface ICallable
+    {
+        int ArityMin { get; }
+        int ArityMax { get; } // int.MaxValue for variadic
+        Value Call(Interpreter interp, List<Value> args);
+    }
+
+    public class BuiltinFunction : ICallable
+    {
+        public string Name { get; }
+        private readonly Func<Interpreter, List<Value>, Value> _fn;
+        public int ArityMin { get; }
+        public int ArityMax { get; }
+
+        public BuiltinFunction(string name, int arityMin, int arityMax, Func<Interpreter, List<Value>, Value> fn)
+        {
+            Name = name; ArityMin = arityMin; ArityMax = arityMax; _fn = fn;
+        }
+
+        public Value Call(Interpreter interp, List<Value> args) => _fn(interp, args);
+        public override string ToString() => $"<builtin {Name}>";
+    }
+
+    public class UserFunction : ICallable
+    {
+        public struct ParamSpec
+        {
+            public string Name;
+            public Expr Default;
+            public bool IsRest;
+            public ParamSpec(string n, Expr d, bool r) { Name = n; Default = d; IsRest = r; }
+        }
+
+        public List<ParamSpec> Params { get; }
+        public Stmt.Block Body { get; }
+        public Environment Closure { get; }
+        public string Name { get; }
+
+        public int ArityMin
+        {
+            get
+            {
+                int count = 0;
+                foreach (var p in Params)
+                {
+                    if (p.IsRest) break;
+                    if (p.Default == null) count++;
+                }
+                return count;
+            }
+        }
+        public int ArityMax
+        {
+            get
+            {
+                foreach (var p in Params) if (p.IsRest) return int.MaxValue;
+                return Params.Count;
+            }
+        }
+
+        public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure)
+        {
+            Name = name;
+            Body = body;
+            Closure = closure;
+            Params = new List<ParamSpec>(parameters.Count);
+            foreach (var p in parameters)
+                Params.Add(new ParamSpec(p.Name, p.Default, p.IsRest));
+        }
+
+        public Value Call(Interpreter interp, List<Value> args)
+        {
+            var env = new Environment(Closure);
+
+            // Bind parameters with defaults and rest
+            int i = 0;
+            int argsCount = args.Count;
+            bool hasRest = false;
+            for (int pi = 0; pi < Params.Count; pi++)
+            {
+                var p = Params[pi];
+                if (p.IsRest)
+                {
+                    hasRest = true;
+                    var rest = new ArrayValue();
+                    for (int ai = i; ai < argsCount; ai++)
+                    {
+                        rest.Items.Add(args[ai]);
+                    }
+                    env.DefineVar(p.Name, Value.Array(rest));
+                    i = argsCount;
+                    break;
+                }
+                if (i < argsCount)
+                {
+                    env.DefineVar(p.Name, args[i++]);
+                }
+                else
+                {
+                    if (p.Default != null)
+                    {
+                        env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                    }
+                    else
+                    {
+                        throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                    }
+                }
+            }
+            if (!hasRest && i < argsCount)
+                throw new MiniDynRuntimeError($"Function {ToString()} expected at most {ArityMax} args, got {argsCount}");
+
+            try
+            {
+                interp.ExecuteBlock(Body.Statements, env);
+            }
+            catch (Interpreter.ReturnSignal ret)
+            {
+                return ret.Value ?? Value.Nil();
+            }
+            return Value.Nil();
+        }
+
+        public override string ToString()
+        {
+            return Name != null ? $"<fn {Name}>" : "<fn>";
+        }
+
+        public UserFunction Bind(Environment newClosure) => new UserFunction(Name, ToExprParams(), Body, newClosure);
+
+        private List<Expr.Param> ToExprParams()
+        {
+            var list = new List<Expr.Param>(Params.Count);
+            foreach (var p in Params) list.Add(new Expr.Param(p.Name, p.Default, p.IsRest));
+            return list;
+        }
+    }
+
+    // Interpreter
+    public class Interpreter : Expr.IVisitor<Value>, Stmt.IVisitor<object>
+    {
+        public class ReturnSignal : Exception
+        {
+            public Value Value;
+            public ReturnSignal(Value v) { Value = v; }
+        }
+        public class BreakSignal : Exception { }
+        public class ContinueSignal : Exception { }
+
+        public readonly Environment Globals = new();
+        private Environment _env;
+        public Environment CurrentEnv => _env;
+
+        private readonly Dictionary<string, ICallable> _builtins = new();
+
+        public Interpreter()
+        {
+            _env = Globals;
+
+            // Builtins
+            DefineBuiltin("length", 1, 1, (i, a) =>
+            {
+                var v = a[0];
+                return v.Type switch
+                {
+                    ValueType.String => Value.Number(NumberValue.FromLong(v.AsString().Length)),
+                    ValueType.Array => Value.Number(NumberValue.FromLong(v.AsArray().Length)),
+                    ValueType.Object => Value.Number(NumberValue.FromLong(v.AsObject().Count)),
+                    ValueType.Nil => Value.Number(NumberValue.FromLong(0)),
+                    ValueType.Boolean => Value.Number(NumberValue.FromLong(1)),
+                    ValueType.Number => Value.Number(NumberValue.FromLong(1)),
+                    ValueType.Function => Value.Number(NumberValue.FromLong(1)),
+                    _ => Value.Number(NumberValue.FromLong(0))
+                };
+            });
+
+            DefineBuiltin("print", 1, int.MaxValue, (i, a) =>
+            {
+                var sb = new StringBuilder();
+                for (int idx = 0; idx < a.Count; idx++)
+                {
+                    sb.Append(i.ToStringValue(a[idx]));
+                    if (idx + 1 < a.Count) sb.Append(' ');
+                }
+                Console.Write(sb.ToString());
+                return Value.Nil();
+            });
+
+            DefineBuiltin("println", 0, int.MaxValue, (i, a) =>
+            {
+                if (a.Count == 0) { Console.WriteLine(); return Value.Nil(); }
+                var sb = new StringBuilder();
+                for (int idx = 0; idx < a.Count; idx++)
+                {
+                    sb.Append(i.ToStringValue(a[idx]));
+                    if (idx + 1 < a.Count) sb.Append(' ');
+                }
+                Console.WriteLine(sb.ToString());
+                return Value.Nil();
+            });
+
+            DefineBuiltin("gets", 0, 0, (i, a) =>
+            {
+                string line = Console.ReadLine();
+                if (line == null) return Value.Nil();
+                return Value.String(line);
+            });
+
+            DefineBuiltin("to_number", 1, 1, (i, a) =>
+            {
+                var v = a[0];
+                return v.Type switch
+                {
+                    ValueType.Number => v,
+                    ValueType.String => NumberValue.TryFromString(v.AsString(), out var nv) ? Value.Number(nv) : Value.Nil(),
+                    ValueType.Boolean => Value.Number(NumberValue.FromBool(v.AsBoolean())),
+                    ValueType.Nil => Value.Number(NumberValue.FromLong(0)),
+                    _ => Value.Nil()
+                };
+            });
+
+            DefineBuiltin("to_string", 1, 1, (i, a) => Value.String(i.ToStringValue(a[0])));
+
+            DefineBuiltin("type", 1, 1, (i, a) => Value.String(a[0].Type.ToString().ToLowerInvariant()));
+
+            // Object builtins
+            DefineBuiltin("keys", 1, 1, (i, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var k in o.Props.Keys) arr.Items.Add(Value.String(k));
+                return Value.Array(arr);
+            });
+
+            DefineBuiltin("has_key", 2, 2, (i, a) =>
+            {
+                var o = a[0].AsObject();
+                var k = a[1].AsString();
+                return Value.Boolean(o.Props.ContainsKey(k));
+            });
+
+            DefineBuiltin("remove_key", 2, 2, (i, a) =>
+            {
+                var o = a[0].AsObject();
+                var k = a[1].AsString();
+                return Value.Boolean(o.Remove(k));
+            });
+
+            DefineBuiltin("merge", 2, 2, (i, a) =>
+            {
+                var o1 = a[0].AsObject();
+                var o2 = a[1].AsObject();
+                var res = o1.CloneShallow();
+                foreach (var kv in o2.Props) res.Set(kv.Key, kv.Value);
+                return Value.Object(res);
+            });
+
+            // Math
+            DefineBuiltin("abs", 1, 1, (i, a) =>
+            {
+                var n = ToNumber(a[0]);
+                return n.Kind switch
+                {
+                    NumberValue.NumKind.Int => Value.Number(NumberValue.FromLong(Math.Abs(n.I64))),
+                    NumberValue.NumKind.BigInt => Value.Number(NumberValue.FromBigInt(BigInteger.Abs(n.BigInt))),
+                    NumberValue.NumKind.Double => Value.Number(NumberValue.FromDouble(Math.Abs(n.Dbl))),
+                    _ => Value.Number(NumberValue.FromLong(0))
+                };
+            });
+            DefineBuiltin("floor", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Floor(ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("ceil", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Ceiling(ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("round", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Round(ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("sqrt", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Sqrt(ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("pow", 2, 2, (i, a) => Value.Number(NumberValue.FromDouble(Math.Pow(ToNumber(a[0]).ToDoubleNV().Dbl, ToNumber(a[1]).ToDoubleNV().Dbl))));
+            DefineBuiltin("min", 1, int.MaxValue, (i, a) =>
+            {
+                if (a.Count == 0) return Value.Nil();
+                var cur = ToNumber(a[0]);
+                for (int k = 1; k < a.Count; k++)
+                    if (NumberValue.Compare(ToNumber(a[k]), cur) < 0) cur = ToNumber(a[k]);
+                return Value.Number(cur);
+            });
+            DefineBuiltin("max", 1, int.MaxValue, (i, a) =>
+            {
+                if (a.Count == 0) return Value.Nil();
+                var cur = ToNumber(a[0]);
+                for (int k = 1; k < a.Count; k++)
+                    if (NumberValue.Compare(ToNumber(a[k]), cur) > 0) cur = ToNumber(a[k]);
+                return Value.Number(cur);
+            });
+
+            var rng = new Random();
+            DefineBuiltin("random", 0, 0, (i, a) => Value.Number(NumberValue.FromDouble(rng.NextDouble())));
+            DefineBuiltin("srand", 1, 1, (i, a) => { rng = new Random((int)(ToNumber(a[0]).ToDoubleNV().Dbl)); return Value.Nil(); });
+
+            // String utilities
+            DefineBuiltin("substring", 2, 3, (i, a) =>
+            {
+                var s = a[0].AsString();
+                var start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                if (start < 0) start = 0;
+                if (start > s.Length) start = s.Length;
+                if (a.Count == 2)
+                {
+                    return Value.String(s.Substring(start));
+                }
+                var len = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
+                if (len < 0) len = 0;
+                if (start + len > s.Length) len = s.Length - start;
+                return Value.String(s.Substring(start, len));
+            });
+            DefineBuiltin("index_of", 2, 2, (i, a) => Value.Number(NumberValue.FromLong(a[0].AsString().IndexOf(a[1].AsString(), StringComparison.Ordinal))));
+            DefineBuiltin("contains", 2, 2, (i, a) => Value.Boolean(a[0].AsString().Contains(a[1].AsString(), StringComparison.Ordinal)));
+            DefineBuiltin("starts_with", 2, 2, (i, a) => Value.Boolean(a[0].AsString().StartsWith(a[1].AsString(), StringComparison.Ordinal)));
+            DefineBuiltin("ends_with", 2, 2, (i, a) => Value.Boolean(a[0].AsString().EndsWith(a[1].AsString(), StringComparison.Ordinal)));
+            DefineBuiltin("to_upper", 1, 1, (i, a) => Value.String(a[0].AsString().ToUpperInvariant()));
+            DefineBuiltin("to_lower", 1, 1, (i, a) => Value.String(a[0].AsString().ToLowerInvariant()));
+            DefineBuiltin("trim", 1, 1, (i, a) => Value.String(a[0].AsString().Trim()));
+            DefineBuiltin("split", 2, 2, (i, a) =>
+            {
+                var parts = a[0].AsString().Split(new string[] { a[1].AsString() }, StringSplitOptions.None);
+                var arr = new ArrayValue();
+                foreach (var p in parts) arr.Items.Add(Value.String(p));
+                return Value.Array(arr);
+            });
+            DefineBuiltin("parse_int", 1, 1, (i, a) =>
+            {
+                var s = a[0].AsString();
+                if (NumberValue.TryFromString(s, out var nv) && nv.Kind != NumberValue.NumKind.Double)
+                    return Value.Number(nv);
+                if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
+                    return Value.Number(NumberValue.FromLong(l));
+                if (BigInteger.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bi))
+                    return Value.Number(NumberValue.FromBigInt(bi));
+                return Value.Nil();
+            });
+            DefineBuiltin("parse_float", 1, 1, (i, a) =>
+            {
+                var s = a[0].AsString();
+                if (double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var d))
+                    return Value.Number(NumberValue.FromDouble(d));
+                return Value.Nil();
+            });
+
+            // Array helpers
+            DefineBuiltin("array", 0, int.MaxValue, (i, a) => Value.Array(new ArrayValue(a)));
+            DefineBuiltin("push", 2, int.MaxValue, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                for (int k = 1; k < a.Count; k++) arr.Items.Add(a[k]);
+                return Value.Number(NumberValue.FromLong(arr.Length));
+            });
+            DefineBuiltin("pop", 1, 1, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                if (arr.Length == 0) return Value.Nil();
+                var v = arr.Items[^1];
+                arr.Items.RemoveAt(arr.Length - 1);
+                return v;
+            });
+            DefineBuiltin("slice", 2, 3, (i, a) =>
+            {
+                if (a[0].Type == ValueType.Array)
+                {
+                    var arr = a[0].AsArray();
+                    int start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = NormalizeIndex(start, arr.Length);
+                    int end = arr.Length;
+                    if (a.Count == 3)
+                    {
+                        end = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = NormalizeIndex(end, arr.Length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end < start) end = start;
+                    if (end > arr.Length) end = arr.Length;
+                    var res = new ArrayValue();
+                    for (int k = start; k < end; k++) res.Items.Add(arr[k]);
+                    return Value.Array(res);
+                }
+                else if (a[0].Type == ValueType.String)
+                {
+                    var s = a[0].AsString();
+                    int start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = NormalizeIndex(start, s.Length);
+                    int end = s.Length;
+                    if (a.Count == 3)
+                    {
+                        end = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = NormalizeIndex(end, s.Length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end < start) end = start;
+                    if (end > s.Length) end = s.Length;
+                    return Value.String(s.Substring(start, end - start));
+                }
+                throw new MiniDynRuntimeError("slice expects array or string");
+            });
+            DefineBuiltin("join", 2, 2, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                var sep = a[1].AsString();
+                var sb = new StringBuilder();
+                for (int k = 0; k < arr.Length; k++)
+                {
+                    if (k > 0) sb.Append(sep);
+                    sb.Append(i.ToStringValue(arr[k]));
+                }
+                return Value.String(sb.ToString());
+            });
+            DefineBuiltin("at", 2, 2, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                int idx = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = NormalizeIndex(idx, arr.Length);
+                if (idx < 0 || idx >= arr.Length) return Value.Nil();
+                return arr[idx];
+            });
+            DefineBuiltin("set_at", 3, 3, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                int idx = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = NormalizeIndex(idx, arr.Length);
+                if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
+                arr[idx] = a[2];
+                return a[2];
+            });
+            DefineBuiltin("clone", 1, 1, (i, a) =>
+            {
+                if (a[0].Type == ValueType.Array) return Value.Array(a[0].AsArray().Clone());
+                if (a[0].Type == ValueType.Object) return Value.Object(a[0].AsObject().CloneShallow());
+                return a[0];
+            });
+
+            // Time
+            DefineBuiltin("now_ms", 0, 0, (i, a) => Value.Number(NumberValue.FromLong(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())));
+        }
+
+        private void DefineBuiltin(string name, int arityMin, int arityMax, Func<Interpreter, List<Value>, Value> fn)
+        {
+            var f = new BuiltinFunction(name, arityMin, arityMax, fn);
+            _builtins[name] = f;
+            Globals.DefineVar(name, Value.Function(f));
+        }
+
+        public string ToStringValue(Value v) => v.ToString();
+
+        public void Interpret(List<Stmt> statements)
+        {
+            foreach (var s in statements) Execute(s);
+        }
+
+        private void Execute(Stmt s) => s.Accept(this);
+
+        private Value Evaluate(Expr e) => e.Accept(this);
+        public Value EvaluateWithEnv(Expr e, Environment env)
+        {
+            var prev = _env;
+            try { _env = env; return Evaluate(e); }
+            finally { _env = prev; }
+        }
+
+        // Stmt visitor
+        public object VisitExpr(Stmt.ExprStmt s)
+        {
+            Evaluate(s.Expression);
+            return null;
+        }
+
+        public object VisitVar(Stmt.Var s)
+        {
+            Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
+            _env.DefineVar(s.Name, val);
+            return null;
+        }
+
+        public object VisitLet(Stmt.Let s)
+        {
+            Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
+            _env.DefineLet(s.Name, val);
+            return null;
+        }
+
+        public object VisitConst(Stmt.Const s)
+        {
+            Value val = Evaluate(s.Initializer);
+            _env.DefineConst(s.Name, val);
+            return null;
+        }
+
+        public object VisitDestructuringDecl(Stmt.DestructuringDecl s)
+        {
+            var src = Evaluate(s.Initializer);
+            // Declare bindings then assign
+            void declare(string name, Value v)
+            {
+                switch (s.DeclKind)
+                {
+                    case Stmt.DestructuringDecl.Kind.Var: _env.DefineVar(name, v); break;
+                    case Stmt.DestructuringDecl.Kind.Let: _env.DefineLet(name, v); break;
+                    case Stmt.DestructuringDecl.Kind.Const: _env.DefineConst(name, v); break;
+                }
+            }
+            s.Pattern.Bind(this, src, declare, allowConstReassign: false);
+            return null;
+        }
+
+        public object VisitBlock(Stmt.Block s)
+        {
+            ExecuteBlock(s.Statements, new Environment(_env));
+            return null;
+        }
+
+        public void ExecuteBlock(List<Stmt> stmts, Environment env)
+        {
+            var prev = _env;
+            try
+            {
+                _env = env;
+                foreach (var st in stmts) Execute(st);
+            }
+            finally { _env = prev; }
+        }
+
+        public object VisitIf(Stmt.If s)
+        {
+            if (Value.IsTruthy(Evaluate(s.Condition))) Execute(s.Then);
+            else if (s.Else != null) Execute(s.Else);
+            return null;
+        }
+
+        public object VisitWhile(Stmt.While s)
+        {
+            while (Value.IsTruthy(Evaluate(s.Condition)))
+            {
+                try
+                {
+                    Execute(s.Body);
+                }
+                catch (ContinueSignal)
+                {
+                    continue;
+                }
+                catch (BreakSignal)
+                {
+                    break;
+                }
+            }
+            return null;
+        }
+
+        public object VisitFunction(Stmt.Function s)
+        {
+            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env);
+            _env.DefineVar(s.Name, Value.Function(fn));
+            return null;
+        }
+
+        public object VisitReturn(Stmt.Return s)
+        {
+            Value v = s.Value != null ? Evaluate(s.Value) : Value.Nil();
+            throw new ReturnSignal(v);
+        }
+
+        public object VisitBreak(Stmt.Break s) { throw new BreakSignal(); }
+        public object VisitContinue(Stmt.Continue s) { throw new ContinueSignal(); }
+
+        // Expr visitor
+        public Value VisitLiteral(Expr.Literal e) => e.Value;
+
+        public Value VisitVariable(Expr.Variable e)
+        {
+            return _env.Get(e.Name);
+        }
+
+        public Value VisitAssign(Expr.Assign e)
+        {
+            // Compute RHS
+            Value rhs = Evaluate(e.Value);
+
+            // Helper to apply compound op
+            Value ApplyOp(Value cur, TokenType op, Value rhsVal)
+            {
+                switch (op)
+                {
+                    case TokenType.Assign: return rhsVal;
+                    case TokenType.PlusAssign:
+                        if (cur.Type == ValueType.Number && rhsVal.Type == ValueType.Number)
+                            return Value.Number(NumberValue.Add(cur.AsNumber(), rhsVal.AsNumber()));
+                        if (cur.Type == ValueType.String || rhsVal.Type == ValueType.String)
+                            return Value.String(ToStringValue(cur) + ToStringValue(rhsVal));
+                        if (cur.Type == ValueType.Array && rhsVal.Type == ValueType.Array)
+                        {
+                            var la = cur.AsArray();
+                            var ra = rhsVal.AsArray();
+                            var res = new ArrayValue();
+                            res.Items.AddRange(la.Items);
+                            res.Items.AddRange(ra.Items);
+                            return Value.Array(res);
+                        }
+                        throw new MiniDynRuntimeError("Invalid '+=' operands");
+                    case TokenType.MinusAssign:
+                        return Value.Number(NumberValue.Sub(ToNumber(cur), ToNumber(rhsVal)));
+                    case TokenType.StarAssign:
+                        return Value.Number(NumberValue.Mul(ToNumber(cur), ToNumber(rhsVal)));
+                    case TokenType.SlashAssign:
+                        return Value.Number(NumberValue.Div(ToNumber(cur), ToNumber(rhsVal)));
+                    case TokenType.PercentAssign:
+                        return Value.Number(NumberValue.Mod(ToNumber(cur), ToNumber(rhsVal)));
+                    default:
+                        throw new MiniDynRuntimeError("Unknown compound assignment");
+                }
+            }
+
+            if (e.Target is Expr.Variable v)
+            {
+                var cur = _env.Get(v.Name);
+                var newVal = ApplyOp(cur, e.Op.Type, rhs);
+                _env.Assign(v.Name, newVal);
+                return newVal;
+            }
+            else if (e.Target is Expr.Property p)
+            {
+                var objVal = Evaluate(p.Target);
+                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property assignment target must be object");
+                var obj = objVal.AsObject();
+                obj.Props.TryGetValue(p.Name, out var cur);
+                var newVal = ApplyOp(cur, e.Op.Type, rhs);
+                obj.Set(p.Name, newVal);
+                return newVal;
+            }
+            else if (e.Target is Expr.Index idx)
+            {
+                var target = Evaluate(idx.Target);
+                var idxV = Evaluate(idx.IndexExpr);
+                if (target.Type == ValueType.Array)
+                {
+                    var arr = target.AsArray();
+                    int i = (int)ToNumber(idxV).ToDoubleNV().Dbl;
+                    i = NormalizeIndex(i, arr.Length);
+                    if (i < 0 || i >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
+                    var cur = arr[i];
+                    var newVal = ApplyOp(cur, e.Op.Type, rhs);
+                    arr[i] = newVal;
+                    return newVal;
+                }
+                else if (target.Type == ValueType.Object)
+                {
+                    var obj = target.AsObject();
+                    var key = ToStringValue(idxV);
+                    obj.Props.TryGetValue(key, out var cur);
+                    var newVal = ApplyOp(cur, e.Op.Type, rhs);
+                    obj.Set(key, newVal);
+                    return newVal;
+                }
+                else if (target.Type == ValueType.String)
+                {
+                    throw new MiniDynRuntimeError("Cannot assign into string by index");
+                }
+                throw new MiniDynRuntimeError("Index assignment target must be array or object");
+            }
+            else
+            {
+                throw new MiniDynRuntimeError("Invalid assignment target");
+            }
+        }
+
+        public Value VisitUnary(Expr.Unary e)
+        {
+            var r = Evaluate(e.Right);
+            return e.Op.Type switch
+            {
+                TokenType.Minus => Value.Number(NumberValue.Neg(ToNumber(r))),
+                TokenType.Plus => r.Type == ValueType.Number ? r : Value.Number(ToNumber(r)),
+                TokenType.Not => Value.Boolean(!Value.IsTruthy(r)),
+                _ => throw new MiniDynRuntimeError("Unknown unary")
+            };
+        }
+
+        public Value VisitBinary(Expr.Binary e)
+        {
+            var l = Evaluate(e.Left);
+            var r = Evaluate(e.Right);
+
+            switch (e.Op.Type)
+            {
+                case TokenType.Plus:
+                    if (l.Type == ValueType.Number && r.Type == ValueType.Number)
+                        return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
+                    if (l.Type == ValueType.String || r.Type == ValueType.String)
+                        return Value.String(ToStringValue(l) + ToStringValue(r));
+                    if (l.Type == ValueType.Array && r.Type == ValueType.Array)
+                    {
+                        // concatenate arrays
+                        var la = l.AsArray();
+                        var ra = r.AsArray();
+                        var res = new ArrayValue();
+                        res.Items.AddRange(la.Items);
+                        res.Items.AddRange(ra.Items);
+                        return Value.Array(res);
+                    }
+                    throw new MiniDynRuntimeError("Invalid '+' operands");
+                case TokenType.Minus:
+                    return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
+                case TokenType.Star:
+                    return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
+                case TokenType.Slash:
+                    return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
+                case TokenType.Percent:
+                    return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
+                case TokenType.Equal:
+                    return Value.Boolean(CompareEqual(l, r));
+                case TokenType.NotEqual:
+                    return Value.Boolean(!CompareEqual(l, r));
+                case TokenType.Less:
+                    return Value.Boolean(CompareRel(l, r, "<"));
+                case TokenType.LessEq:
+                    return Value.Boolean(CompareRel(l, r, "<="));
+                case TokenType.Greater:
+                    return Value.Boolean(CompareRel(l, r, ">"));
+                case TokenType.GreaterEq:
+                    return Value.Boolean(CompareRel(l, r, ">="));
+                default:
+                    throw new MiniDynRuntimeError("Unknown binary op");
+            }
+        }
+
+        public Value VisitLogical(Expr.Logical e)
+        {
+            var left = Evaluate(e.Left);
+            if (e.Op.Type == TokenType.Or)
+            {
+                if (Value.IsTruthy(left)) return left;
+                return Evaluate(e.Right);
+            }
+            else
+            {
+                if (!Value.IsTruthy(left)) return left;
+                return Evaluate(e.Right);
+            }
+        }
+
+        public Value VisitCall(Expr.Call e)
+        {
+            var calleeVal = Evaluate(e.Callee);
+
+            if (calleeVal.Type != ValueType.Function)
+                throw new MiniDynRuntimeError("Can only call functions");
+
+            var fn = calleeVal.AsFunction();
+            var args = new List<Value>();
+            foreach (var arg in e.Args) args.Add(Evaluate(arg));
+            if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
+                throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
+            return fn.Call(this, args);
+        }
+
+        public Value VisitGrouping(Expr.Grouping e) => Evaluate(e.Inner);
+
+        public Value VisitFunction(Expr.Function e)
+        {
+            var uf = new UserFunction(null, e.Parameters, e.Body, _env);
+            return Value.Function(uf);
+        }
+
+        public Value VisitTernary(Expr.Ternary e)
+        {
+            var c = Evaluate(e.Cond);
+            if (Value.IsTruthy(c)) return Evaluate(e.Then);
+            return Evaluate(e.Else);
+        }
+
+        public Value VisitIndex(Expr.Index e)
+        {
+            var target = Evaluate(e.Target);
+            var idxV = Evaluate(e.IndexExpr);
+            if (target.Type == ValueType.Array)
+            {
+                int idx = (int)ToNumber(idxV).ToDoubleNV().Dbl;
+                var arr = target.AsArray();
+                idx = NormalizeIndex(idx, arr.Length);
+                if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
+                return arr[idx];
+            }
+            if (target.Type == ValueType.String)
+            {
+                var s = target.AsString();
+                int idx = (int)ToNumber(idxV).ToDoubleNV().Dbl;
+                idx = NormalizeIndex(idx, s.Length);
+                if (idx < 0 || idx >= s.Length) throw new MiniDynRuntimeError("String index out of range");
+                return Value.String(s[idx].ToString());
+            }
+            if (target.Type == ValueType.Object)
+            {
+                var obj = target.AsObject();
+                var key = ToStringValue(idxV);
+                if (obj.TryGet(key, out var val)) return val;
+                return Value.Nil();
+            }
+            throw new MiniDynRuntimeError("Indexing supported only on arrays, strings, or objects");
+        }
+
+        public Value VisitArrayLiteral(Expr.ArrayLiteral e)
+        {
+            var arr = new ArrayValue();
+            foreach (var el in e.Elements) arr.Items.Add(Evaluate(el));
+            return Value.Array(arr);
+        }
+
+        public Value VisitObjectLiteral(Expr.ObjectLiteral e)
+        {
+            var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+            foreach (var entry in e.Entries)
+            {
+                string key;
+                if (entry.KeyName != null)
+                {
+                    key = entry.KeyName;
+                }
+                else
+                {
+                    var kVal = Evaluate(entry.KeyExpr);
+                    key = ToStringValue(kVal);
+                }
+                var val = Evaluate(entry.ValueExpr);
+                dict[key] = val;
+            }
+            return Value.Object(new ObjectValue(dict));
+        }
+
+        public Value VisitProperty(Expr.Property e)
+        {
+            var objv = Evaluate(e.Target);
+            if (objv.Type != ValueType.Object) throw new MiniDynRuntimeError("Property access target must be object");
+            var obj = objv.AsObject();
+            if (obj.TryGet(e.Name, out var v)) return v;
+            return Value.Nil();
+        }
+
+        public Value VisitDestructuringAssign(Expr.DestructuringAssign e)
+        {
+            var src = Evaluate(e.Value);
+            void assignLocal(string name, Value v)
+            {
+                _env.Assign(name, v);
+            }
+            e.Pat.Bind(this, src, assignLocal, allowConstReassign: true);
+            return Value.Nil();
+        }
+
+        private static int NormalizeIndex(int idx, int len)
+        {
+            if (idx < 0) idx = len + idx;
+            return idx;
+        }
+
+        private static bool CompareEqual(Value a, Value b)
+        {
+            if (a.Type == b.Type)
+            {
+                return a.Equals(b);
+            }
+            // Optional numeric-string numeric equality
+            if (a.Type == ValueType.Number && b.Type == ValueType.String)
+            {
+                if (NumberValue.TryFromString(b.AsString(), out var nb)) return NumberValue.Compare(a.AsNumber(), nb) == 0;
+                return false;
+            }
+            if (a.Type == ValueType.String && b.Type == ValueType.Number)
+            {
+                if (NumberValue.TryFromString(a.AsString(), out var na)) return NumberValue.Compare(na, b.AsNumber()) == 0;
+                return false;
+            }
+            return false;
+        }
+
+        private static bool CompareRel(Value a, Value b, string op)
+        {
+            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+            {
+                int cmp = NumberValue.Compare(a.AsNumber(), b.AsNumber());
+                return op switch
+                {
+                    "<" => cmp < 0,
+                    "<=" => cmp <= 0,
+                    ">" => cmp > 0,
+                    ">=" => cmp >= 0,
+                    _ => false
+                };
+            }
+            if (a.Type == ValueType.String && b.Type == ValueType.String)
+            {
+                int cmp = string.CompareOrdinal(a.AsString(), b.AsString());
+                return op switch
+                {
+                    "<" => cmp < 0,
+                    "<=" => cmp <= 0,
+                    ">" => cmp > 0,
+                    ">=" => cmp >= 0,
+                    _ => false
+                };
+            }
+            throw new MiniDynRuntimeError("Relational comparison only on numbers or strings");
+        }
+
+        private static NumberValue ToNumber(Value v)
+        {
+            return v.Type switch
+            {
+                ValueType.Number => v.AsNumber(),
+                ValueType.Boolean => NumberValue.FromBool(v.AsBoolean()),
+                ValueType.Nil => NumberValue.FromLong(0),
+                ValueType.String => NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0),
+                ValueType.Array => NumberValue.FromLong(0),
+                ValueType.Object => NumberValue.FromLong(0),
+                _ => NumberValue.FromLong(0)
+            };
+        }
+    }
+
+    class Program
+    {
+        static void Run(string source)
+        {
+            var lexer = new Lexer(source);
+            var parser = new Parser(lexer);
+            var program = parser.Parse();
+            var interp = new Interpreter();
+            interp.Interpret(program);
+        }
+
+        static void RunFile(string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine($"File not found: {filePath}");
+                return;
+            }
+            var source = File.ReadAllText(filePath);
+            Run(source);
+        }
+
+        static void Repl()
+        {
+            Console.WriteLine("MiniDynLang REPL. Ctrl+C to exit.");
+            var interp = new Interpreter();
+            while (true)
+            {
+                Console.Write("> ");
+                string line = Console.ReadLine();
+                if (line == null) break;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    var lexer = new Lexer(line);
+                    var parser = new Parser(lexer);
+                    var stmts = parser.Parse();
+
+                    if (stmts.Count == 1 && stmts[0] is Stmt.ExprStmt es)
+                    {
+                        var val = interp.EvaluateWithEnv(es.Expression, interp.Globals);
+                        Console.WriteLine(interp.ToStringValue(val));
+                    }
+                    else
+                    {
+                        interp.Interpret(stmts);
+                    }
+                }
+                catch (MiniDynException ex)
+                {
+                    Console.WriteLine("Error: " + ex.ToString());
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Error: " + ex.Message);
+                }
+            }
+        }
+
+        static void Main(string[] args)
+        {
+            string demo = @"
+                // Patch 1 demo: Objects, property/index assignment, compound ops, destructuring
+
+                // Objects and property access
+                let o = { a: 1, b: 2, c: { nested: true }, d: ""str"" };
+                println(o.a, o[""b""], o.c.nested, o[""d""]);
+                o.a += 5;
+                o[""b""] = o[""b""] * 10;
+                println(o.a, o.b);
+
+                // Computed keys and merge
+                let k = ""x"";
+                let o2 = { [k + ""1""]: 11, [k+""2""]: 22 };
+                println(o2[""x1""], o2[""x2""]);
+                let o3 = merge(o, o2);
+                println(keys(o3));
+
+                // Arrays, index assignment and compound ops
+                let arr = [1,2,3];
+                arr[0] += 41;
+                arr[2] = arr[2] * 3;
+                println(arr);
+
+                // Destructuring declarations
+                let [p, q = 20, ...rest] = [10, , 30, 40, 50];
+                println(p, q, rest);
+
+                const { a, b: bb, z = 99, ...other } = o3;
+                println(a, bb, z, other);
+
+                // Destructuring assignment
+                [p, q] = [100, 200];
+                { a: o.a, b: o.b } = { a: 7, b: 8 }; // assign into object properties
+                println(p, q, o.a, o.b);
+
+                // Object index assignment
+                o[""newKey""] = 123;
+                println(has_key(o, ""newKey""), o[""newKey""]);
+
+                // Strings and numbers still work
+                println(""Hello "" + ""World"", 1 + 2 + 3);
+            ";
+            try
+            {
+                if (args.Length == 0)
+                {
+                    Repl();
+                }
+                else if (args[0] == "-demo")
+                {
+                    Run(demo);
+                }
+                else
+                {
+                    RunFile(args[0]);
+                }
+            }
+            catch (MiniDynException ex)
+            {
+                Console.WriteLine("Runtime error: " + ex.ToString());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Runtime error: " + ex.Message);
+            }
+        }
+    }
+}
