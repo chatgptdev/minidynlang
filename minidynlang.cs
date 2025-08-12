@@ -412,7 +412,8 @@ namespace MiniDynLang
         Equal, NotEqual, Less, LessEq, Greater, GreaterEq,
         Question, Colon, // ternary
         Ellipsis, // ...
-        Dot // .
+        Dot, // .
+        Arrow, // =>
     }
 
     public class Token
@@ -560,6 +561,7 @@ namespace MiniDynLang
                     throw new MiniDynLexError("Unexpected '!'", startLine, startCol);
                 case '=':
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.Equal, "==", null, start, startLine, startCol); }
+                    if (Peek() == '>') { Advance(); return MakeToken(TokenType.Arrow, "=>", null, start, startLine, startCol); }
                     return MakeToken(TokenType.Assign, "=", null, start, startLine, startCol);
                 case '<':
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.LessEq, "<=", null, start, startLine, startCol); }
@@ -715,8 +717,28 @@ namespace MiniDynLang
         }
         public sealed class Call : Expr
         {
-            public Expr Callee; public List<Expr> Args;
-            public Call(Expr callee, List<Expr> args) { Callee = callee; Args = args; }
+            public sealed class Argument
+            {
+                public string Name { get; }  // null for positional
+                public Expr Value { get; }
+                public bool IsNamed => Name != null;
+                
+                public Argument(string name, Expr value)
+                {
+                    Name = name;
+                    Value = value;
+                }
+            }
+            
+            public Expr Callee { get; }
+            public List<Argument> Args { get; }
+            
+            public Call(Expr callee, List<Argument> args) 
+            { 
+                Callee = callee; 
+                Args = args; 
+            }
+            
             public override T Accept<T>(IVisitor<T> v) => v.VisitCall(this);
         }
         public sealed class Grouping : Expr
@@ -1030,7 +1052,7 @@ namespace MiniDynLang
 
             var baseTok = Advance();
             Expr expr = new Expr.Variable((string)baseTok.Literal);
-            
+
             bool hasAccessor = false;          // did we see '.' or '[' ?
 
             while (true)
@@ -1109,10 +1131,12 @@ namespace MiniDynLang
                     Token nameTok = null;
                     if (Match(TokenType.Ellipsis))
                     {
+                        if (sawRest)
+                            throw new MiniDynParseError("Only one rest parameter allowed", Peek().Line, Peek().Column);
                         nameTok = Consume(TokenType.Identifier, "Expected rest parameter name after '...'");
                         parameters.Add(new Expr.Param((string)nameTok.Literal, null, isRest: true));
                         sawRest = true;
-                        break; // rest must be last
+                        continue;  // we keep parsing the remaining parameters
                     }
                     nameTok = Consume(TokenType.Identifier, "Expected parameter name");
                     Expr def = null;
@@ -1122,8 +1146,8 @@ namespace MiniDynLang
                     }
                     parameters.Add(new Expr.Param((string)nameTok.Literal, def, false));
                 } while (Match(TokenType.Comma));
-                if (sawRest && Match(TokenType.Comma))
-                    throw new MiniDynParseError("Rest parameter must be the last parameter", Previous().Line, Previous().Column);
+                // After a rest parameter we simply continue parsing: any further
+                // parameters must be supplied via default or named arguments.
             }
             return parameters;
         }
@@ -1299,19 +1323,88 @@ namespace MiniDynLang
             if (Match(TokenType.While)) return WhileStatement();
             if (Match(TokenType.Break)) { Consume(TokenType.Semicolon, "Expected ';' after break"); return new Stmt.Break(); }
             if (Match(TokenType.Continue)) { Consume(TokenType.Semicolon, "Expected ';' after continue"); return new Stmt.Continue(); }
-
-            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            if (Match(TokenType.Return))
             {
-                // Destructuring assignment statement: [a,b] = expr; or {x,y} = expr;
+                Expr value = null;
+                if (!Check(TokenType.Semicolon)) value = Expression();
+                Consume(TokenType.Semicolon, "Expected ';' after return value");
+                return new Stmt.Return(value);
+            }
+
+            // Array destructuring assignment: [a,b] = expr;
+            if (Check(TokenType.LBracket))
+            {
                 var pat = ParsePattern();
                 Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
                 var val = Expression();
                 Consume(TokenType.Semicolon, "Expected ';'");
                 return new Stmt.ExprStmt(new Expr.DestructuringAssign(pat, val));
             }
-            // Plain block statement
-            if (Match(TokenType.LBrace))
-                return new Stmt.Block(BlockStatementInternal().Statements);
+            
+            // For '{', we need to look ahead to determine if it's a block or destructuring
+            if (Check(TokenType.LBrace))
+            {
+                // Try to determine if this is a destructuring pattern or a block
+                int savePoint = _current;
+                bool isDestructuring = false;
+                
+                try
+                {
+                    Advance(); // consume '{'
+                    
+                    // Look for pattern-like syntax
+                    if (!Check(TokenType.RBrace))
+                    {
+                        // Check if it looks like object destructuring
+                        if (Check(TokenType.Ellipsis) || 
+                            (Check(TokenType.Identifier) && (PeekAhead(1)?.Type == TokenType.Colon || PeekAhead(1)?.Type == TokenType.Comma || PeekAhead(1)?.Type == TokenType.Assign)) ||
+                            Check(TokenType.String))
+                        {
+                            // Skip to find '}'
+                            int braceCount = 1;
+                            while (!IsAtEnd && braceCount > 0)
+                            {
+                                if (Check(TokenType.LBrace)) braceCount++;
+                                else if (Check(TokenType.RBrace)) braceCount--;
+                                if (braceCount > 0) Advance();
+                            }
+                            
+                            if (braceCount == 0)
+                            {
+                                Advance(); // consume '}'
+                                // Check if followed by '='
+                                if (Check(TokenType.Assign))
+                                {
+                                    isDestructuring = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // If we hit an error, assume it's not destructuring
+                }
+                
+                // Restore position
+                _current = savePoint;
+                
+                if (isDestructuring)
+                {
+                    var pat = ParsePattern();
+                    Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
+                    var val = Expression();
+                    Consume(TokenType.Semicolon, "Expected ';'");
+                    return new Stmt.ExprStmt(new Expr.DestructuringAssign(pat, val));
+                }
+                else
+                {
+                    // Plain block statement
+                    Advance(); // consume '{'
+                    return new Stmt.Block(BlockStatementInternal().Statements);
+                }
+            }
+            
             return ExprStatement();
         }
 
@@ -1485,28 +1578,64 @@ namespace MiniDynLang
             return Member();
         }
 
-        private Expr Member()
-        {
-            var expr = Call();
-            while (true)
-            {
-                if (Match(TokenType.Dot))
-                {
-                    var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
-                    expr = new Expr.Property(expr, (string)nameTok.Literal);
-                }
-                else if (Match(TokenType.LBracket))
-                {
-                    var idx = Expression();
-                    Consume(TokenType.RBracket, "Expected ']'");
-                    expr = new Expr.Index(expr, idx);
-                }
-                else
-                {
-                    break;
-                }
-            }
-            return expr;
+        private Expr Member()  
+        {  
+            Expr expr = Primary();  
+        
+            while (true)  
+            {  
+                // 1. function / method call  
+                if (Match(TokenType.LParen))  
+                {  
+                    var args = new List<Expr.Call.Argument>();  
+        
+                    if (!Check(TokenType.RParen))  
+                    {  
+                        do  
+                        {  
+                            // named argument?  
+                            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Colon)  
+                            {  
+                                var nameTok = Advance();          // identifier  
+                                Consume(TokenType.Colon, "Expected ':'");  
+                                args.Add(new Expr.Call.Argument(  
+                                    (string)nameTok.Literal,  
+                                    Expression()));  
+                            }  
+                            else  
+                            {  
+                                // positional  
+                                args.Add(new Expr.Call.Argument(null, Expression()));  
+                            }  
+                        } while (Match(TokenType.Comma));  
+                    }  
+        
+                    Consume(TokenType.RParen, "Expected ')'");  
+                    expr = new Expr.Call(expr, args);  
+                    continue;  
+                }  
+        
+                // 2. property access  
+                if (Match(TokenType.Dot))  
+                {  
+                    var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");  
+                    expr = new Expr.Property(expr, (string)nameTok.Literal);  
+                    continue;  
+                }  
+        
+                // 3. index access  
+                if (Match(TokenType.LBracket))  
+                {  
+                    var indexExpr = Expression();  
+                    Consume(TokenType.RBracket, "Expected ']'");  
+                    expr = new Expr.Index(expr, indexExpr);  
+                    continue;  
+                }  
+        
+                break; // nothing more to fold  
+            }  
+        
+            return expr;  
         }
 
         private Expr Call()
@@ -1516,12 +1645,24 @@ namespace MiniDynLang
             {
                 if (Match(TokenType.LParen))
                 {
-                    var args = new List<Expr>();
+                    var args = new List<Expr.Call.Argument>();
                     if (!Check(TokenType.RParen))
                     {
                         do
                         {
-                            args.Add(Expression());
+                            // Check if this is a named argument
+                            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Colon)
+                            {
+                                var nameTok = Advance();
+                                Consume(TokenType.Colon, "Expected ':'");
+                                var value = Expression();
+                                args.Add(new Expr.Call.Argument((string)nameTok.Literal, value));
+                            }
+                            else
+                            {
+                                // Positional argument
+                                args.Add(new Expr.Call.Argument(null, Expression()));
+                            }
                         } while (Match(TokenType.Comma));
                     }
                     Consume(TokenType.RParen, "Expected ')'");
@@ -1622,15 +1763,117 @@ namespace MiniDynLang
                 Consume(TokenType.RBrace, "Expected '}'");
                 return new Expr.ObjectLiteral(entries);
             }
-            if (Match(TokenType.Identifier))
-                return new Expr.Variable((string)Previous().Literal);
+
             if (Match(TokenType.LParen))
             {
+                // Could be grouped expression or arrow function parameters
+                int savePoint = _current;
+
+                // Try to parse as arrow function parameters
+                if (TryParseArrowFunction(out var arrowFunc))
+                {
+                    return arrowFunc;
+                }
+
+                // Not arrow function, restore and parse as grouping
+                _current = savePoint; // we are already right after '('
                 var e = Expression();
                 Consume(TokenType.RParen, "Expected ')'");
                 return new Expr.Grouping(e);
             }
+
+            // ──────────────── 1. Single-parameter arrow function  x => expr ────────────────
+            // Must be checked before we treat the identifier as an ordinary variable.
+            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Arrow)
+            {
+                var param = Advance();
+                Consume(TokenType.Arrow, "Expected '=>'");
+
+                Stmt.Block bodyBlock;
+                if (Check(TokenType.LBrace))
+                {
+                    // It's a block body, like: n => { ... }
+                    Consume(TokenType.LBrace, "Expected '{' for arrow function block body.");
+                    bodyBlock = BlockStatementInternal();
+                }
+                else
+                {
+                    // It's an expression body, like: n => n * 2
+                    var body = Expression();
+                    bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
+                }
+
+                var parameters = new List<Expr.Param> { new Expr.Param((string)param.Literal) };
+                return new Expr.Function(parameters, bodyBlock);
+            }
+
+            if (Match(TokenType.Fn))
+            {
+                // anonymous/inline function expression
+                Consume(TokenType.LParen, "Expected '(' after 'fn'");
+                var parameters = ParseParamList();
+                Consume(TokenType.RParen, "Expected ')'");
+                Consume(TokenType.LBrace, "Expected '{' before function body");
+                var body = BlockStatementInternal();
+                return new Expr.Function(parameters, body);
+            }
+
+            // Ordinary identifier
+            if (Match(TokenType.Identifier))
+                return new Expr.Variable((string)Previous().Literal);
             throw new MiniDynParseError("Expected expression", Peek().Line, Peek().Column);
+        }
+        
+        private Token PeekAhead(int distance)
+        {
+            if (_current + distance >= _tokens.Count) return null;
+            return _tokens[_current + distance];
+        }
+
+        private bool TryParseArrowFunction(out Expr arrowFunc)
+        {
+            arrowFunc = null;
+            
+            // Save position
+            int start = _current;
+            
+            try
+            {
+                var parameters = ParseParamList();
+                Consume(TokenType.RParen, "Expected ')'");
+                
+                if (!Check(TokenType.Arrow))
+                {
+                    _current = start;
+                    return false;
+                }
+                
+                Consume(TokenType.Arrow, "Expected '=>'");
+                
+                Expr body;
+                Stmt.Block bodyBlock;
+                
+                if (Check(TokenType.LBrace))
+                {
+                    // Block body
+                    Advance(); // consume '{'
+                    bodyBlock = BlockStatementInternal();
+                }
+                else
+                {
+                    // Expression body
+                    body = Expression();
+                    bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
+                }
+                
+                arrowFunc = new Expr.Function(parameters, bodyBlock);
+                return true;
+            }
+            catch
+            {
+                _current = start;
+                return false;
+            }
         }
     }
 
@@ -1717,6 +1960,8 @@ namespace MiniDynLang
         public Environment Closure { get; }
         public string Name { get; }
 
+        private Value _boundThis;
+
         public int ArityMin
         {
             get
@@ -1724,7 +1969,7 @@ namespace MiniDynLang
                 int count = 0;
                 foreach (var p in Params)
                 {
-                    if (p.IsRest) break;
+                    if (p.IsRest) continue;              // rest adds no requirement
                     if (p.Default == null) count++;
                 }
                 return count;
@@ -1749,9 +1994,22 @@ namespace MiniDynLang
                 Params.Add(new ParamSpec(p.Name, p.Default, p.IsRest));
         }
 
+        public UserFunction BindThis(Value thisValue)
+        {
+            var bound = new UserFunction(Name, ToExprParams(), Body, Closure);
+            bound._boundThis = thisValue;
+            return bound;
+        }
+
         public Value Call(Interpreter interp, List<Value> args)
         {
             var env = new Environment(Closure);
+
+            // Define 'this' if bound
+            if (_boundThis != null)
+            {
+                env.DefineConst("this", _boundThis);
+            }
 
             // Bind parameters with defaults and rest
             int i = 0;
@@ -1770,7 +2028,7 @@ namespace MiniDynLang
                     }
                     env.DefineVar(p.Name, Value.Array(rest));
                     i = argsCount;
-                    break;
+                    continue;     // << keep looping so later parameters get defaults / named values
                 }
                 if (i < argsCount)
                 {
@@ -2423,17 +2681,161 @@ namespace MiniDynLang
 
         public Value VisitCall(Expr.Call e)
         {
-            var calleeVal = Evaluate(e.Callee);
-
+            Value receiver = null;
+            Value calleeVal;
+            
+            // Check if this is a method call (obj.method())
+            if (e.Callee is Expr.Property prop)
+            {
+                receiver = Evaluate(prop.Target);
+                calleeVal = VisitProperty(prop);
+            }
+            else
+            {
+                calleeVal = Evaluate(e.Callee);
+            }
+            
             if (calleeVal.Type != ValueType.Function)
                 throw new MiniDynRuntimeError("Can only call functions");
 
             var fn = calleeVal.AsFunction();
-            var args = new List<Value>();
-            foreach (var arg in e.Args) args.Add(Evaluate(arg));
-            if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
-                throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
-            return fn.Call(this, args);
+                
+            // Process arguments
+            List<Value> processedArgs;
+            
+            if (fn is UserFunction userFn)
+            {
+                processedArgs = ProcessNamedArguments(userFn, e.Args);
+                
+                // Bind 'this' for method calls
+                if (receiver != null)
+                {
+                    fn = userFn.BindThis(receiver);
+                }
+            }
+            else
+            {
+                // Built-in functions only support positional arguments
+                if (e.Args.Any(a => a.IsNamed))
+                    throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
+                
+                processedArgs = new List<Value>();
+                foreach (var arg in e.Args)
+                    processedArgs.Add(Evaluate(arg.Value));
+            }
+            
+            if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+            
+            return fn.Call(this, processedArgs);
+        }
+
+        private List<Value> ProcessNamedArguments(UserFunction fn, List<Expr.Call.Argument> args)
+        {
+            var result = new List<Value>(new Value[fn.Params.Count]);
+            var filled = new bool[fn.Params.Count];
+            var namedArgs = new Dictionary<string, Value>();
+            var positionalArgs = new List<Value>();
+            var restArgs = new List<Value>();
+            
+            // First, evaluate all arguments
+            foreach (var arg in args)
+            {
+                if (arg.IsNamed)
+                {
+                    namedArgs[arg.Name] = Evaluate(arg.Value);
+                }
+                else
+                {
+                    positionalArgs.Add(Evaluate(arg.Value));
+                }
+            }
+            
+            // Find rest parameter index if any
+            int restParamIndex = -1;
+            for (int i = 0; i < fn.Params.Count; i++)
+            {
+                if (fn.Params[i].IsRest)
+                {
+                    restParamIndex = i;
+                    break;
+                }
+            }
+            
+            // Fill named arguments
+            foreach (var kv in namedArgs)
+            {
+                bool found = false;
+                for (int i = 0; i < fn.Params.Count; i++)
+                {
+                    if (fn.Params[i].Name == kv.Key && !fn.Params[i].IsRest)
+                    {
+                        if (filled[i])
+                            throw new MiniDynRuntimeError($"Argument '{kv.Key}' specified multiple times");
+                        result[i] = kv.Value;
+                        filled[i] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    if (restParamIndex >= 0)
+                        restArgs.Add(kv.Value); // Extra named args go to rest
+                    else
+                        throw new MiniDynRuntimeError($"Unknown parameter '{kv.Key}'");
+                }
+            }
+            
+            // Fill positional arguments
+            int posIndex = 0;
+            for (int i = 0; i < fn.Params.Count && posIndex < positionalArgs.Count; i++)
+            {
+                if (!filled[i] && !fn.Params[i].IsRest)
+                {
+                    result[i] = positionalArgs[posIndex++];
+                    filled[i] = true;
+                }
+            }
+            
+            // Collect remaining positional args for rest parameter
+            while (posIndex < positionalArgs.Count)
+            {
+                restArgs.Add(positionalArgs[posIndex++]);
+            }
+            
+            // Apply defaults for unfilled parameters
+            for (int i = 0; i < fn.Params.Count; i++)
+            {
+                if (!filled[i] && !fn.Params[i].IsRest)
+                {
+                    if (fn.Params[i].Default != null)
+                    {
+                        result[i] = EvaluateWithEnv(fn.Params[i].Default, CurrentEnv);
+                        filled[i] = true;
+                    }
+                    else
+                    {
+                        throw new MiniDynRuntimeError($"Missing required argument '{fn.Params[i].Name}'");
+                    }
+                }
+            }
+            
+            // Build final argument list
+            var finalArgs = new List<Value>();
+
+            for (int i = 0; i < fn.Params.Count; i++)
+            {
+                if (fn.Params[i].IsRest)
+                {
+                    // push each rest value individually, exactly as the runtime expects
+                    finalArgs.AddRange(restArgs);
+                    continue;
+                }
+                finalArgs.Add(result[i]);   // may be null right now – that’s OK
+            }
+            
+            return finalArgs;
         }
 
         public Value VisitGrouping(Expr.Grouping e) => Evaluate(e.Inner);
@@ -2661,47 +3063,252 @@ namespace MiniDynLang
         static void Main(string[] args)
         {
             string demo = @"
-                // Patch 1 demo: Objects, property/index assignment, compound ops, destructuring
+                    // Patch 1 demo: Objects, property/index assignment, compound ops, destructuring
+                    // Patch 2 demo: Arrow functions, this-binding, and named arguments
 
-                // Objects and property access
-                let o = { a: 1, b: 2, c: { nested: true }, d: ""str"" };
-                println(o.a, o[""b""], o.c.nested, o[""d""]);
-                o.a += 5;
-                o[""b""] = o[""b""] * 10;
-                println(o.a, o.b);
+                    println(""=== ORIGINAL PATCH 1 FEATURES ==="");
+                    
+                    // Objects and property access
+                    let o = { a: 1, b: 2, c: { nested: true }, d: ""str"" };
+                    println(o.a, o[""b""], o.c.nested, o[""d""]);
+                    o.a += 5;
+                    o[""b""] = o[""b""] * 10;
+                    println(o.a, o.b);
 
-                // Computed keys and merge
-                let k = ""x"";
-                let o2 = { [k + ""1""]: 11, [k+""2""]: 22 };
-                println(o2[""x1""], o2[""x2""]);
-                let o3 = merge(o, o2);
-                println(keys(o3));
+                    // Computed keys and merge
+                    let k = ""x"";
+                    let o2 = { [k + ""1""]: 11, [k+""2""]: 22 };
+                    println(o2[""x1""], o2[""x2""]);
+                    let o3 = merge(o, o2);
+                    println(keys(o3));
 
-                // Arrays, index assignment and compound ops
-                let arr = [1,2,3];
-                arr[0] += 41;
-                arr[2] = arr[2] * 3;
-                println(arr);
+                    // Arrays, index assignment and compound ops
+                    let arr = [1,2,3];
+                    arr[0] += 41;
+                    arr[2] = arr[2] * 3;
+                    println(arr);
 
-                // Destructuring declarations
-                let [p, q = 20, ...rest] = [10, , 30, 40, 50];
-                println(p, q, rest);
+                    // Destructuring declarations
+                    let [p, q = 20, ...rest] = [10, , 30, 40, 50];
+                    println(p, q, rest);
 
-                const { a, b: bb, z = 99, ...other } = o3;
-                println(a, bb, z, other);
+                    const { a, b: bb, z = 99, ...other } = o3;
+                    println(a, bb, z, other);
 
-                // Destructuring assignment
-                [p, q] = [100, 200];
-                { a: o.a, b: o.b } = { a: 7, b: 8 }; // assign into object properties
-                println(p, q, o.a, o.b);
+                    // Destructuring assignment
+                    [p, q] = [100, 200];
+                    { a: o.a, b: o.b } = { a: 7, b: 8 }; // assign into object properties
+                    println(p, q, o.a, o.b);
 
-                // Object index assignment
-                o[""newKey""] = 123;
-                println(has_key(o, ""newKey""), o[""newKey""]);
+                    // Object index assignment
+                    o[""newKey""] = 123;
+                    println(has_key(o, ""newKey""), o[""newKey""]);
 
-                // Strings and numbers still work
-                println(""Hello "" + ""World"", 1 + 2 + 3);
-            ";
+                    // Strings and numbers still work
+                    println(""Hello "" + ""World"", 1 + 2 + 3);
+
+                    println();
+                    println(""=== NEW PATCH 2 FEATURES ==="");
+                    
+                    // Arrow functions - expression body
+                    println(""--- Arrow Functions ---"");
+                    let add = (x, y) => x + y;
+                    println(""add(5, 3) ="", add(5, 3));
+                    
+                    // Single parameter arrow function (no parentheses)
+                    let double = x => x * 2;
+                    println(""double(7) ="", double(7));
+                    
+                    // Arrow function with no parameters
+                    let getMessage = () => ""Hello from arrow function!"";
+                    println(getMessage());
+                    
+                    // Arrow function with block body
+                    let factorial = n => {
+                        if (n <= 1) return 1;
+                        return n * factorial(n - 1);
+                    };
+                    println(""factorial(5) ="", factorial(5));
+                    
+                    // Arrow functions with default parameters
+                    let greet = (name, greeting = ""Hello"") => greeting + "", "" + name + ""!"";
+                    println(greet(""World""));
+                    println(greet(""Alice"", ""Hi""));
+                    
+                    // Arrow function with rest parameters
+                    let sum = (...nums) => {
+                        let total = 0;
+                        let i = 0;
+                        while (i < length(nums)) {
+                            total = total + nums[i];
+                            i = i + 1;
+                        }
+                        return total;
+                    };
+                    println(""sum(1, 2, 3, 4, 5) ="", sum(1, 2, 3, 4, 5));
+                    
+                    // Using arrow functions with higher-order functions
+                    let numbers = [1, 2, 3, 4, 5];
+                    let doubled = [];
+                    let i = 0;
+                    while (i < length(numbers)) {
+                        push(doubled, double(numbers[i]));
+                        i = i + 1;
+                    }
+                    println(""doubled:"", doubled);
+                    
+                    // This-binding and methods
+                    println();
+                    println(""--- This-binding and Methods ---"");
+                    
+                    let person = {
+                        name: ""John"",
+                        age: 30,
+                        greet: fn() {
+                            return ""Hello, I'm "" + this.name + "" and I'm "" + this.age + "" years old."";
+                        },
+                        haveBirthday: fn() {
+                            this.age = this.age + 1;
+                            return ""Happy birthday! Now "" + this.age + "" years old."";
+                        }
+                    };
+                    
+                    println(person.greet());
+                    println(person.haveBirthday());
+                    println(person.greet());
+                    
+                    // Method with arrow function - note: arrow functions don't bind their own 'this'
+                    let calculator = {
+                        value: 10,
+                        add: fn(n) { this.value = this.value + n; return this.value; },
+                        multiply: fn(n) { this.value = this.value * n; return this.value; },
+                        getValue: fn() { return this.value; },
+                        // Test nested this access
+                        getDoubler: fn() {
+                            return fn() { return this.value * 2; };
+                        }
+                    };
+                    
+                    println(""Initial value:"", calculator.getValue());
+                    println(""After add(5):"", calculator.add(5));
+                    println(""After multiply(2):"", calculator.multiply(2));
+                    let doubler = calculator.getDoubler();
+                    println(""Doubled value:"", doubler());
+                    
+                    // Named arguments
+                    println();
+                    println(""--- Named Arguments ---"");
+                    
+                    // Function with default parameters
+                    fn createUser(name, age = 25, city = ""Unknown"", active = true) {
+                        return {
+                            name: name,
+                            age: age,
+                            city: city,
+                            active: active
+                        };
+                    }
+                    
+                    // Call with positional arguments
+                    let user1 = createUser(""Alice"", 28, ""New York"", true);
+                    println(""user1:"", user1);
+                    
+                    // Call with named arguments
+                    let user2 = createUser(name: ""Bob"", city: ""London"", age: 35);
+                    println(""user2:"", user2);
+                    
+                    // Mixed positional and named arguments
+                    let user3 = createUser(""Charlie"", city: ""Tokyo"", active: false);
+                    println(""user3:"", user3);
+                    
+                    // All named arguments in different order
+                    let user4 = createUser(active: false, name: ""David"", age: 40, city: ""Paris"");
+                    println(""user4:"", user4);
+                    
+                    // Function with rest parameters and named arguments
+                    fn formatMessage(template, ...values, prefix = ""MSG: "", suffix = ""!"") {
+                        let result = prefix + template;
+                        let i = 0;
+                        while (i < length(values)) {
+                            result = result + "" ["" + values[i] + ""]"";
+                            i = i + 1;
+                        }
+                        return result + suffix;
+                    }
+                    
+                    println(formatMessage(""Error"", ""404"", ""Not Found""));
+                    println(formatMessage(""Info"", prefix: ""INFO: "", suffix: "" [OK]""));
+                    println(formatMessage(template: ""Warning"", prefix: ""WARN: ""));
+                    
+                    // Arrow function with named arguments
+                    let configure = (host = ""localhost"", port = 8080, ssl = false) => {
+                        return {
+                            url: (ssl ? ""https://"" : ""http://"") + host + "":"" + port
+                        };
+                    };
+                    
+                    println(configure());
+                    println(configure(port: 443, ssl: true));
+                    println(configure(""example.com"", ssl: true, port: 9000));
+                    
+                    // Complex example combining all features
+                    println();
+                    println(""--- Combined Features Example ---"");
+                    
+                    let team = {
+                        name: ""Development Team"",
+                        members: [],
+                        addMember: fn(name, role = ""Developer"", skills = []) {
+                            let member = {
+                                name: name,
+                                role: role,
+                                skills: skills,
+                                introduce: fn() {
+                                    return ""Hi, I'm "" + this.name + "", a "" + this.role + 
+                                        "" with skills: "" + join(this.skills, "", "");
+                                }
+                            };
+                            push(this.members, member);
+                            return member;
+                        },
+                        listMembers: fn() {
+                            println(""Team: "" + this.name);
+                            let i = 0;
+                            while (i < length(this.members)) {
+                                println(""  - "" + this.members[i].introduce());
+                                i = i + 1;
+                            }
+                        }
+                    };
+                    
+                    // Add members using different argument styles
+                    team.addMember(""Alice"", ""Lead Developer"", [""JavaScript"", ""Python""]);
+                    team.addMember(name: ""Bob"", skills: [""Java"", ""C++""], role: ""Senior Developer"");
+                    team.addMember(""Charlie"", skills: [""Go"", ""Rust""]);
+                    
+                    // Arrow function to find members by skill
+                    let findBySkill = skill => {
+                        let found = [];
+                        let i = 0;
+                        while (i < length(team.members)) {
+                            let member = team.members[i];
+                            let j = 0;
+                            while (j < length(member.skills)) {
+                                if (member.skills[j] == skill) {
+                                    push(found, member.name);
+                                    break;
+                                }
+                                j = j + 1;
+                            }
+                            i = i + 1;
+                        }
+                        return found;
+                    };
+                    
+                    team.listMembers();
+                    println(""Members who know Python:"", findBySkill(""Python""));
+                    println(""Members who know Go:"", findBySkill(""Go""));
+                ";
             try
             {
                 if (args.Length == 0)
