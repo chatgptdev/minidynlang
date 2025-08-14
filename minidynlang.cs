@@ -1133,32 +1133,52 @@ namespace MiniDynLang
 
         private List<Expr.Param> ParseParamList()
         {
-            List<Expr.Param> parameters = new();
+            var parameters = new List<Expr.Param>();
             if (!Check(TokenType.RParen))
             {
+                var seen = new HashSet<string>(StringComparer.Ordinal);
                 bool sawRest = false;
-                do
+
+                while (true)
                 {
-                    Token nameTok;
                     if (Match(TokenType.Ellipsis))
                     {
                         if (sawRest)
                             throw new MiniDynParseError("Only one rest parameter allowed", Peek().Line, Peek().Column);
-                        nameTok = Consume(TokenType.Identifier, "Expected rest parameter name after '...'");
-                        parameters.Add(new Expr.Param((string)nameTok.Literal!, null, isRest: true));
+
+                        var nameTok = Consume(TokenType.Identifier, "Expected rest parameter name after '...'");
+                        var name = (string)nameTok.Literal!;
+
+                        if (!seen.Add(name))
+                            throw new MiniDynParseError($"Duplicate parameter name '{name}'", nameTok.Line, nameTok.Column);
+
+                        parameters.Add(new Expr.Param(name, null, isRest: true));
                         sawRest = true;
-                        continue;  // we keep parsing the remaining parameters
+
+                        // Rest MUST be last — forbid a trailing comma and anything after it.
+                        if (Match(TokenType.Comma))
+                            throw new MiniDynParseError("Rest parameter must be last", Peek().Line, Peek().Column);
+
+                        break; // no more params allowed after rest
                     }
-                    nameTok = Consume(TokenType.Identifier, "Expected parameter name");
+
+                    // Normal parameter
+                    var nameTok2 = Consume(TokenType.Identifier, "Expected parameter name");
+                    var pname = (string)nameTok2.Literal!;
+
+                    if (!seen.Add(pname))
+                        throw new MiniDynParseError($"Duplicate parameter name '{pname}'", nameTok2.Line, nameTok2.Column);
+
                     Expr? def = null;
                     if (Match(TokenType.Assign))
                     {
                         def = Expression();
                     }
-                    parameters.Add(new Expr.Param((string)nameTok.Literal!, def, false));
-                } while (Match(TokenType.Comma));
-                // After a rest parameter we simply continue parsing: any further
-                // parameters must be supplied via default or named arguments.
+                    parameters.Add(new Expr.Param(pname, def, isRest: false));
+
+                    if (!Match(TokenType.Comma))
+                        break;
+                }
             }
             return parameters;
         }
@@ -2780,41 +2800,33 @@ namespace MiniDynLang
         {
             var result = new List<Value?>(new Value?[fn.Params.Count]);
             var filled = new bool[fn.Params.Count];
-            var namedArgs = new Dictionary<string, Value>();
+            var namedArgs = new Dictionary<string, Value>(StringComparer.Ordinal);
             var positionalArgs = new List<Value>();
             var restArgs = new List<Value>();
-            
-            // First, evaluate all arguments
+
+            // Evaluate all arguments first
             foreach (var arg in args)
             {
                 if (arg.IsNamed)
-                {
                     namedArgs[arg.Name!] = Evaluate(arg.Value);
-                }
                 else
-                {
                     positionalArgs.Add(Evaluate(arg.Value));
-                }
             }
-            
-            // Find rest parameter index if any
+
+            // Index of rest param, if present
             int restParamIndex = -1;
             for (int i = 0; i < fn.Params.Count; i++)
             {
-                if (fn.Params[i].IsRest)
-                {
-                    restParamIndex = i;
-                    break;
-                }
+                if (fn.Params[i].IsRest) { restParamIndex = i; break; }
             }
-            
-            // Fill named arguments
+
+            // Apply named arguments to matching parameters (non-rest only)
             foreach (var kv in namedArgs)
             {
                 bool found = false;
                 for (int i = 0; i < fn.Params.Count; i++)
                 {
-                    if (fn.Params[i].Name == kv.Key && !fn.Params[i].IsRest)
+                    if (!fn.Params[i].IsRest && fn.Params[i].Name == kv.Key)
                     {
                         if (filled[i])
                             throw new MiniDynRuntimeError($"Argument '{kv.Key}' specified multiple times");
@@ -2826,14 +2838,12 @@ namespace MiniDynLang
                 }
                 if (!found)
                 {
-                    if (restParamIndex >= 0)
-                        restArgs.Add(kv.Value); // Extra named args go to rest
-                    else
-                        throw new MiniDynRuntimeError($"Unknown parameter '{kv.Key}'");
+                    // Do NOT push unknown named args into rest; this is an error.
+                    throw new MiniDynRuntimeError($"Unknown parameter '{kv.Key}'");
                 }
             }
-            
-            // Fill positional arguments
+
+            // Fill remaining non-rest parameters with positional args, left to right
             int posIndex = 0;
             for (int i = 0; i < fn.Params.Count && posIndex < positionalArgs.Count; i++)
             {
@@ -2843,14 +2853,12 @@ namespace MiniDynLang
                     filled[i] = true;
                 }
             }
-            
-            // Collect remaining positional args for rest parameter
+
+            // Remaining positional args go to rest (if present)
             while (posIndex < positionalArgs.Count)
-            {
                 restArgs.Add(positionalArgs[posIndex++]);
-            }
-            
-            // Apply defaults for unfilled parameters
+
+            // Apply defaults for any still-unfilled non-rest parameters
             for (int i = 0; i < fn.Params.Count; i++)
             {
                 if (!filled[i] && !fn.Params[i].IsRest)
@@ -2866,24 +2874,22 @@ namespace MiniDynLang
                     }
                 }
             }
-            
-            // Build final argument list
-            var finalArgs = new List<Value>();
 
+            // Build the final positional list to call into UserFunction.Call
+            // Place rest args exactly at the rest param position (and rest MUST be last after parser patch).
+            var finalArgs = new List<Value>();
             for (int i = 0; i < fn.Params.Count; i++)
             {
                 if (fn.Params[i].IsRest)
                 {
-                    // push each rest value individually, exactly as the runtime expects
                     finalArgs.AddRange(restArgs);
                     continue;
                 }
-                // At this point, all non-rest parameters should have a value.
                 finalArgs.Add(result[i]!);
             }
-            
             return finalArgs;
         }
+
 
         public Value VisitGrouping(Expr.Grouping e) => Evaluate(e.Inner);
 
@@ -3110,6 +3116,32 @@ namespace MiniDynLang
             }
         }
 
+        static void RunExpectParseError(string source, string label)
+        {
+            try
+            {
+                Run(source);
+                Console.WriteLine($"FAIL: expected parse error not thrown: {label}");
+            }
+            catch (MiniDynParseError ex)
+            {
+                Console.WriteLine($"OK (parse error: {label}) -> {ex.Message}");
+            }
+        }
+
+        static void RunExpectRuntimeError(string source, string label)
+        {
+            try
+            {
+                Run(source);
+                Console.WriteLine($"FAIL: expected runtime error not thrown: {label}");
+            }
+            catch (MiniDynRuntimeError ex)
+            {
+                Console.WriteLine($"OK (runtime error: {label}) -> {ex.Message}");
+            }
+        }
+
         static void Main(string[] args)
         {
             string demo = @"
@@ -3276,7 +3308,7 @@ namespace MiniDynLang
                     println(""user4:"", user4);
                     
                     // Function with rest parameters and named arguments
-                    fn formatMessage(template, ...values, prefix = ""MSG: "", suffix = ""!"") {
+                    fn formatMessage(template, prefix = ""MSG: "", suffix = ""!"", ...values) {
                         let result = prefix + template;
                         let i = 0;
                         while (i < length(values)) {
@@ -3285,8 +3317,9 @@ namespace MiniDynLang
                         }
                         return result + suffix;
                     }
-                    
-                    println(formatMessage(""Error"", ""404"", ""Not Found""));
+
+                    // Pass explicit prefix/suffix when you also want extra trailing values:
+                    println(formatMessage(""Error"", ""MSG: "", ""!"", ""404"", ""Not Found""));
                     println(formatMessage(""Info"", prefix: ""INFO: "", suffix: "" [OK]""));
                     println(formatMessage(template: ""Warning"", prefix: ""WARN: ""));
                     
@@ -3300,7 +3333,17 @@ namespace MiniDynLang
                     println(configure());
                     println(configure(port: 443, ssl: true));
                     println(configure(""example.com"", ssl: true, port: 9000));
-                    
+
+                    println();
+                    println(""=== REST-LAST TESTS ==="");
+
+                    fn restLastDemo(a, b = 2, ...r) {
+                        println(""a="", a, "" b="", b, "" rest="", r);
+                    }
+                    restLastDemo(1);                  // a=1 b=2 rest=[]
+                    restLastDemo(1, 3, 4, 5);         // a=1 b=3 rest=[4, 5]
+                    restLastDemo(b: 10, a: 7, 8, 9);  // a=7 b=10 rest=[8, 9]
+
                     // Complex example combining all features
                     println();
                     println(""--- Combined Features Example ---"");
@@ -3429,6 +3472,18 @@ namespace MiniDynLang
                 else if (args[0] == "-demo")
                 {
                     Run(demo);
+
+                    Console.WriteLine();
+                    Console.WriteLine("=== NEGATIVE TESTS (should error) ===");
+
+                    // 1) Rest not last -> parse error
+                    RunExpectParseError(@"fn bad1(a, ...r, b) { return 0; }", "rest must be last");
+
+                    // 2) Duplicate parameter names -> parse error
+                    RunExpectParseError(@"fn bad2(x, y, x) { return 0; }", "duplicate parameter name");
+
+                    // 3) Unknown named argument -> runtime error
+                    RunExpectRuntimeError(@"fn f(a) { println(a); } f(b: 1);", "unknown named argument");
                 }
                 else
                 {
