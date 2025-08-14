@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Text;
 
@@ -205,7 +207,7 @@ namespace MiniDynLang
                 _ => 0
             };
         }
-        public override bool Equals(object obj)
+        public override bool Equals([NotNullWhen(true)] object? obj)
         {
             if (obj is not NumberValue n) return false;
             if (Kind == n.Kind)
@@ -252,8 +254,8 @@ namespace MiniDynLang
     {
         public readonly Dictionary<string, Value> Props;
         public ObjectValue() { Props = new Dictionary<string, Value>(); }
-        public ObjectValue(Dictionary<string, Value> dict) { Props = dict ?? new Dictionary<string, Value>(); }
-        public bool TryGet(string key, out Value v) => Props.TryGetValue(key, out v);
+        public ObjectValue(Dictionary<string, Value>? dict) { Props = dict ?? new Dictionary<string, Value>(); }
+        public bool TryGet(string key, [NotNullWhen(true)] out Value? v) => Props.TryGetValue(key, out v);
         public void Set(string key, Value v) => Props[key] = v;
         public bool Remove(string key) => Props.Remove(key);
         public int Count => Props.Count;
@@ -283,46 +285,46 @@ namespace MiniDynLang
     {
         public ValueType Type { get; }
         private readonly NumberValue _num;
-        private readonly string _str;
+        private readonly string? _str;
         private readonly bool _bool;
-        private readonly ICallable _func;
-        private readonly ArrayValue _arr;
-        private readonly ObjectValue _obj;
+        private readonly ICallable? _func;
+        private readonly ArrayValue? _arr;
+        private readonly ObjectValue? _obj;
 
         private static readonly Value TrueVal = new Value(ValueType.Boolean, default, null, true, null, null, null);
         private static readonly Value FalseVal = new Value(ValueType.Boolean, default, null, false, null, null, null);
         private static readonly Value NilVal = new Value(ValueType.Nil, default, null, false, null, null, null);
 
-        private Value(ValueType t, NumberValue n, string s, bool b, ICallable f, ArrayValue a, ObjectValue o)
+        private Value(ValueType t, NumberValue n, string? s, bool b, ICallable? f, ArrayValue? a, ObjectValue? o)
         {
             Type = t; _num = n; _str = s; _bool = b; _func = f; _arr = a; _obj = o;
         }
 
         public static Value Number(NumberValue n) => new Value(ValueType.Number, n, null, false, null, null, null);
-        public static Value String(string s) => new Value(ValueType.String, default, s ?? "", false, null, null, null);
+        public static Value String(string? s) => new Value(ValueType.String, default, s ?? "", false, null, null, null);
         public static Value Boolean(bool b) => b ? TrueVal : FalseVal;
         public static Value Nil() => NilVal;
         public static Value Function(ICallable f) => new Value(ValueType.Function, default, null, false, f, null, null);
-        public static Value Array(ArrayValue a) => new Value(ValueType.Array, default, null, false, null, a ?? new ArrayValue(), null);
-        public static Value Object(ObjectValue o) => new Value(ValueType.Object, default, null, false, null, null, o ?? new ObjectValue());
+        public static Value Array(ArrayValue? a) => new Value(ValueType.Array, default, null, false, null, a ?? new ArrayValue(), null);
+        public static Value Object(ObjectValue? o) => new Value(ValueType.Object, default, null, false, null, null, o ?? new ObjectValue());
 
         public NumberValue AsNumber() => Type == ValueType.Number ? _num : throw new MiniDynRuntimeError("Expected number");
-        public string AsString() => Type == ValueType.String ? _str : throw new MiniDynRuntimeError("Expected string");
+        public string AsString() => Type == ValueType.String ? _str! : throw new MiniDynRuntimeError("Expected string");
         public bool AsBoolean() => Type == ValueType.Boolean ? _bool : throw new MiniDynRuntimeError("Expected boolean");
-        public ICallable AsFunction() => Type == ValueType.Function ? _func : throw new MiniDynRuntimeError("Expected function");
-        public ArrayValue AsArray() => Type == ValueType.Array ? _arr : throw new MiniDynRuntimeError("Expected array");
-        public ObjectValue AsObject() => Type == ValueType.Object ? _obj : throw new MiniDynRuntimeError("Expected object");
+        public ICallable AsFunction() => Type == ValueType.Function ? _func! : throw new MiniDynRuntimeError("Expected function");
+        public ArrayValue AsArray() => Type == ValueType.Array ? _arr! : throw new MiniDynRuntimeError("Expected array");
+        public ObjectValue AsObject() => Type == ValueType.Object ? _obj! : throw new MiniDynRuntimeError("Expected object");
 
         public override string ToString()
         {
             return Type switch
             {
                 ValueType.Number => _num.ToString(),
-                ValueType.String => _str,
+                ValueType.String => _str!, // _str is guaranteed non-null for string values
                 ValueType.Boolean => _bool ? "true" : "false",
-                ValueType.Function => _func.ToString(),
-                ValueType.Array => _arr.ToString(),
-                ValueType.Object => _obj.ToString(),
+                ValueType.Function => _func?.ToString() ?? "<function>",
+                ValueType.Array => _arr?.ToString() ?? "[]",
+                ValueType.Object => _obj?.ToString() ?? "{}",
                 _ => "nil"
             };
         }
@@ -336,13 +338,13 @@ namespace MiniDynLang
                 ValueType.Number => NumberValue.Compare(v._num, NumberValue.FromLong(0)) != 0,
                 ValueType.String => !string.IsNullOrEmpty(v._str),
                 ValueType.Function => true,
-                ValueType.Array => v._arr.Length != 0,
-                ValueType.Object => v._obj.Count != 0,
+                ValueType.Array => v._arr!.Length != 0,
+                ValueType.Object => v._obj!.Count != 0,
                 _ => false
             };
         }
 
-        public override bool Equals(object obj)
+        public override bool Equals([NotNullWhen(true)] object? obj)
         {
             if (obj is not Value o || o.Type != Type) return false;
             return Type switch
@@ -365,9 +367,9 @@ namespace MiniDynLang
                 ValueType.Boolean => _bool.GetHashCode(),
                 ValueType.Number => _num.GetHashCode(),
                 ValueType.String => _str?.GetHashCode() ?? 0,
-                ValueType.Function => _func.GetHashCode(),
-                ValueType.Array => _arr.GetHashCode(),
-                ValueType.Object => _obj.GetHashCode(),
+                ValueType.Function => _func?.GetHashCode() ?? 0,
+                ValueType.Array => _arr?.GetHashCode() ?? 0,
+                ValueType.Object => _obj?.GetHashCode() ?? 0,
                 _ => 0
             };
         }
@@ -420,12 +422,12 @@ namespace MiniDynLang
     {
         public TokenType Type { get; }
         public string Lexeme { get; }
-        public object Literal { get; }
+        public object? Literal { get; }
         public int Position { get; }
         public int Line { get; }
         public int Column { get; }
 
-        public Token(TokenType type, string lexeme, object literal, int pos, int line, int column)
+        public Token(TokenType type, string lexeme, object? literal, int pos, int line, int column)
         {
             Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column;
         }
@@ -499,7 +501,7 @@ namespace MiniDynLang
             }
         }
 
-        private Token MakeToken(TokenType t, string lexeme, object lit, int startPos, int startLine, int startCol)
+        private Token MakeToken(TokenType t, string lexeme, object? lit, int startPos, int startLine, int startCol)
             => new Token(t, lexeme, lit, startPos, startLine, startCol);
 
         public Token NextToken()
@@ -719,11 +721,11 @@ namespace MiniDynLang
         {
             public sealed class Argument
             {
-                public string Name { get; }  // null for positional
+                public string? Name { get; }  // null for positional
                 public Expr Value { get; }
                 public bool IsNamed => Name != null;
                 
-                public Argument(string name, Expr value)
+                public Argument(string? name, Expr value)
                 {
                     Name = name;
                     Value = value;
@@ -751,9 +753,15 @@ namespace MiniDynLang
         {
             public List<Param> Parameters;
             public Stmt.Block Body;
-            public Function(List<Param> parameters, Stmt.Block body) { Parameters = parameters; Body = body; }
+            public bool IsArrow;
+
+            public Function(List<Param> parameters, Stmt.Block body, bool isArrow = false)
+            {
+                Parameters = parameters; Body = body; IsArrow = isArrow;
+            }
             public override T Accept<T>(IVisitor<T> v) => v.VisitFunction(this);
         }
+
         public sealed class Ternary : Expr
         {
             public Expr Cond, Then, Else;
@@ -777,10 +785,10 @@ namespace MiniDynLang
         {
             public sealed class Entry
             {
-                public string KeyName; // when identifier key or string literal
-                public Expr KeyExpr;   // when computed key
+                public string? KeyName; // when identifier key or string literal
+                public Expr? KeyExpr;   // when computed key
                 public Expr ValueExpr;
-                public Entry(string keyName, Expr keyExpr, Expr valueExpr) { KeyName = keyName; KeyExpr = keyExpr; ValueExpr = valueExpr; }
+                public Entry(string? keyName, Expr? keyExpr, Expr valueExpr) { KeyName = keyName; KeyExpr = keyExpr; ValueExpr = valueExpr; }
             }
             public List<Entry> Entries;
             public ObjectLiteral(List<Entry> entries) { Entries = entries; }
@@ -824,13 +832,13 @@ namespace MiniDynLang
             public sealed class Elem
             {
                 public Pattern Inner;
-                public Expr Default; // optional
-                public Elem(Pattern inner, Expr def) { Inner = inner; Default = def; }
+                public Expr? Default; // optional
+                public Elem(Pattern inner, Expr? def) { Inner = inner; Default = def; }
             }
             public List<Elem> Elements;
             public bool HasRest;
-            public Pattern RestPattern; // PatternIdentifier or nested
-            public PatternArray(List<Elem> elements, bool hasRest = false, Pattern rest = null)
+            public Pattern? RestPattern; // PatternIdentifier or nested
+            public PatternArray(List<Elem> elements, bool hasRest = false, Pattern? rest = null)
             {
                 Elements = elements; HasRest = hasRest; RestPattern = rest;
             }
@@ -872,14 +880,14 @@ namespace MiniDynLang
             {
                 public string SourceKey;
                 public Pattern TargetPattern; // often PatternIdentifier
-                public Expr Default;
-                public Prop(string key, Pattern pat, Expr def) { SourceKey = key; TargetPattern = pat; Default = def; }
+                public Expr? Default;
+                public Prop(string key, Pattern pat, Expr? def) { SourceKey = key; TargetPattern = pat; Default = def; }
             }
 
             public List<Prop> Props;
             public bool HasRest;
-            public Pattern RestPattern; // binds remaining keys as object
-            public PatternObject(List<Prop> props, bool hasRest = false, Pattern rest = null)
+            public Pattern? RestPattern; // binds remaining keys as object
+            public PatternObject(List<Prop> props, bool hasRest = false, Pattern? rest = null)
             {
                 Props = props; HasRest = hasRest; RestPattern = rest;
             }
@@ -930,9 +938,9 @@ namespace MiniDynLang
         public sealed class Param
         {
             public string Name;
-            public Expr Default;
+            public Expr? Default;
             public bool IsRest;
-            public Param(string name, Expr def = null, bool isRest = false)
+            public Param(string name, Expr? def = null, bool isRest = false)
             {
                 Name = name; Default = def; IsRest = isRest;
             }
@@ -966,14 +974,16 @@ namespace MiniDynLang
         }
         public sealed class Var : Stmt
         {
-            public string Name; public Expr Initializer;
-            public Var(string name, Expr init) { Name = name; Initializer = init; }
+            public string Name; 
+            public Expr? Initializer;
+            public Var(string name, Expr? init) { Name = name; Initializer = init; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitVar(this);
         }
         public sealed class Let : Stmt
         {
-            public string Name; public Expr Initializer;
-            public Let(string name, Expr init) { Name = name; Initializer = init; }
+            public string Name; 
+            public Expr? Initializer;
+            public Let(string name, Expr? init) { Name = name; Initializer = init; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitLet(this);
         }
         public sealed class Const : Stmt
@@ -999,8 +1009,9 @@ namespace MiniDynLang
         }
         public sealed class If : Stmt
         {
-            public Expr Condition; public Stmt Then; public Stmt Else;
-            public If(Expr cond, Stmt thenS, Stmt elseS) { Condition = cond; Then = thenS; Else = elseS; }
+            public Expr Condition; public Stmt Then; 
+            public Stmt? Else;
+            public If(Expr cond, Stmt thenS, Stmt? elseS) { Condition = cond; Then = thenS; Else = elseS; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitIf(this);
         }
         public sealed class While : Stmt
@@ -1018,8 +1029,8 @@ namespace MiniDynLang
         }
         public sealed class Return : Stmt
         {
-            public Expr Value;
-            public Return(Expr value) { Value = value; }
+            public Expr? Value;
+            public Return(Expr? value) { Value = value; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitReturn(this);
         }
         public sealed class Break : Stmt
@@ -1051,7 +1062,7 @@ namespace MiniDynLang
                 return ParseSinglePattern();
 
             var baseTok = Advance();
-            Expr expr = new Expr.Variable((string)baseTok.Literal);
+            Expr expr = new Expr.Variable((string)baseTok.Literal!);
 
             bool hasAccessor = false;          // did we see '.' or '[' ?
 
@@ -1060,7 +1071,7 @@ namespace MiniDynLang
                 if (Match(TokenType.Dot))
                 {
                     var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
-                    expr = new Expr.Property(expr, (string)nameTok.Literal);
+                    expr = new Expr.Property(expr, (string)nameTok.Literal!);
                     hasAccessor = true;
                 }
                 else if (Match(TokenType.LBracket))
@@ -1075,7 +1086,7 @@ namespace MiniDynLang
 
             // simple alias like "bb" - declare a new variable
             if (!hasAccessor)
-                return new Expr.PatternIdentifier((string)baseTok.Literal);
+                return new Expr.PatternIdentifier((string)baseTok.Literal!);
 
             return new Expr.PatternLValue(expr);
         }
@@ -1128,23 +1139,23 @@ namespace MiniDynLang
                 bool sawRest = false;
                 do
                 {
-                    Token nameTok = null;
+                    Token nameTok;
                     if (Match(TokenType.Ellipsis))
                     {
                         if (sawRest)
                             throw new MiniDynParseError("Only one rest parameter allowed", Peek().Line, Peek().Column);
                         nameTok = Consume(TokenType.Identifier, "Expected rest parameter name after '...'");
-                        parameters.Add(new Expr.Param((string)nameTok.Literal, null, isRest: true));
+                        parameters.Add(new Expr.Param((string)nameTok.Literal!, null, isRest: true));
                         sawRest = true;
                         continue;  // we keep parsing the remaining parameters
                     }
                     nameTok = Consume(TokenType.Identifier, "Expected parameter name");
-                    Expr def = null;
+                    Expr? def = null;
                     if (Match(TokenType.Assign))
                     {
                         def = Expression();
                     }
-                    parameters.Add(new Expr.Param((string)nameTok.Literal, def, false));
+                    parameters.Add(new Expr.Param((string)nameTok.Literal!, def, false));
                 } while (Match(TokenType.Comma));
                 // After a rest parameter we simply continue parsing: any further
                 // parameters must be supplied via default or named arguments.
@@ -1160,7 +1171,7 @@ namespace MiniDynLang
             Consume(TokenType.RParen, "Expected ')'");
             Consume(TokenType.LBrace, "Expected '{' before function body");
             var body = BlockStatementInternal();
-            return new Stmt.Function((string)nameTok.Literal, new Expr.Function(parameters, body));
+            return new Stmt.Function((string)nameTok.Literal!, new Expr.Function(parameters, body, isArrow: false));
         }
 
         // Destructuring patterns
@@ -1170,7 +1181,7 @@ namespace MiniDynLang
             {
                 var elements = new List<Expr.PatternArray.Elem>();
                 bool hasRest = false;
-                Expr.Pattern rest = null;
+                Expr.Pattern? rest = null;
                 if (!Check(TokenType.RBracket))
                 {
                     do
@@ -1182,7 +1193,7 @@ namespace MiniDynLang
                             break;
                         }
                         var pat = ParseSinglePattern();
-                        Expr def = null;
+                        Expr? def = null;
                         if (Match(TokenType.Assign))
                         {
                             def = Expression();
@@ -1197,7 +1208,7 @@ namespace MiniDynLang
             {
                 var props = new List<Expr.PatternObject.Prop>();
                 bool hasRest = false;
-                Expr.Pattern rest = null;
+                Expr.Pattern? rest = null;
                 if (!Check(TokenType.RBrace))
                 {
                     do
@@ -1211,9 +1222,9 @@ namespace MiniDynLang
                         // key [: aliasPattern] [= default]
                         string key;
                         if (Match(TokenType.Identifier))
-                            key = (string)Previous().Literal;
+                            key = (string)Previous().Literal!;
                         else if (Match(TokenType.String))
-                            key = (string)Previous().Literal;
+                            key = (string)Previous().Literal!;
                         else
                             throw new MiniDynParseError("Expected property name in object pattern", Peek().Line, Peek().Column);
 
@@ -1226,7 +1237,7 @@ namespace MiniDynLang
                         {
                             aliasPat = new Expr.PatternIdentifier(key);
                         }
-                        Expr def = null;
+                        Expr? def = null;
                         if (Match(TokenType.Assign))
                         {
                             def = Expression();
@@ -1247,7 +1258,7 @@ namespace MiniDynLang
         {
             if (Match(TokenType.Identifier))
             {
-                return new Expr.PatternIdentifier((string)Previous().Literal);
+                return new Expr.PatternIdentifier((string)Previous().Literal!);
             }
             else if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
@@ -1262,18 +1273,18 @@ namespace MiniDynLang
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
                 var pat = ParsePattern();
-                Expr init = null;
+                Expr init;
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
                 return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var);
             }
             var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-            Expr init2 = null;
+            Expr? init2 = null;
             if (Match(TokenType.Assign))
                 init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Var((string)nameTok.Literal, init2);
+            return new Stmt.Var((string)nameTok.Literal!, init2);
         }
 
         private Stmt LetDeclOrDestructuring()
@@ -1281,18 +1292,18 @@ namespace MiniDynLang
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
                 var pat = ParsePattern();
-                Expr init = null;
+                Expr init;
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
                 return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let);
             }
             var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-            Expr init2 = null;
+            Expr? init2 = null;
             if (Match(TokenType.Assign))
                 init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Let((string)nameTok.Literal, init2);
+            return new Stmt.Let((string)nameTok.Literal!, init2);
         }
 
         private Stmt ConstDeclOrDestructuring()
@@ -1308,7 +1319,7 @@ namespace MiniDynLang
             Consume(TokenType.Assign, "Expected '=' after const name");
             var init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Const((string)nameTok.Literal, init2);
+            return new Stmt.Const((string)nameTok.Literal!, init2);
         }
 
         private Expr ParseInitializerRequired()
@@ -1325,7 +1336,7 @@ namespace MiniDynLang
             if (Match(TokenType.Continue)) { Consume(TokenType.Semicolon, "Expected ';' after continue"); return new Stmt.Continue(); }
             if (Match(TokenType.Return))
             {
-                Expr value = null;
+                Expr? value = null;
                 if (!Check(TokenType.Semicolon)) value = Expression();
                 Consume(TokenType.Semicolon, "Expected ';' after return value");
                 return new Stmt.Return(value);
@@ -1355,9 +1366,10 @@ namespace MiniDynLang
                     // Look for pattern-like syntax
                     if (!Check(TokenType.RBrace))
                     {
+                        var nextToken = PeekAhead(1);
                         // Check if it looks like object destructuring
                         if (Check(TokenType.Ellipsis) || 
-                            (Check(TokenType.Identifier) && (PeekAhead(1)?.Type == TokenType.Colon || PeekAhead(1)?.Type == TokenType.Comma || PeekAhead(1)?.Type == TokenType.Assign)) ||
+                            (Check(TokenType.Identifier) && (nextToken?.Type == TokenType.Colon || nextToken?.Type == TokenType.Comma || nextToken?.Type == TokenType.Assign)) ||
                             Check(TokenType.String))
                         {
                             // Skip to find '}'
@@ -1414,7 +1426,7 @@ namespace MiniDynLang
             var cond = Expression();
             Consume(TokenType.RParen, "Expected ')'");
             var thenS = Statement();
-            Stmt elseS = null;
+            Stmt? elseS = null;
             if (Match(TokenType.Else)) elseS = Statement();
             return new Stmt.If(cond, thenS, elseS);
         }
@@ -1593,13 +1605,14 @@ namespace MiniDynLang
                     {  
                         do  
                         {  
+                            var nextToken = PeekAhead(1);
                             // named argument?  
-                            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Colon)  
+                            if (Check(TokenType.Identifier) && nextToken?.Type == TokenType.Colon)  
                             {  
                                 var nameTok = Advance();          // identifier  
                                 Consume(TokenType.Colon, "Expected ':'");  
                                 args.Add(new Expr.Call.Argument(  
-                                    (string)nameTok.Literal,  
+                                    (string)nameTok.Literal!,  
                                     Expression()));  
                             }  
                             else  
@@ -1619,7 +1632,7 @@ namespace MiniDynLang
                 if (Match(TokenType.Dot))  
                 {  
                     var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");  
-                    expr = new Expr.Property(expr, (string)nameTok.Literal);  
+                    expr = new Expr.Property(expr, (string)nameTok.Literal!);  
                     continue;  
                 }  
         
@@ -1650,13 +1663,14 @@ namespace MiniDynLang
                     {
                         do
                         {
+                            var nextToken = PeekAhead(1);
                             // Check if this is a named argument
-                            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Colon)
+                            if (Check(TokenType.Identifier) && nextToken?.Type == TokenType.Colon)
                             {
                                 var nameTok = Advance();
                                 Consume(TokenType.Colon, "Expected ':'");
                                 var value = Expression();
-                                args.Add(new Expr.Call.Argument((string)nameTok.Literal, value));
+                                args.Add(new Expr.Call.Argument((string)nameTok.Literal!, value));
                             }
                             else
                             {
@@ -1679,9 +1693,9 @@ namespace MiniDynLang
         private Expr Primary()
         {
             if (Match(TokenType.Number))
-                return new Expr.Literal(Value.Number((NumberValue)Previous().Literal));
+                return new Expr.Literal(Value.Number((NumberValue)Previous().Literal!));
             if (Match(TokenType.String))
-                return new Expr.Literal(Value.String((string)Previous().Literal));
+                return new Expr.Literal(Value.String((string)Previous().Literal!));
             if (Match(TokenType.True))
                 return new Expr.Literal(Value.Boolean(true));
             if (Match(TokenType.False))
@@ -1725,7 +1739,7 @@ namespace MiniDynLang
                         if (Check(TokenType.Identifier))
                         {
                             var keyTok = Advance();
-                            string keyName = (string)keyTok.Literal;
+                            string keyName = (string)keyTok.Literal!;
                             if (Match(TokenType.Colon))
                             {
                                 var valExpr = Expression();
@@ -1740,7 +1754,7 @@ namespace MiniDynLang
                         else if (Check(TokenType.String))
                         {
                             var keyTok = Advance();
-                            string keyName = (string)keyTok.Literal;
+                            string keyName = (string)keyTok.Literal!;
                             Consume(TokenType.Colon, "Expected ':' after string key");
                             var valExpr = Expression();
                             entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, valExpr));
@@ -1782,9 +1796,10 @@ namespace MiniDynLang
                 return new Expr.Grouping(e);
             }
 
+            var nextTokenIsArrow = PeekAhead(1)?.Type == TokenType.Arrow;
             // ──────────────── 1. Single-parameter arrow function  x => expr ────────────────
             // Must be checked before we treat the identifier as an ordinary variable.
-            if (Check(TokenType.Identifier) && PeekAhead(1)?.Type == TokenType.Arrow)
+            if (Check(TokenType.Identifier) && nextTokenIsArrow)
             {
                 var param = Advance();
                 Consume(TokenType.Arrow, "Expected '=>'");
@@ -1803,8 +1818,8 @@ namespace MiniDynLang
                     bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
                 }
 
-                var parameters = new List<Expr.Param> { new Expr.Param((string)param.Literal) };
-                return new Expr.Function(parameters, bodyBlock);
+                var parameters = new List<Expr.Param> { new Expr.Param((string)param.Literal!) };
+                return new Expr.Function(parameters, bodyBlock, isArrow: true);
             }
 
             if (Match(TokenType.Fn))
@@ -1815,22 +1830,22 @@ namespace MiniDynLang
                 Consume(TokenType.RParen, "Expected ')'");
                 Consume(TokenType.LBrace, "Expected '{' before function body");
                 var body = BlockStatementInternal();
-                return new Expr.Function(parameters, body);
+                return new Expr.Function(parameters, body, isArrow: false);
             }
 
             // Ordinary identifier
             if (Match(TokenType.Identifier))
-                return new Expr.Variable((string)Previous().Literal);
+                return new Expr.Variable((string)Previous().Literal!);
             throw new MiniDynParseError("Expected expression", Peek().Line, Peek().Column);
         }
-        
-        private Token PeekAhead(int distance)
+
+        private Token? PeekAhead(int distance)
         {
             if (_current + distance >= _tokens.Count) return null;
             return _tokens[_current + distance];
         }
 
-        private bool TryParseArrowFunction(out Expr arrowFunc)
+        private bool TryParseArrowFunction([NotNullWhen(true)] out Expr? arrowFunc)
         {
             arrowFunc = null;
             
@@ -1866,7 +1881,7 @@ namespace MiniDynLang
                     bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
                 }
                 
-                arrowFunc = new Expr.Function(parameters, bodyBlock);
+                arrowFunc = new Expr.Function(parameters, bodyBlock, isArrow: true);
                 return true;
             }
             catch
@@ -1883,9 +1898,9 @@ namespace MiniDynLang
         private readonly Dictionary<string, Value> _values = new();
         private readonly HashSet<string> _consts = new();
         private readonly HashSet<string> _lets = new(); // tracks block-scoped let/const by name
-        public Environment Enclosing { get; }
+        public Environment? Enclosing { get; }
 
-        public Environment(Environment enclosing = null) { Enclosing = enclosing; }
+        public Environment(Environment? enclosing = null) { Enclosing = enclosing; }
 
         public void DefineVar(string name, Value value) => _values[name] = value;
         public void DefineLet(string name, Value value)
@@ -1919,6 +1934,19 @@ namespace MiniDynLang
             throw new MiniDynRuntimeError($"Undefined variable '{name}'");
         }
 
+        public bool TryGet(string name, [NotNullWhen(true)] out Value? v)
+        {
+            if (_values.TryGetValue(name, out var local))
+            {
+                v = local;
+                return true;
+            }
+            if (Enclosing != null) return Enclosing.TryGet(name, out v);
+            v = null;
+            return false;
+        }
+
+
         public bool IsDeclaredHere(string name) => _values.ContainsKey(name) && _lets.Contains(name);
     }
 
@@ -1950,17 +1978,22 @@ namespace MiniDynLang
         public struct ParamSpec
         {
             public string Name;
-            public Expr Default;
+            public Expr? Default;
             public bool IsRest;
-            public ParamSpec(string n, Expr d, bool r) { Name = n; Default = d; IsRest = r; }
+            public ParamSpec(string n, Expr? d, bool r) { Name = n; Default = d; IsRest = r; }
         }
+
+        // kind & captured 'this'
+        public enum Kind { Normal, Arrow }
+        public Kind FunctionKind { get; }
+        private readonly Value? _capturedThis; // for arrows
 
         public List<ParamSpec> Params { get; }
         public Stmt.Block Body { get; }
-        public Environment Closure { get; }
-        public string Name { get; }
+        public Environment? Closure { get; }
+        public string? Name { get; }
 
-        private Value _boundThis;
+        private Value? _boundThis;
 
         public int ArityMin
         {
@@ -1969,7 +2002,7 @@ namespace MiniDynLang
                 int count = 0;
                 foreach (var p in Params)
                 {
-                    if (p.IsRest) continue;              // rest adds no requirement
+                    if (p.IsRest) continue;
                     if (p.Default == null) count++;
                 }
                 return count;
@@ -1984,7 +2017,9 @@ namespace MiniDynLang
             }
         }
 
-        public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure)
+        // kind + capturedThis parameters (default to Normal/null for old call sites)
+        public UserFunction(string? name, List<Expr.Param> parameters, Stmt.Block body, Environment? closure,
+                            Kind kind = Kind.Normal, Value? capturedThis = null)
         {
             Name = name;
             Body = body;
@@ -1992,11 +2027,16 @@ namespace MiniDynLang
             Params = new List<ParamSpec>(parameters.Count);
             foreach (var p in parameters)
                 Params.Add(new ParamSpec(p.Name, p.Default, p.IsRest));
+            FunctionKind = kind;
+            _capturedThis = capturedThis;
         }
 
         public UserFunction BindThis(Value thisValue)
         {
-            var bound = new UserFunction(Name, ToExprParams(), Body, Closure);
+            // arrows ignore rebinding
+            if (FunctionKind == Kind.Arrow) return this;
+
+            var bound = new UserFunction(Name, ToExprParams(), Body, Closure, FunctionKind, _capturedThis);
             bound._boundThis = thisValue;
             return bound;
         }
@@ -2005,8 +2045,12 @@ namespace MiniDynLang
         {
             var env = new Environment(Closure);
 
-            // Define 'this' if bound
-            if (_boundThis != null)
+            // define 'this' according to kind (arrow uses captured lexical; normal uses bound call-site)
+            if (FunctionKind == Kind.Arrow)
+            {
+                if (_capturedThis != null) env.DefineConst("this", _capturedThis);
+            }
+            else if (_boundThis != null)
             {
                 env.DefineConst("this", _boundThis);
             }
@@ -2065,7 +2109,8 @@ namespace MiniDynLang
             return Name != null ? $"<fn {Name}>" : "<fn>";
         }
 
-        public UserFunction Bind(Environment newClosure) => new UserFunction(Name, ToExprParams(), Body, newClosure);
+        public UserFunction Bind(Environment? newClosure) =>
+            new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis);
 
         private List<Expr.Param> ToExprParams()
         {
@@ -2080,8 +2125,8 @@ namespace MiniDynLang
     {
         public class ReturnSignal : Exception
         {
-            public Value Value;
-            public ReturnSignal(Value v) { Value = v; }
+            public Value? Value;
+            public ReturnSignal(Value? v) { Value = v; }
         }
         public class BreakSignal : Exception { }
         public class ContinueSignal : Exception { }
@@ -2140,8 +2185,7 @@ namespace MiniDynLang
 
             DefineBuiltin("gets", 0, 0, (i, a) =>
             {
-                string line = Console.ReadLine();
-                if (line == null) return Value.Nil();
+                string? line = Console.ReadLine();
                 return Value.String(line);
             });
 
@@ -2403,28 +2447,28 @@ namespace MiniDynLang
         public object VisitExpr(Stmt.ExprStmt s)
         {
             Evaluate(s.Expression);
-            return null;
+            return null!;
         }
 
         public object VisitVar(Stmt.Var s)
         {
             Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
             _env.DefineVar(s.Name, val);
-            return null;
+            return null!;
         }
 
         public object VisitLet(Stmt.Let s)
         {
             Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
             _env.DefineLet(s.Name, val);
-            return null;
+            return null!;
         }
 
         public object VisitConst(Stmt.Const s)
         {
             Value val = Evaluate(s.Initializer);
             _env.DefineConst(s.Name, val);
-            return null;
+            return null!;
         }
 
         public object VisitDestructuringDecl(Stmt.DestructuringDecl s)
@@ -2441,13 +2485,13 @@ namespace MiniDynLang
                 }
             }
             s.Pattern.Bind(this, src, declare, allowConstReassign: false);
-            return null;
+            return null!;
         }
 
         public object VisitBlock(Stmt.Block s)
         {
             ExecuteBlock(s.Statements, new Environment(_env));
-            return null;
+            return null!;
         }
 
         public void ExecuteBlock(List<Stmt> stmts, Environment env)
@@ -2465,7 +2509,7 @@ namespace MiniDynLang
         {
             if (Value.IsTruthy(Evaluate(s.Condition))) Execute(s.Then);
             else if (s.Else != null) Execute(s.Else);
-            return null;
+            return null!;
         }
 
         public object VisitWhile(Stmt.While s)
@@ -2485,14 +2529,15 @@ namespace MiniDynLang
                     break;
                 }
             }
-            return null;
+            return null!;
         }
 
         public object VisitFunction(Stmt.Function s)
         {
-            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env);
+            var kind = s.FuncExpr.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null);
             _env.DefineVar(s.Name, Value.Function(fn));
-            return null;
+            return null!;
         }
 
         public object VisitReturn(Stmt.Return s)
@@ -2518,8 +2563,9 @@ namespace MiniDynLang
             Value rhs = Evaluate(e.Value);
 
             // Helper to apply compound op
-            Value ApplyOp(Value cur, TokenType op, Value rhsVal)
+            Value ApplyOp(Value? cur, TokenType op, Value rhsVal)
             {
+                cur ??= Value.Nil(); // Treat uninitialized/null values as nil for compound assignments
                 switch (op)
                 {
                     case TokenType.Assign: return rhsVal;
@@ -2681,7 +2727,7 @@ namespace MiniDynLang
 
         public Value VisitCall(Expr.Call e)
         {
-            Value receiver = null;
+            Value? receiver = null;
             Value calleeVal;
             
             // Check if this is a method call (obj.method())
@@ -2708,7 +2754,7 @@ namespace MiniDynLang
                 processedArgs = ProcessNamedArguments(userFn, e.Args);
                 
                 // Bind 'this' for method calls
-                if (receiver != null)
+                if (receiver != null && userFn.FunctionKind == UserFunction.Kind.Normal)
                 {
                     fn = userFn.BindThis(receiver);
                 }
@@ -2732,7 +2778,7 @@ namespace MiniDynLang
 
         private List<Value> ProcessNamedArguments(UserFunction fn, List<Expr.Call.Argument> args)
         {
-            var result = new List<Value>(new Value[fn.Params.Count]);
+            var result = new List<Value?>(new Value?[fn.Params.Count]);
             var filled = new bool[fn.Params.Count];
             var namedArgs = new Dictionary<string, Value>();
             var positionalArgs = new List<Value>();
@@ -2743,7 +2789,7 @@ namespace MiniDynLang
             {
                 if (arg.IsNamed)
                 {
-                    namedArgs[arg.Name] = Evaluate(arg.Value);
+                    namedArgs[arg.Name!] = Evaluate(arg.Value);
                 }
                 else
                 {
@@ -2811,7 +2857,7 @@ namespace MiniDynLang
                 {
                     if (fn.Params[i].Default != null)
                     {
-                        result[i] = EvaluateWithEnv(fn.Params[i].Default, CurrentEnv);
+                        result[i] = EvaluateWithEnv(fn.Params[i].Default!, CurrentEnv);
                         filled[i] = true;
                     }
                     else
@@ -2832,7 +2878,8 @@ namespace MiniDynLang
                     finalArgs.AddRange(restArgs);
                     continue;
                 }
-                finalArgs.Add(result[i]);   // may be null right now – that’s OK
+                // At this point, all non-rest parameters should have a value.
+                finalArgs.Add(result[i]!);
             }
             
             return finalArgs;
@@ -2842,7 +2889,10 @@ namespace MiniDynLang
 
         public Value VisitFunction(Expr.Function e)
         {
-            var uf = new UserFunction(null, e.Parameters, e.Body, _env);
+            Value? capturedThis = null;
+            if (e.IsArrow && _env.TryGet("this", out var t)) capturedThis = t;
+            var kind = e.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+            var uf = new UserFunction(null, e.Parameters, e.Body, _env, kind, capturedThis);
             return Value.Function(uf);
         }
 
@@ -2902,7 +2952,7 @@ namespace MiniDynLang
                 }
                 else
                 {
-                    var kVal = Evaluate(entry.KeyExpr);
+                    var kVal = Evaluate(entry.KeyExpr!);
                     key = ToStringValue(kVal);
                 }
                 var val = Evaluate(entry.ValueExpr);
@@ -3030,7 +3080,7 @@ namespace MiniDynLang
             while (true)
             {
                 Console.Write("> ");
-                string line = Console.ReadLine();
+                string? line = Console.ReadLine();
                 if (line == null) break;
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 try
@@ -3108,7 +3158,7 @@ namespace MiniDynLang
                     println(""Hello "" + ""World"", 1 + 2 + 3);
 
                     println();
-                    println(""=== NEW PATCH 2 FEATURES ==="");
+                    println(""=== EXTRA FEATURES ==="");
                     
                     // Arrow functions - expression body
                     println(""--- Arrow Functions ---"");
@@ -3142,7 +3192,7 @@ namespace MiniDynLang
                         while (i < length(nums)) {
                             total = total + nums[i];
                             i = i + 1;
-                        }
+   }
                         return total;
                     };
                     println(""sum(1, 2, 3, 4, 5) ="", sum(1, 2, 3, 4, 5));
@@ -3308,6 +3358,67 @@ namespace MiniDynLang
                     team.listMembers();
                     println(""Members who know Python:"", findBySkill(""Python""));
                     println(""Members who know Go:"", findBySkill(""Go""));
+                    println();
+                    println(""=== ARROW LEXICAL 'this' TESTS ==="");
+
+                    // A counter object to test 'this' semantics.
+                    let counter = {
+                        n: 0,
+                        inc: fn() { this.n = this.n + 1; return this.n; },
+
+                        // Returns an ARROW that uses 'this' lexically (captured at creation in inc/maker).
+                        makeArrowGetter: fn() {
+                            // lexical 'this' is the counter when this method is called
+                            return () => this.n;
+                        },
+
+                        // Returns a NORMAL function; when called as a method of another object,
+                        // it should use that object's 'this'.
+                        makeNormalGetter: fn() {
+                            return fn() { return this.n; };
+                        }
+                    };
+
+                    // bump to a known state
+                    counter.inc(); // 1
+                    counter.inc(); // 2
+
+                    let getArrow = counter.makeArrowGetter();
+                    let getNormal = counter.makeNormalGetter();
+
+                    println(""counter.n ="", counter.n);
+                    println(""getArrow() -> expect 2:"", getArrow()); // lexical this = counter
+
+                    // Borrow the functions onto another object and call as methods.
+                    let other = { n: 100 };
+                    other.get = getArrow;
+                    println(""borrowed arrow via other.get() -> expect 2:"", other.get()); // still 2 (arrow ignores call-site 'this')
+
+                    other.get = getNormal;
+                    println(""borrowed normal via other.get() -> expect 100:"", other.get()); // dynamic this = other
+
+                    // Re-check that counter still unchanged by above calls other than our earlier incs.
+                    println(""counter.n (still 2) ="", counter.n);
+
+                    // Another object that exposes an arrow to its own 'this'
+                    let holder = {
+                        v: 7,
+                        make: fn() { return () => this.v; },   // arrow captures holder at creation
+                        norm: fn() { return this.v; }          // normal uses dynamic 'this'
+                    };
+
+                    let a = holder.make();
+                    println(""a() -> expect 7:"", a());
+                    let bobj = { v: 123, call: a };
+                    println(""bobj.call() borrowed arrow -> expect 7:"", bobj.call()); // arrow ignores rebinding
+
+                    let borrowNorm = { v: 123, m: holder.norm };
+                    println(""borrowed normal m() -> expect 123:"", borrowNorm.m()); // normal respects call-site
+
+                    // Ensure property-call on an arrow returned from a method does not rebind:
+                    let wrapper = { m: getArrow, n: 999 };
+                    println(""wrapper.m() (arrow) -> expect 2:"", wrapper.m());
+
                 ";
             try
             {
