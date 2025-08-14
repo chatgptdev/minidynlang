@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text;
+using System.Text.Json;
 
 namespace MiniDynLang
 {
@@ -2437,6 +2438,195 @@ namespace MiniDynLang
 
             // Time
             DefineBuiltin("now_ms", 0, 0, (i, a) => Value.Number(NumberValue.FromLong(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())));
+
+            // === Array/object helpers ===
+            DefineBuiltin("values", 1, 1, (i, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var v in o.Props.Values) arr.Items.Add(v);
+                return Value.Array(arr);
+            });
+
+            DefineBuiltin("entries", 1, 1, (i, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var kv in o.Props)
+                {
+                    var pair = new ArrayValue(new[] { Value.String(kv.Key), kv.Value });
+                    arr.Items.Add(Value.Array(pair));
+                }
+                return Value.Array(arr);
+            });
+
+            DefineBuiltin("from_entries", 1, 1, (i, a) =>
+            {
+                var src = a[0].AsArray();
+                var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+                for (int k = 0; k < src.Length; k++)
+                {
+                    var entry = src[k];
+                    if (entry.Type != ValueType.Array) throw new MiniDynRuntimeError("from_entries expects array of [key, value] pairs");
+                    var tup = entry.AsArray();
+                    if (tup.Length != 2 || tup[0].Type != ValueType.String) throw new MiniDynRuntimeError("from_entries expects [string, any] pairs");
+                    dict[tup[0].AsString()] = tup[1];
+                }
+                return Value.Object(new ObjectValue(dict));
+            });
+
+            DefineBuiltin("map", 2, 2, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                var res = new ArrayValue();
+                for (int idx = 0; idx < arr.Length; idx++)
+                    res.Items.Add(fn.Call(i, new List<Value> { arr[idx] }));
+                return Value.Array(res);
+            });
+
+            DefineBuiltin("filter", 2, 2, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                var res = new ArrayValue();
+                for (int idx = 0; idx < arr.Length; idx++)
+                {
+                    var keep = fn.Call(i, new List<Value> { arr[idx] });
+                    if (Value.IsTruthy(keep)) res.Items.Add(arr[idx]);
+                }
+                return Value.Array(res);
+            });
+
+            DefineBuiltin("reduce", 2, 3, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                int start = 0;
+                Value acc;
+                if (a.Count == 3) { acc = a[2]; }
+                else
+                {
+                    if (arr.Length == 0) throw new MiniDynRuntimeError("reduce of empty array with no initial value");
+                    acc = arr[0]; start = 1;
+                }
+                for (int idx = start; idx < arr.Length; idx++)
+                    acc = fn.Call(i, new List<Value> { acc, arr[idx] });
+                return acc;
+            });
+
+            DefineBuiltin("sort", 1, 2, (i, a) =>
+            {
+                var src = a[0].AsArray();
+                var copy = src.Clone();
+                Comparison<Value> cmp;
+                if (a.Count == 2)
+                {
+                    var fn = a[1].AsFunction();
+                    cmp = (x, y) =>
+                    {
+                        var r = fn.Call(i, new List<Value> { x, y });
+                        var n = r.Type == ValueType.Number ? r.AsNumber() : NumberValue.FromLong(0);
+                        var d = n.ToDoubleNV().Dbl;
+                        return d < 0 ? -1 : d > 0 ? 1 : 0;
+                    };
+                }
+                else
+                {
+                    cmp = (x, y) =>
+                    {
+                        if (x.Type == ValueType.Number && y.Type == ValueType.Number)
+                            return NumberValue.Compare(x.AsNumber(), y.AsNumber());
+                        if (x.Type == ValueType.String && y.Type == ValueType.String)
+                            return string.CompareOrdinal(x.AsString(), y.AsString());
+                        // Fallback: by type name
+                        return string.CompareOrdinal(x.Type.ToString(), y.Type.ToString());
+                    };
+                }
+                copy.Items.Sort(cmp);
+                return Value.Array(copy);
+            });
+
+            DefineBuiltin("unique", 1, 1, (i, a) =>
+            {
+                var arr = a[0].AsArray();
+                var seen = new HashSet<Value>();
+                var res = new ArrayValue();
+                for (int k = 0; k < arr.Length; k++)
+                    if (seen.Add(arr[k])) res.Items.Add(arr[k]);
+                return Value.Array(res);
+            });
+
+            DefineBuiltin("range", 1, 3, (i, a) =>
+            {
+                long start, end, step;
+                if (a.Count == 1) { start = 0; end = (long)ToNumber(a[0]).ToDoubleNV().Dbl; step = 1; }
+                else if (a.Count == 2) { start = (long)ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)ToNumber(a[1]).ToDoubleNV().Dbl; step = 1; }
+                else { start = (long)ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)ToNumber(a[1]).ToDoubleNV().Dbl; step = (long)ToNumber(a[2]).ToDoubleNV().Dbl; }
+                if (step == 0) throw new MiniDynRuntimeError("range step cannot be 0");
+                var res = new ArrayValue();
+                if (step > 0) for (long v = start; v < end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
+                else for (long v = start; v > end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
+                return Value.Array(res);
+            });
+
+            // === String helpers ===
+            DefineBuiltin("replace", 3, 3, (i, a) =>
+            {
+                var s = a[0].AsString(); var find = a[1].AsString(); var repl = a[2].AsString();
+                return Value.String(s.Replace(find, repl, StringComparison.Ordinal));
+            });
+            DefineBuiltin("repeat", 2, 2, (i, a) =>
+            {
+                var s = a[0].AsString(); int n = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                if (n < 0) n = 0;
+                var sb = new StringBuilder(s.Length * n);
+                for (int k = 0; k < n; k++) sb.Append(s);
+                return Value.String(sb.ToString());
+            });
+            DefineBuiltin("pad_start", 2, 3, (i, a) =>
+            {
+                var s = a[0].AsString(); int len = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var pad = a.Count == 3 ? a[2].AsString() : " ";
+                if (pad.Length == 0) pad = " ";
+                if (s.Length >= len) return Value.String(s);
+                var sb = new StringBuilder(len);
+                while (sb.Length + s.Length < len) sb.Append(pad);
+                var padCut = sb.ToString().Substring(0, len - s.Length);
+                return Value.String(padCut + s);
+            });
+            DefineBuiltin("pad_end", 2, 3, (i, a) =>
+            {
+                var s = a[0].AsString(); int len = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var pad = a.Count == 3 ? a[2].AsString() : " ";
+                if (pad.Length == 0) pad = " ";
+                if (s.Length >= len) return Value.String(s);
+                var sb = new StringBuilder(len);
+                sb.Append(s);
+                while (sb.Length < len) sb.Append(pad);
+                return Value.String(sb.ToString().Substring(0, len));
+            });
+
+            // === New: Time ===
+            DefineBuiltin("sleep_ms", 1, 1, (i, a) =>
+            {
+                var ms = (int)ToNumber(a[0]).ToDoubleNV().Dbl;
+                System.Threading.Thread.Sleep(ms < 0 ? 0 : ms);
+                return Value.Nil();
+            });
+
+            // === New: JSON ===
+            DefineBuiltin("json_stringify", 1, 2, (i, a) =>
+            {
+                bool pretty = a.Count == 2 && Value.IsTruthy(a[1]);
+                return Value.String(i.JsonStringifyValue(a[0], pretty));
+            });
+            DefineBuiltin("json_parse", 1, 1, (i, a) =>
+            {
+                var s = a[0].AsString();
+                using var doc = JsonDocument.Parse(s);
+                return JsonToValue(doc.RootElement);
+            });
         }
 
         private void DefineBuiltin(string name, int arityMin, int arityMax, Func<Interpreter, List<Value>, Value> fn)
@@ -2749,7 +2939,7 @@ namespace MiniDynLang
         {
             Value? receiver = null;
             Value calleeVal;
-            
+
             // Check if this is a method call (obj.method())
             if (e.Callee is Expr.Property prop)
             {
@@ -2760,19 +2950,19 @@ namespace MiniDynLang
             {
                 calleeVal = Evaluate(e.Callee);
             }
-            
+
             if (calleeVal.Type != ValueType.Function)
                 throw new MiniDynRuntimeError("Can only call functions");
 
             var fn = calleeVal.AsFunction();
-                
+
             // Process arguments
             List<Value> processedArgs;
-            
+
             if (fn is UserFunction userFn)
             {
                 processedArgs = ProcessNamedArguments(userFn, e.Args);
-                
+
                 // Bind 'this' for method calls
                 if (receiver != null && userFn.FunctionKind == UserFunction.Kind.Normal)
                 {
@@ -2784,15 +2974,15 @@ namespace MiniDynLang
                 // Built-in functions only support positional arguments
                 if (e.Args.Any(a => a.IsNamed))
                     throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-                
+
                 processedArgs = new List<Value>();
                 foreach (var arg in e.Args)
                     processedArgs.Add(Evaluate(arg.Value));
             }
-            
+
             if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
                 throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-            
+
             return fn.Call(this, processedArgs);
         }
 
@@ -3054,6 +3244,104 @@ namespace MiniDynLang
                 ValueType.Object => NumberValue.FromLong(0),
                 _ => NumberValue.FromLong(0)
             };
+        }
+        
+        // Helpers for JSON
+        private static string EscapeJson(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (var ch in s)
+            {
+                switch (ch)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (char.IsControl(ch)) sb.Append("\\u").Append(((int)ch).ToString("x4"));
+                        else sb.Append(ch);
+                        break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        private string JsonStringifyValue(Value v, bool pretty = false, int indent = 0)
+        {
+            string Ind() => new string(' ', indent);
+            string Ind2() => new string(' ', indent + 2);
+
+            switch (v.Type)
+            {
+                case ValueType.Nil: return "null";
+                case ValueType.Boolean: return v.AsBoolean() ? "true" : "false";
+                case ValueType.Number: return v.AsNumber().ToString();
+                case ValueType.String: return "\"" + EscapeJson(v.AsString()) + "\"";
+                case ValueType.Array:
+                {
+                    var arr = v.AsArray();
+                    if (arr.Length == 0) return "[]";
+                    var parts = new List<string>(arr.Length);
+                    for (int k = 0; k < arr.Length; k++)
+                        parts.Add(JsonStringifyValue(arr[k], pretty, indent + 2));
+                    if (!pretty) return "[" + string.Join(",", parts) + "]";
+                    var lines = string.Join(",\n", parts.Select(p => Ind2() + p));
+                    return "[\n" + lines + "\n" + Ind() + "]";
+                }
+                case ValueType.Object:
+                {
+                    var obj = v.AsObject();
+                    if (obj.Count == 0) return "{}";
+                    var parts = new List<string>(obj.Count);
+                    foreach (var kv in obj.Props)
+                    {
+                        var key = "\"" + EscapeJson(kv.Key) + "\"";
+                        var val = JsonStringifyValue(kv.Value, pretty, indent + 2);
+                        parts.Add(pretty ? (Ind2() + key + ": " + val) : (key + ":" + val));
+                    }
+                    if (!pretty) return "{" + string.Join(",", parts) + "}";
+                    var lines = string.Join(",\n", parts);
+                    return "{\n" + lines + "\n" + Ind() + "}";
+                }
+                default:
+                    // functions are not representable in JSON; return null
+                    return "null";
+            }
+        }
+
+        private static Value JsonToValue(JsonElement e)
+        {
+            switch (e.ValueKind)
+            {
+                case JsonValueKind.Null: return Value.Nil();
+                case JsonValueKind.True: return Value.Boolean(true);
+                case JsonValueKind.False: return Value.Boolean(false);
+                case JsonValueKind.Number:
+                {
+                    var raw = e.GetRawText();
+                    return NumberValue.TryFromString(raw, out var nv) ? Value.Number(nv) : Value.Number(NumberValue.FromDouble(e.GetDouble()));
+                }
+                case JsonValueKind.String: return Value.String(e.GetString());
+                case JsonValueKind.Array:
+                {
+                    var arr = new ArrayValue();
+                    foreach (var item in e.EnumerateArray())
+                        arr.Items.Add(JsonToValue(item));
+                    return Value.Array(arr);
+                }
+                case JsonValueKind.Object:
+                {
+                    var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+                    foreach (var prop in e.EnumerateObject())
+                        dict[prop.Name] = JsonToValue(prop.Value);
+                    return Value.Object(new ObjectValue(dict));
+                }
+                default: return Value.Nil();
+            }
         }
     }
 
@@ -3461,6 +3749,91 @@ namespace MiniDynLang
                     // Ensure property-call on an arrow returned from a method does not rebind:
                     let wrapper = { m: getArrow, n: 999 };
                     println(""wrapper.m() (arrow) -> expect 2:"", wrapper.m());
+
+                    println();
+                    println(""=== BUILTIN SHOWCASE (non-interactive) ==="");
+                    // gets() is interactive; omitted to keep demo non-blocking
+
+                    // Basics
+                    print(""print without newline -> ""); println(""done"");
+                    println(""to_number('42.5') ="", to_number(""42.5""));
+                    println(""to_string(123) ="", to_string(123));
+                    println(""type([1,2,3]) ="", type([1,2,3]));
+
+                    // Object key ops
+                    let objDemo = { k1: 1, k2: 2 };
+                    println(""remove_key k2 ="", remove_key(objDemo, ""k2""), "" keys="", keys(objDemo));
+
+                    println();
+                    println(""--- Math ---"");
+                    println(""abs(-5) ="", abs(-5));
+                    println(""floor(3.7) ="", floor(3.7), "" ceil(3.1) ="", ceil(3.1), "" round(3.5) ="", round(3.5));
+                    println(""sqrt(9) ="", sqrt(9), "" pow(2,10) ="", pow(2,10));
+                    println(""min(3,1,2) ="", min(3,1,2), "" max(3,1,2) ="", max(3,1,2));
+                    srand(123);
+                    println(""random seeded -> "", random(), "" "", random());
+
+                    println();
+                    println(""--- String ---"");
+                    let s = ""  Hello, MiniDyn!  "";
+                    println(""substring(s, 2, 5) ="", substring(s, 2, 5));
+                    println(""index_of(s, 'Mini') ="", index_of(s, ""Mini""));
+                    println(""contains(s, 'Dyn') ="", contains(s, ""Dyn""));
+                    println(""starts_with(s, '  He') ="", starts_with(s, ""  He""));
+                    println(""ends_with(s, '!  ') ="", ends_with(s, ""!  ""));
+                    println(""to_upper(s) ="", to_upper(s));
+                    println(""to_lower(s) ="", to_lower(s));
+                    println(""trim(s) ="", trim(s));
+                    let parts = split(""a,b,c"", "",""); println(""split -> "", parts);
+                    println(""parse_int('123') ="", parse_int(""123""), "" parse_float('3.14') ="", parse_float(""3.14""));
+
+                    println();
+                    println(""--- Array ---"");
+                    let arr2 = array(10, 20, 30);
+                    println(""array -> "", arr2);
+                    println(""push -> length ="", push(arr2, 40, 50), "" arr2="", arr2);
+                    println(""pop -> "", pop(arr2), "" arr2="", arr2);
+                    println(""at(arr2, -1) ="", at(arr2, -1));
+                    println(""slice(arr2, 1) ="", slice(arr2, 1));
+                    set_at(arr2, 0, 99); println(""set_at -> "", arr2);
+                    let arrClone = clone(arr2); println(""clone(arr2) ="", arrClone);
+
+                    println(""now_ms() ="", now_ms());
+
+                    println();
+                    println(""--- Object helpers ---"");
+                    let obj2 = { a: 1, b: 2, c: 3 };
+                    println(""values(obj2) ="", values(obj2));
+                    let ents = entries(obj2); println(""entries(obj2) ="", ents);
+                    let obj3 = from_entries(ents); println(""from_entries(entries(obj2)) ="", obj3);
+
+                    println();
+                    println(""--- Functional array helpers ---"");
+                    let nums = [1,2,3,4,5,2,3];
+                    println(""map x*2 -> "", map(nums, x => x * 2));
+                    println(""filter x>2 -> "", filter(nums, x => x > 2));
+                    println(""reduce sum -> "", reduce(nums, (a, b) => a + b, 0));
+                    println(""sort default -> "", sort(nums));
+                    println(""sort desc -> "", sort(nums, (a, b) => b - a));
+                    println(""unique(nums) -> "", unique(nums));
+                    println(""range(5) -> "", range(5));
+                    println(""range(2, 8, 2) -> "", range(2, 8, 2));
+
+                    println();
+                    println(""--- More strings ---"");
+                    println(""replace('foo bar','bar','baz') -> "", replace(""foo bar"", ""bar"", ""baz""));
+                    println(""repeat('ab',3) -> "", repeat(""ab"", 3));
+                    println(""pad_start('7',3,'0') -> "", pad_start(""7"", 3, ""0""));
+                    println(""pad_end('7',3,'0') -> "", pad_end(""7"", 3, ""0""));
+
+                    println(""sleeping 10ms...""); sleep_ms(10); println(""awake"");
+
+                    println();
+                    println(""--- JSON ---"");
+                    let j = json_stringify({ msg: ""ok"", data: [1,2,3] }, true);
+                    println(j);
+                    let parsed = json_parse(j);
+                    println(parsed);
 
                 ";
             try
