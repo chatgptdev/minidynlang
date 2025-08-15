@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36221.1 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "minidynlang", "minidynlang.csproj", "{F6C13A90-DCBC-4EEC-9D4F-10D6AB200D86}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "minidynlang", "minidynlang.csproj", "{35DF55EA-EB23-4ABC-AE5C-46ACE37DD57E}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -11,15 +11,15 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{F6C13A90-DCBC-4EEC-9D4F-10D6AB200D86}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{F6C13A90-DCBC-4EEC-9D4F-10D6AB200D86}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{F6C13A90-DCBC-4EEC-9D4F-10D6AB200D86}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{F6C13A90-DCBC-4EEC-9D4F-10D6AB200D86}.Release|Any CPU.Build.0 = Release|Any CPU
+		{35DF55EA-EB23-4ABC-AE5C-46ACE37DD57E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{35DF55EA-EB23-4ABC-AE5C-46ACE37DD57E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{35DF55EA-EB23-4ABC-AE5C-46ACE37DD57E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{35DF55EA-EB23-4ABC-AE5C-46ACE37DD57E}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {72951CB0-6417-4BCF-8146-5435FC76C054}
+		SolutionGuid = {1D3A0288-9D7C-4214-9DAA-913BACB8C21B}
 	EndGlobalSection
 EndGlobal
