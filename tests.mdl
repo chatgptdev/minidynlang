@@ -1,0 +1,332 @@
+// MiniDynLang test suite
+
+// --- Test harness ------------------------------------------------------------
+let TOTAL = 0;
+let PASSED = 0;
+let FAILED = 0;
+let FAILS = [];
+
+let EPS = 1e-9;
+
+fn show(v) {
+    let t = type(v);
+    if (t == "object" or t == "array") return json_stringify(v);
+    return to_string(v);
+}
+
+fn almost_number_equal(a, b) {
+    // numbers: allow tiny tolerance for doubles
+    if (a == b) return true;
+    return abs(a - b) < EPS;
+}
+
+fn deep_equal(a, b) {
+    let ta = type(a);
+    let tb = type(b);
+
+    // Allow numeric-string equality by numeric conversion (as the interpreter does)
+    if (ta != tb) {
+        if ((ta == "number" and tb == "string") or (ta == "string" and tb == "number")) {
+            return to_number(a) == to_number(b);
+        }
+        return false;
+    }
+
+    if (ta == "number") return almost_number_equal(a, b);
+    if (ta == "string" or ta == "boolean" or ta == "nil") return a == b;
+
+    if (ta == "array") {
+        if (length(a) != length(b)) return false;
+        let i = 0;
+        while (i < length(a)) {
+            if (not deep_equal(a[i], b[i])) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    if (ta == "object") {
+        let ka = sort(keys(a));
+        let kb = sort(keys(b));
+        if (not deep_equal(ka, kb)) return false;
+        let i = 0;
+        while (i < length(ka)) {
+            let k = ka[i];
+            if (not deep_equal(a[k], b[k])) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // functions and others: reference equality only (not used for deep compares)
+    return a == b;
+}
+
+fn record(ok, name, got, exp) {
+    TOTAL = TOTAL + 1;
+    if (ok) {
+        PASSED = PASSED + 1;
+        println("ok ", TOTAL, " - ", name);
+    } else {
+        FAILED = FAILED + 1;
+        push(FAILS, name);
+        println("not ok ", TOTAL, " - ", name);
+        if (type(exp) != "nil") {
+            println("   got: ", show(got));
+            println("   exp: ", show(exp));
+        } else {
+            println("   got: ", show(got));
+        }
+    }
+}
+
+fn test_true(name, cond) {
+    record(not not cond, name, cond, true);
+}
+
+fn test_eq(name, got, exp) {
+    let ok = deep_equal(got, exp);
+    record(ok, name, got, exp);
+}
+
+fn section(name) {
+    println();
+    println("## ", name);
+    println();
+}
+
+// --- Tests -------------------------------------------------------------------
+
+// Numbers and arithmetic
+section("Numbers and arithmetic");
+test_eq("1 + 2 == 3", 1 + 2, 3);
+test_eq("2*3 + 4 == 10", 2 * 3 + 4, 10);
+test_eq("7 / 2 == 3.5", 7 / 2, 3.5);
+test_eq("8 / 2 == 4", 8 / 2, 4);
+test_eq("7 % 3 == 1", 7 % 3, 1);
+test_eq("unary minus", -5, -5);
+
+// BigInt arithmetic (just beyond int64)
+let big = 9223372036854775808;
+test_eq("BigInt add", big + 5, 9223372036854775813);
+
+// Comparisons
+test_true("3 < 5", 3 < 5);
+test_true("5 >= 5", 5 >= 5);
+test_true("10 == '10' (numeric-string equality)", 10 == "10");
+
+// Logical ops and short-circuit
+section("Logical ops and short-circuit");
+let side = 0;
+fn inc() { side = side + 1; return true; }
+test_eq("false and inc() doesn't call inc", (fn(){ false and inc(); return side; })(), 0);
+test_eq("true or inc() doesn't call inc",   (fn(){ true or inc();   return side; })(), 0);
+test_eq("true and inc() calls inc once",    (fn(){ true and inc();  return side; })(), 1);
+test_eq("false or inc() calls inc twice total", (fn(){ false or inc(); return side; })(), 2);
+
+// Ternary
+section("Ternary");
+test_eq("1<2 ? 'yes' : 'no'", (1 < 2) ? "yes" : "no", "yes");
+
+// Strings
+section("Strings");
+test_eq("'abc' + 'def'", "abc" + "def", "abcdef");
+test_eq("substring('abcdef',2,3)", substring("abcdef", 2, 3), "cde");
+test_eq("index_of('hello','lo')", index_of("hello", "lo"), 3);
+test_true("contains('hello','ell')", contains("hello", "ell"));
+test_true("starts_with('hello','he')", starts_with("hello", "he"));
+test_true("ends_with('hello','lo')", ends_with("hello", "lo"));
+test_eq("trim('  a  ')", trim("  a  "), "a");
+test_eq("split/join", join(split("a,b,c", ","), "-"), "a-b-c");
+test_eq("to_upper", to_upper("Abc!"), "ABC!");
+test_eq("to_lower", to_lower("AbC!"), "abc!");
+
+// Indexing string
+test_eq("'Hello'[1] == 'e'", "Hello"[1], "e");
+
+// Arrays
+section("Arrays");
+let arr1 = [1, 2, 3];
+test_eq("length([1,2,3])", length(arr1), 3);
+let arr2 = [1, , 3];
+test_eq("elision makes hole (nil) at index 1", type(arr2[1]), "nil");
+
+let arr3 = [];
+push(arr3, 10, 20, 30);
+test_eq("push adds elements", arr3, [10, 20, 30]);
+test_eq("pop returns last", pop(arr3), 30);
+test_eq("pop removed last", arr3, [10, 20]);
+
+arr3[0] += 2;
+test_eq("index compound assignment", arr3, [12, 20]);
+
+test_eq("array concatenation with +", [1, 2] + [3, 4], [1, 2, 3, 4]);
+test_eq("slice([1,2,3,4], -2)", slice([1, 2, 3, 4], -2), [3, 4]);
+test_eq("at negative index", at([9, 8, 7], -1), 7);
+
+test_eq("join(['a','b'],'|')", join(["a", "b"], "|"), "a|b");
+
+// Higher-order
+let nums = [1, 2, 3, 4, 5, 2, 3];
+test_eq("map x*2", map(nums, x => x * 2), [2, 4, 6, 8, 10, 4, 6]);
+test_eq("filter x>2", filter(nums, x => x > 2), [3, 4, 5, 3]);
+test_eq("reduce sum with init", reduce(nums, (a, b) => a + b, 0), 20);
+test_eq("sort default asc", sort([3, 1, 2]), [1, 2, 3]);
+test_eq("sort with comparator desc", sort([3, 1, 2], (a, b) => b - a), [3, 2, 1]);
+test_eq("unique", unique(nums), [1, 2, 3, 4, 5]);
+test_eq("range(5)", range(5), [0, 1, 2, 3, 4]);
+test_eq("range(2,8,2)", range(2, 8, 2), [2, 4, 6]);
+
+// Arrays: set_at and clone
+let arr4 = [5, 6, 7];
+set_at(arr4, 1, 42);
+test_eq("set_at", arr4, [5, 42, 7]);
+let arr4c = clone(arr4);
+test_eq("clone array", arr4c, [5, 42, 7]);
+
+// Objects
+section("Objects");
+let o = { a: 1, b: 2, c: { d: 3 } };
+test_eq("dot access", o.a, 1);
+test_eq("bracket access", o["b"], 2);
+test_eq("nested", o.c.d, 3);
+
+let k = "x";
+let o2 = { [k + "1"]: 11, [k + "2"]: 22 };
+test_eq("computed keys", [o2["x1"], o2["x2"]], [11, 22]);
+
+let merged = merge(o, o2);
+test_true("has_key merged 'x2'", has_key(merged, "x2"));
+test_eq("remove_key", (fn(){ remove_key(merged, "x1"); return has_key(merged, "x1"); })(), false);
+
+test_eq("keys sorted", sort(keys(o)), ["a", "b", "c"]);
+test_eq("values unordered check via sort after stringify",
+    sort(map(values({ q: 1, w: 2, e: 3 }), to_string)),
+    ["1", "2", "3"]);
+
+let entries_o = entries({ k1: 1, k2: 2 });
+let rebuilt = from_entries(entries_o);
+test_eq("from_entries(entries(obj)) roundtrip", rebuilt, { k1: 1, k2: 2 });
+
+// Object assignment
+o.a += 5;
+o["b"] = o["b"] * 10;
+test_eq("compound prop ops", [o.a, o.b], [6, 20]);
+
+// Functions
+section("Functions");
+fn add(a, b) { return a + b; }
+test_eq("fn add", add(5, 7), 12);
+
+fn greet(name, greeting = "Hi") { return greeting + ", " + name; }
+test_eq("default param used", greet("World"), "Hi, World");
+test_eq("default param overridden", greet("Alice", "Hello"), "Hello, Alice");
+
+fn sum(...nums) {
+    let t = 0;
+    let i = 0;
+    while (i < length(nums)) { t = t + nums[i]; i = i + 1; }
+    return t;
+}
+test_eq("rest param sum", sum(1, 2, 3, 4), 10);
+
+// Named arguments
+fn createUser(name, age = 25, city = "Unknown", active = true) {
+    return { name: name, age: age, city: city, active: active };
+}
+test_eq("positional createUser", createUser("Alice", 28, "NY", true),
+    { name: "Alice", age: 28, city: "NY", active: true });
+test_eq("named args createUser", createUser(name: "Bob", city: "London", age: 35),
+    { name: "Bob", age: 35, city: "London", active: true });
+test_eq("mixed named/positional", createUser("Charlie", city: "Tokyo", active: false),
+    { name: "Charlie", age: 25, city: "Tokyo", active: false });
+
+// Arrow functions
+let dbl = x => x * 2;
+test_eq("arrow single param", dbl(7), 14);
+
+let arrowAdd = (x, y) => x + y;
+test_eq("arrow two params", arrowAdd(2, 3), 5);
+
+let fact = n => { if (n <= 1) return 1; return n * fact(n - 1); };
+test_eq("arrow block body recursion", fact(6), 720);
+
+// 'this' binding
+section("'this' binding");
+let counter = {
+    n: 0,
+    inc: fn() { this.n = this.n + 1; return this.n; },
+    makeArrowGetter: fn() { return () => this.n; },
+    makeNormalGetter: fn() { return fn() { return this.n; }; }
+};
+
+counter.inc(); // 1
+counter.inc(); // 2
+let getArrow = counter.makeArrowGetter();
+let getNormal = counter.makeNormalGetter();
+test_eq("arrow captures lexical this", getArrow(), 2);
+
+let other = { n: 100 };
+other.get = getArrow;
+test_eq("arrow ignores rebinding", other.get(), 2);
+
+other.get = getNormal;
+test_eq("normal respects call-site this", other.get(), 100);
+
+// Methods on object
+let person = {
+    name: "John",
+    age: 30,
+    greet: fn() { return "Hello, I'm " + this.name + " and I'm " + this.age + " years old."; },
+    haveBirthday: fn() { this.age = this.age + 1; return this.age; }
+};
+test_eq("method uses this", person.greet(), "Hello, I'm John and I'm 30 years old.");
+test_eq("mutating method", person.haveBirthday(), 31);
+
+// Destructuring declarations and assignment
+section("Destructuring");
+let [a, b = 2, ...rest] = [1, , 3, 4, 5];
+test_eq("array destructuring decl", [a, b, rest], [1, 2, [3, 4, 5]]);
+
+const { x: xx, y, z = 7, ...other } = { x: 1, y: 2, w: 9 };
+test_eq("object destructuring decl with alias/default/rest",
+    [xx, y, z, other], [1, 2, 7, { w: 9 }]);
+
+[a, b] = [10, 20];
+test_eq("array destructuring assignment", [a, b], [10, 20]);
+
+let target = { a: 0, b: 0 };
+{ a: target.a, b: target.b } = { a: 5, b: 6 };
+test_eq("object destructuring assignment into properties", target, { a: 5, b: 6 });
+
+// Member calls + rest-last with named args
+section("Parameters: rest-last and named arguments");
+fn restLastDemo(a, b = 2, ...r) { return { a: a, b: b, rest: r }; }
+test_eq("restLastDemo(1)", restLastDemo(1), { a: 1, b: 2, rest: [] });
+test_eq("restLastDemo(1,3,4,5)", restLastDemo(1, 3, 4, 5), { a: 1, b: 3, rest: [4, 5] });
+test_eq("restLastDemo(b:10,a:7,8,9)", restLastDemo(b: 10, a: 7, 8, 9), { a: 7, b: 10, rest: [8, 9] });
+
+// JSON roundtrip
+section("JSON");
+let objJ = { msg: "ok", data: [1, 2, 3], nested: { a: 1 } };
+let j = json_stringify(objJ);
+let parsed = json_parse(j);
+test_eq("json round-trip deep equal", parsed, objJ);
+
+// Random determinism by reseeding
+section("Random with seed");
+srand(123);
+let r1 = random();
+srand(123);
+let r2 = random();
+test_true("random repeatable after same seed", almost_number_equal(r1, r2));
+
+// --- Summary -----------------------------------------------------------------
+println();
+println("===== SUMMARY =====");
+println("Total: ", TOTAL, "  Passed: ", PASSED, "  Failed: ", FAILED);
+if (FAILED > 0) {
+    println("Failed tests:");
+    let i = 0;
+    while (i < length(FAILS)) { println(" - ", FAILS[i]); i = i + 1; }
+}
