@@ -2152,19 +2152,75 @@ namespace MiniDynLang
         private readonly Dictionary<string, Value> _values = new Dictionary<string, Value>();
         private readonly HashSet<string> _consts = new HashSet<string>();
         private readonly HashSet<string> _lets = new HashSet<string>(); // tracks block-scoped let/const by name
+        // NEW: track "uninitialized" for TDZ-like checks on let without initializer
+        private readonly HashSet<string> _uninitialized = new HashSet<string>();
 
+        public virtual bool IsFunction => false; // NEW: mark function/global boundaries
         public Environment Enclosing { get; }
 
         public Environment(Environment enclosing = null) { Enclosing = enclosing; }
 
+        // NEW: helper – is name declared in this exact env (no parents)
+        public bool HasHere(string name) => _values.ContainsKey(name);
+
+        // NEW: helper – get only from this env (throws if TDZ)
+        public bool TryGetHere(string name, out Value v)
+        {
+            if (_values.TryGetValue(name, out v))
+            {
+                if (_uninitialized.Contains(name))
+                    throw new MiniDynRuntimeError($"Cannot access '{name}' before initialization");
+                return true;
+            }
+            v = null;
+            return false;
+        }
+
+        // NEW: nearest function/global env (fallback to self if none)
+        private Environment GetNearestFunctionEnv()
+        {
+            var e = this;
+            while (e != null && !e.IsFunction) e = e.Enclosing;
+            return e ?? this;
+        }
+
+        // NEW: var belongs to nearest function/global env; error if collides with block-scoped in that env
+        public void DeclareVarInFunctionOrGlobal(string name, Value value)
+        {
+            var target = GetNearestFunctionEnv();
+            // If that function env has a block-scoped declaration with same name, disallow var redeclare
+            if (target._values.ContainsKey(name) && (target._lets.Contains(name) || target._consts.Contains(name)))
+                throw new MiniDynRuntimeError($"Cannot redeclare block-scoped '{name}' with 'var'");
+            target._values[name] = value;
+            // Note: var can be redeclared; we don't track a separate _vars set.
+        }
+
         public void DefineVar(string name, Value value) => _values[name] = value;
+
         public void DefineLet(string name, Value value)
         {
+            if (HasHere(name))
+                throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
             _values[name] = value;
             _lets.Add(name);
+            // If it was previously marked uninitialized in this scope, clear it.
+            _uninitialized.Remove(name);
         }
+
+        // NEW: let without initializer => TDZ sentinel
+        public void DefineLetUninitialized(string name)
+        {
+            if (HasHere(name))
+                throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
+            _values[name] = Value.Nil(); // placeholder; real guard is in _uninitialized
+            _lets.Add(name);
+            _uninitialized.Add(name);
+        }
+
         public void DefineConst(string name, Value value)
         {
+            if (HasHere(name))
+                throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
             _values[name] = value;
             _lets.Add(name);
             _consts.Add(name);
@@ -2176,7 +2232,10 @@ namespace MiniDynLang
             {
                 if (_consts.Contains(name))
                     throw new MiniDynRuntimeError($"Cannot assign to const '{name}'");
-                _values[name] = value; return;
+                _values[name] = value;
+                // TDZ lift: first write initializes a 'let'
+                _uninitialized.Remove(name);
+                return;
             }
             if (Enclosing != null) { Enclosing.Assign(name, value); return; }
             throw new MiniDynRuntimeError($"Undefined variable '{name}'");
@@ -2184,7 +2243,12 @@ namespace MiniDynLang
 
         public Value Get(string name)
         {
-            if (_values.TryGetValue(name, out var v)) return v;
+            if (_values.TryGetValue(name, out var v))
+            {
+                if (_uninitialized.Contains(name))
+                    throw new MiniDynRuntimeError($"Cannot access '{name}' before initialization");
+                return v;
+            }
             if (Enclosing != null) return Enclosing.Get(name);
             throw new MiniDynRuntimeError($"Undefined variable '{name}'");
         }
@@ -2193,6 +2257,8 @@ namespace MiniDynLang
         {
             if (_values.TryGetValue(name, out var local))
             {
+                if (_uninitialized.Contains(name))
+                    throw new MiniDynRuntimeError($"Cannot access '{name}' before initialization");
                 v = local;
                 return true;
             }
@@ -2203,6 +2269,13 @@ namespace MiniDynLang
 
 
         public bool IsDeclaredHere(string name) => _values.ContainsKey(name) && _lets.Contains(name);
+    }
+
+    // Marks function/global scopes (nearest target for 'var')
+    public class FunctionEnvironment : Environment
+    {
+        public override bool IsFunction => true;
+        public FunctionEnvironment(Environment enclosing = null) : base(enclosing) { }
     }
 
     public interface ICallable
@@ -2388,7 +2461,7 @@ namespace MiniDynLang
         public class BreakSignal : Exception { }
         public class ContinueSignal : Exception { }
 
-        public readonly Environment Globals = new Environment();
+        public readonly Environment Globals;
         private Environment _env;
         public Environment CurrentEnv => _env;
 
@@ -2397,6 +2470,8 @@ namespace MiniDynLang
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
         public Interpreter()
         {
+            // NEW: make top-level a function env so 'var' is truly global/function scoped
+            Globals = new FunctionEnvironment();
             _env = Globals;
 
             // Builtins
@@ -2944,14 +3019,23 @@ namespace MiniDynLang
         public object VisitVar(Stmt.Var s)
         {
             Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
-            _env.DefineVar(s.Name, val);
+            // var goes to nearest function/global
+            _env.DeclareVarInFunctionOrGlobal(s.Name, val);
             return null;
         }
 
         public object VisitLet(Stmt.Let s)
         {
-            Value val = s.Initializer != null ? Evaluate(s.Initializer) : Value.Nil();
-            _env.DefineLet(s.Name, val);
+            if (s.Initializer != null)
+            {
+                Value val = Evaluate(s.Initializer);
+                _env.DefineLet(s.Name, val);
+            }
+            else
+            {
+                // TDZ-like behavior
+                _env.DefineLetUninitialized(s.Name);
+            }
             return null;
         }
 
@@ -2970,9 +3054,16 @@ namespace MiniDynLang
             {
                 switch (s.DeclKind)
                 {
-                    case Stmt.DestructuringDecl.Kind.Var: _env.DefineVar(name, v); break;
-                    case Stmt.DestructuringDecl.Kind.Let: _env.DefineLet(name, v); break;
-                    case Stmt.DestructuringDecl.Kind.Const: _env.DefineConst(name, v); break;
+                    case Stmt.DestructuringDecl.Kind.Var:
+                        // NEW: var pattern bindings go to function/global env
+                        _env.DeclareVarInFunctionOrGlobal(name, v);
+                        break;
+                    case Stmt.DestructuringDecl.Kind.Let:
+                        _env.DefineLet(name, v);
+                        break;
+                    case Stmt.DestructuringDecl.Kind.Const:
+                        _env.DefineConst(name, v);
+                        break;
                 }
             }
             s.Pattern.Bind(this, src, declare, allowConstReassign: false);
@@ -3027,7 +3118,8 @@ namespace MiniDynLang
         {
             var kind = s.FuncExpr.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
             var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null, s.FuncExpr.Span);
-            _env.DefineVar(s.Name, Value.Function(fn));
+            // function statements bind like 'var' in the nearest function/global env
+            _env.DeclareVarInFunctionOrGlobal(s.Name, Value.Function(fn));
             return null;
         }
 

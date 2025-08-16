@@ -326,9 +326,9 @@ section("Destructuring");
 let [a, b = 2, ...rest] = [1, , 3, 4, 5];
 test_eq("array destructuring decl", [a, b, rest], [1, 2, [3, 4, 5]]);
 
-const { x: xx, y, z = 7, ...other } = { x: 1, y: 2, w: 9 };
+const { x: xx, y, z = 7, ...others } = { x: 1, y: 2, w: 9 };
 test_eq("object destructuring decl with alias/default/rest",
-    [xx, y, z, other], [1, 2, 7, { w: 9 }]);
+    [xx, y, z, others], [1, 2, 7, { w: 9 }]);
 
 [a, b] = [10, 20];
 test_eq("array destructuring assignment", [a, b], [10, 20]);
