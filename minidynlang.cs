@@ -1204,7 +1204,9 @@ namespace MiniDynLang
                 return ParseSinglePattern();
 
             var baseTok = Advance();
-            Expr expr = new Expr.Variable((string)baseTok.Literal);
+            var baseVar = new Expr.Variable((string)baseTok.Literal);
+            baseVar.Span = SourceSpan.FromToken(baseTok);
+            Expr expr = baseVar;
 
             bool hasAccessor = false;          // did we see '.' or '[' ?
 
@@ -1213,14 +1215,19 @@ namespace MiniDynLang
                 if (Match(TokenType.Dot))
                 {
                     var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
-                    expr = new Expr.Property(expr, (string)nameTok.Literal);
+                    var prop = new Expr.Property(expr, (string)nameTok.Literal);
+                    prop.Span = SourceSpan.FromToken(nameTok);
+                    expr = prop;
                     hasAccessor = true;
                 }
                 else if (Match(TokenType.LBracket))
                 {
+                    var lbrTok = Previous();
                     var idx = Expression();
                     Consume(TokenType.RBracket, "Expected ']'");
-                    expr = new Expr.Index(expr, idx);
+                    var index = new Expr.Index(expr, idx);
+                    index.Span = SourceSpan.FromToken(lbrTok);
+                    expr = index;
                     hasAccessor = true;
                 }
                 else break;
@@ -1266,7 +1273,7 @@ namespace MiniDynLang
 
         private Stmt Declaration()
         {
-            if (Match(TokenType.Fn)) return FunctionDecl("function");
+            if (Match(TokenType.Fn)) { var fnTok = Previous(); return FunctionDecl(fnTok, "function"); }
             if (Match(TokenType.Const)) return ConstDeclOrDestructuring();
             if (Match(TokenType.Let)) return LetDeclOrDestructuring();
             if (Match(TokenType.Var)) return VarDeclOrDestructuring();
@@ -1324,7 +1331,7 @@ namespace MiniDynLang
             return parameters;
         }
 
-        private Stmt FunctionDecl(string kind)
+        private Stmt FunctionDecl(Token fnTok, string kind)
         {
             var nameTok = Consume(TokenType.Identifier, $"Expected {kind} name");
             Consume(TokenType.LParen, "Expected '('");
@@ -1332,7 +1339,11 @@ namespace MiniDynLang
             Consume(TokenType.RParen, "Expected ')'");
             Consume(TokenType.LBrace, "Expected '{' before function body");
             var body = BlockStatementInternal();
-            return new Stmt.Function((string)nameTok.Literal, new Expr.Function(parameters, body, isArrow: false));
+            var funcExpr = new Expr.Function(parameters, body, isArrow: false);
+            funcExpr.Span = SourceSpan.FromToken(fnTok);
+            var decl = new Stmt.Function((string)nameTok.Literal, funcExpr);
+            decl.Span = SourceSpan.FromToken(fnTok);
+            return decl;
         }
 
         // Destructuring patterns
@@ -1432,6 +1443,7 @@ namespace MiniDynLang
 
         private Stmt VarDeclOrDestructuring()
         {
+            var kwTok = Previous(); // 'var'
             // var <pattern or name> [= initializer] ;
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
@@ -1440,18 +1452,23 @@ namespace MiniDynLang
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
-                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var);
+                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var);
+                d.Span = SourceSpan.FromToken(kwTok);
+                return d;
             }
             var nameTok = Consume(TokenType.Identifier, "Expected variable name");
             Expr init2 = null;
             if (Match(TokenType.Assign))
                 init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Var((string)nameTok.Literal, init2);
+            var s = new Stmt.Var((string)nameTok.Literal, init2);
+            s.Span = SourceSpan.FromToken(kwTok);
+            return s;
         }
 
         private Stmt LetDeclOrDestructuring()
         {
+            var kwTok = Previous(); // 'let'
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
                 var pat = ParsePattern();
@@ -1459,30 +1476,39 @@ namespace MiniDynLang
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
-                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let);
+                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let);
+                d.Span = SourceSpan.FromToken(kwTok);
+                return d;
             }
             var nameTok = Consume(TokenType.Identifier, "Expected variable name");
             Expr init2 = null;
             if (Match(TokenType.Assign))
                 init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Let((string)nameTok.Literal, init2);
+            var s = new Stmt.Let((string)nameTok.Literal, init2);
+            s.Span = SourceSpan.FromToken(kwTok);
+            return s;
         }
 
         private Stmt ConstDeclOrDestructuring()
         {
+            var kwTok = Previous(); // 'const'
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
                 var pat = ParsePattern();
                 var init = ParseInitializerRequired();
                 Consume(TokenType.Semicolon, "Expected ';'");
-                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Const);
+                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Const);
+                d.Span = SourceSpan.FromToken(kwTok);
+                return d;
             }
             var nameTok = Consume(TokenType.Identifier, "Expected constant name");
             Consume(TokenType.Assign, "Expected '=' after const name");
             var init2 = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.Const((string)nameTok.Literal, init2);
+            var s = new Stmt.Const((string)nameTok.Literal, init2);
+            s.Span = SourceSpan.FromToken(kwTok);
+            return s;
         }
 
         private Expr ParseInitializerRequired()
@@ -1493,26 +1519,32 @@ namespace MiniDynLang
 
         private Stmt Statement()
         {
-            if (Match(TokenType.If)) return IfStatement();
-            if (Match(TokenType.While)) return WhileStatement();
-            if (Match(TokenType.Break)) { Consume(TokenType.Semicolon, "Expected ';' after break"); return new Stmt.Break(); }
-            if (Match(TokenType.Continue)) { Consume(TokenType.Semicolon, "Expected ';' after continue"); return new Stmt.Continue(); }
+            if (Match(TokenType.If)) { var ifTok = Previous(); return IfStatement(ifTok); }
+            if (Match(TokenType.While)) { var whileTok = Previous(); return WhileStatement(whileTok); }
+            if (Match(TokenType.Break)) { var brTok = Previous(); Consume(TokenType.Semicolon, "Expected ';' after break"); var s = new Stmt.Break(); s.Span = SourceSpan.FromToken(brTok); return s; }
+            if (Match(TokenType.Continue)) { var ctTok = Previous(); Consume(TokenType.Semicolon, "Expected ';' after continue"); var s = new Stmt.Continue(); s.Span = SourceSpan.FromToken(ctTok); return s; }
             if (Match(TokenType.Return))
             {
+                var retTok = Previous();
                 Expr value = null;
                 if (!Check(TokenType.Semicolon)) value = Expression();
                 Consume(TokenType.Semicolon, "Expected ';' after return value");
-                return new Stmt.Return(value);
+                var s = new Stmt.Return(value);
+                s.Span = SourceSpan.FromToken(retTok);
+                return s;
             }
 
             // Array destructuring assignment: [a,b] = expr;
             if (Check(TokenType.LBracket))
             {
                 var pat = ParsePattern();
-                Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
+                var assignTok = Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
                 var val = Expression();
                 Consume(TokenType.Semicolon, "Expected ';'");
-                return new Stmt.ExprStmt(new Expr.DestructuringAssign(pat, val));
+                var e = new Expr.DestructuringAssign(pat, val);
+                e.Span = SourceSpan.FromToken(assignTok);
+                var s = new Stmt.ExprStmt(e) { Span = e.Span };
+                return s;
             }
 
             // For '{', we need to look ahead to determine if it's a block or destructuring
@@ -1567,23 +1599,26 @@ namespace MiniDynLang
                 if (isDestructuring)
                 {
                     var pat = ParsePattern();
-                    Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
+                    var assignTok2 = Consume(TokenType.Assign, "Expected '=' in destructuring assignment");
                     var val = Expression();
                     Consume(TokenType.Semicolon, "Expected ';'");
-                    return new Stmt.ExprStmt(new Expr.DestructuringAssign(pat, val));
+                    var e = new Expr.DestructuringAssign(pat, val);
+                    e.Span = SourceSpan.FromToken(assignTok2);
+                    var s = new Stmt.ExprStmt(e) { Span = e.Span };
+                    return s;
                 }
                 else
                 {
                     // Plain block statement
                     Advance(); // consume '{'
-                    return new Stmt.Block(BlockStatementInternal().Statements);
+                    return BlockStatementInternal();
                 }
             }
 
             return ExprStatement();
         }
 
-        private Stmt IfStatement()
+        private Stmt IfStatement(Token ifTok)
         {
             Consume(TokenType.LParen, "Expected '(' after if");
             var cond = Expression();
@@ -1591,32 +1626,39 @@ namespace MiniDynLang
             var thenS = Statement();
             Stmt elseS = null;
             if (Match(TokenType.Else)) elseS = Statement();
-            return new Stmt.If(cond, thenS, elseS);
+            var s = new Stmt.If(cond, thenS, elseS);
+            s.Span = SourceSpan.FromToken(ifTok);
+            return s;
         }
 
-        private Stmt WhileStatement()
+        private Stmt WhileStatement(Token whileTok)
         {
             Consume(TokenType.LParen, "Expected '(' after while");
             var cond = Expression();
             Consume(TokenType.RParen, "Expected ')'");
             var body = Statement();
-            return new Stmt.While(cond, body);
+            var s = new Stmt.While(cond, body);
+            s.Span = SourceSpan.FromToken(whileTok);
+            return s;
         }
 
         private Stmt.Block BlockStatementInternal()
         {
+            var lbraceTok = Previous(); // caller just consumed '{'
             List<Stmt> stmts = new List<Stmt>();
             while (!Check(TokenType.RBrace) && !IsAtEnd)
                 stmts.Add(Declaration());
             Consume(TokenType.RBrace, "Expected '}'");
-            return new Stmt.Block(stmts);
+            var b = new Stmt.Block(stmts);
+            b.Span = SourceSpan.FromToken(lbraceTok);
+            return b;
         }
 
         private Stmt ExprStatement()
         {
             var expr = Expression();
             Consume(TokenType.Semicolon, "Expected ';'");
-            return new Stmt.ExprStmt(expr);
+            return new Stmt.ExprStmt(expr) { Span = expr?.Span ?? default(SourceSpan) };
         }
 
         // expression -> comma
@@ -1640,12 +1682,15 @@ namespace MiniDynLang
             var cond = Assignment();
             if (Match(TokenType.Question))
             {
+                var qTok = Previous();
                 // Do not allow the comma operator to bleed across argument/element boundaries.
                 // Use Assignment for 'then' and recurse to Ternary for right-associativity on 'else'.
                 var thenE = Assignment();
                 Consume(TokenType.Colon, "Expected ':' in ternary expression");
                 var elseE = Ternary();
-                return new Expr.Ternary(cond, thenE, elseE);
+                var t = new Expr.Ternary(cond, thenE, elseE);
+                t.Span = SourceSpan.FromToken(qTok);
+                return t;
             }
             return cond;
         }
@@ -1663,12 +1708,16 @@ namespace MiniDynLang
                 if (expr is Expr.Index || expr is Expr.Property || expr is Expr.Variable)
                 {
                     var value = Assignment();
-                    return new Expr.Assign(expr, op, value);
+                    var a = new Expr.Assign(expr, op, value);
+                    a.Span = SourceSpan.FromToken(op);
+                    return a;
                 }
                 else if (expr is Expr.Grouping g && (g.Inner is Expr.Index || g.Inner is Expr.Property || g.Inner is Expr.Variable))
                 {
                     var value = Assignment();
-                    return new Expr.Assign(g.Inner, op, value);
+                    var a = new Expr.Assign(g.Inner, op, value);
+                    a.Span = SourceSpan.FromToken(op);
+                    return a;
                 }
                 else
                 {
@@ -1691,7 +1740,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = And();
-                expr = new Expr.Logical(expr, op, right);
+                var n = new Expr.Logical(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1703,7 +1753,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Equality();
-                expr = new Expr.Logical(expr, op, right);
+                var n = new Expr.Logical(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1715,7 +1766,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Comparison();
-                expr = new Expr.Binary(expr, op, right);
+                var n = new Expr.Binary(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1727,7 +1779,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Term();
-                expr = new Expr.Binary(expr, op, right);
+                var n = new Expr.Binary(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1739,7 +1792,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Factor();
-                expr = new Expr.Binary(expr, op, right);
+                var n = new Expr.Binary(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1751,7 +1805,8 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Unary();
-                expr = new Expr.Binary(expr, op, right);
+                var n = new Expr.Binary(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
             }
             return expr;
         }
@@ -1762,7 +1817,9 @@ namespace MiniDynLang
             {
                 var op = Previous();
                 var right = Unary();
-                return new Expr.Unary(op, right);
+                var u = new Expr.Unary(op, right);
+                u.Span = SourceSpan.FromToken(op);
+                return u;
             }
             return Member();
         }
@@ -1776,6 +1833,7 @@ namespace MiniDynLang
                 // 1. function / method call  
                 if (Match(TokenType.LParen))
                 {
+                    var lparTok = Previous();
                     var args = new List<Expr.Call.Argument>();
 
                     if (!Check(TokenType.RParen))
@@ -1802,7 +1860,9 @@ namespace MiniDynLang
                     }
 
                     Consume(TokenType.RParen, "Expected ')'");
-                    expr = new Expr.Call(expr, args);
+                    var call = new Expr.Call(expr, args);
+                    call.Span = SourceSpan.FromToken(lparTok);
+                    expr = call;
                     continue;
                 }
 
@@ -1810,17 +1870,22 @@ namespace MiniDynLang
                 if (Match(TokenType.Dot))
                 {
                     var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
-                    expr = new Expr.Property(expr, (string)nameTok.Literal);
+                    var prop = new Expr.Property(expr, (string)nameTok.Literal);
+                    prop.Span = SourceSpan.FromToken(nameTok);
+                    expr = prop;
                     continue;
                 }
 
                 // 3. index access  
                 if (Match(TokenType.LBracket))
                 {
+                    var lbrTok = Previous();
                     // allow ternary in index, not comma operator
                     var indexExpr = Ternary();
                     Consume(TokenType.RBracket, "Expected ']'");
-                    expr = new Expr.Index(expr, indexExpr);
+                    var idx = new Expr.Index(expr, indexExpr);
+                    idx.Span = SourceSpan.FromToken(lbrTok);
+                    expr = idx;
                     continue;
                 }
 
@@ -1833,17 +1898,43 @@ namespace MiniDynLang
         private Expr Primary()
         {
             if (Match(TokenType.Number))
-                return new Expr.Literal(Value.Number((NumberValue)Previous().Literal));
+            {
+                var tok = Previous();
+                var lit = new Expr.Literal(Value.Number((NumberValue)tok.Literal));
+                lit.Span = SourceSpan.FromToken(tok);
+                return lit;
+            }
             if (Match(TokenType.String))
-                return new Expr.Literal(Value.String((string)Previous().Literal));
+            {
+                var tok = Previous();
+                var lit = new Expr.Literal(Value.String((string)tok.Literal));
+                lit.Span = SourceSpan.FromToken(tok);
+                return lit;
+            }
             if (Match(TokenType.True))
-                return new Expr.Literal(Value.Boolean(true));
+            {
+                var tok = Previous();
+                var lit = new Expr.Literal(Value.Boolean(true));
+                lit.Span = SourceSpan.FromToken(tok);
+                return lit;
+            }
             if (Match(TokenType.False))
-                return new Expr.Literal(Value.Boolean(false));
+            {
+                var tok = Previous();
+                var lit = new Expr.Literal(Value.Boolean(false));
+                lit.Span = SourceSpan.FromToken(tok);
+                return lit;
+            }
             if (Match(TokenType.Nil))
-                return new Expr.Literal(Value.Nil());
+            {
+                var tok = Previous();
+                var lit = new Expr.Literal(Value.Nil());
+                lit.Span = SourceSpan.FromToken(tok);
+                return lit;
+            }
             if (Match(TokenType.LBracket))
             {
+                var lbrTok = Previous();
                 var elems = new List<Expr>();
 
                 // We may be looking at "]" right away – empty literal "[]"
@@ -1867,10 +1958,13 @@ namespace MiniDynLang
                 }
 
                 Consume(TokenType.RBracket, "Expected ']'");
-                return new Expr.ArrayLiteral(elems);
+                var arr = new Expr.ArrayLiteral(elems);
+                arr.Span = SourceSpan.FromToken(lbrTok);
+                return arr;
             }
             if (Match(TokenType.LBrace))
             {
+                var lbraceTok = Previous();
                 var entries = new List<Expr.ObjectLiteral.Entry>();
                 if (!Check(TokenType.RBrace))
                 {
@@ -1917,11 +2011,14 @@ namespace MiniDynLang
                     } while (Match(TokenType.Comma));
                 }
                 Consume(TokenType.RBrace, "Expected '}'");
-                return new Expr.ObjectLiteral(entries);
+                var obj = new Expr.ObjectLiteral(entries);
+                obj.Span = SourceSpan.FromToken(lbraceTok);
+                return obj;
             }
 
             if (Match(TokenType.LParen))
             {
+                var lparenTok = Previous();
                 // Could be grouped expression or arrow function parameters
                 int savePoint = _current;
 
@@ -1935,7 +2032,9 @@ namespace MiniDynLang
                 _current = savePoint; // we are already right after '('
                 var e = Expression();
                 Consume(TokenType.RParen, "Expected ')'");
-                return new Expr.Grouping(e);
+                var g = new Expr.Grouping(e);
+                g.Span = SourceSpan.FromToken(lparenTok);
+                return g;
             }
 
             var nextTokenIsArrow = PeekAhead(1)?.Type == TokenType.Arrow;
@@ -1944,7 +2043,7 @@ namespace MiniDynLang
             if (Check(TokenType.Identifier) && nextTokenIsArrow)
             {
                 var param = Advance();
-                Consume(TokenType.Arrow, "Expected '=>'");
+                var arrowTok = Consume(TokenType.Arrow, "Expected '=>'");
 
                 Stmt.Block bodyBlock;
                 if (Check(TokenType.LBrace))
@@ -1962,23 +2061,33 @@ namespace MiniDynLang
                 }
 
                 var parameters = new List<Expr.Param> { new Expr.Param((string)param.Literal) };
-                return new Expr.Function(parameters, bodyBlock, isArrow: true);
+                var fn = new Expr.Function(parameters, bodyBlock, isArrow: true);
+                fn.Span = SourceSpan.FromToken(arrowTok);
+                return fn;
             }
 
             if (Match(TokenType.Fn))
             {
+                var fnTok = Previous();
                 // anonymous/inline function expression
                 Consume(TokenType.LParen, "Expected '(' after 'fn'");
                 var parameters = ParseParamList();
                 Consume(TokenType.RParen, "Expected ')'");
                 Consume(TokenType.LBrace, "Expected '{' before function body");
                 var body = BlockStatementInternal();
-                return new Expr.Function(parameters, body, isArrow: false);
+                var fn = new Expr.Function(parameters, body, isArrow: false);
+                fn.Span = SourceSpan.FromToken(fnTok);
+                return fn;
             }
 
             // Ordinary identifier
             if (Match(TokenType.Identifier))
-                return new Expr.Variable((string)Previous().Literal);
+            {
+                var tok = Previous();
+                var v = new Expr.Variable((string)tok.Literal);
+                v.Span = SourceSpan.FromToken(tok);
+                return v;
+            }
             throw new MiniDynParseError("Expected expression", Peek().Line, Peek().Column);
         }
 
@@ -2006,7 +2115,7 @@ namespace MiniDynLang
                     return false;
                 }
 
-                Consume(TokenType.Arrow, "Expected '=>'");
+                var arrowTok = Consume(TokenType.Arrow, "Expected '=>'");
 
                 Stmt.Block bodyBlock;
 
@@ -2024,7 +2133,9 @@ namespace MiniDynLang
                     bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(bodyExpr) });
                 }
 
-                arrowFunc = new Expr.Function(parameters, bodyBlock, isArrow: true);
+                var fn = new Expr.Function(parameters, bodyBlock, isArrow: true);
+                fn.Span = SourceSpan.FromToken(arrowTok);
+                arrowFunc = fn;
                 return true;
             }
             catch
