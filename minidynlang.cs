@@ -349,29 +349,79 @@ namespace MiniDynLang
 
     public sealed class ObjectValue
     {
-        public readonly Dictionary<string, Value> Props;
-        public ObjectValue() { Props = new Dictionary<string, Value>(); }
-        public ObjectValue(Dictionary<string, Value> dict) { Props = dict ?? new Dictionary<string, Value>(); }
-        public bool TryGet(string key, out Value v) => Props.TryGetValue(key, out v);
-        public void Set(string key, Value v) => Props[key] = v;
-        public bool Remove(string key) => Props.Remove(key);
-        public int Count => Props.Count;
+        // Preserve insertion order deterministically across runtimes
+        private readonly Dictionary<string, Value> _map;
+        private readonly List<string> _order;
+
+        public ObjectValue()
+        {
+            _map = new Dictionary<string, Value>(StringComparer.Ordinal);
+            _order = new List<string>();
+        }
+
+        // Legacy convenience: builds an ordered object from an existing dictionary
+        public ObjectValue(Dictionary<string, Value> dict)
+        {
+            _map = new Dictionary<string, Value>(StringComparer.Ordinal);
+            _order = new List<string>();
+            if (dict != null)
+            {
+                foreach (var kv in dict)
+                    Set(kv.Key, kv.Value);
+            }
+        }
+
+        public bool TryGet(string key, out Value v) => _map.TryGetValue(key, out v);
+        public bool Contains(string key) => _map.ContainsKey(key);
+
+        public void Set(string key, Value v)
+        {
+            if (!_map.ContainsKey(key))
+                _order.Add(key);
+            _map[key] = v;
+        }
+
+        public bool Remove(string key)
+        {
+            if (!_map.ContainsKey(key)) return false;
+            _map.Remove(key);
+            _order.Remove(key);
+            return true;
+        }
+
+        public int Count => _map.Count;
+
+        public IEnumerable<string> Keys => _order;
+
+        public IEnumerable<KeyValuePair<string, Value>> Entries
+        {
+            get
+            {
+                foreach (var k in _order)
+                    yield return new KeyValuePair<string, Value>(k, _map[k]);
+            }
+        }
+
         public ObjectValue CloneShallow()
         {
-            return new ObjectValue(new Dictionary<string, Value>(Props));
+            var copy = new ObjectValue();
+            foreach (var k in _order)
+                copy.Set(k, _map[k]);
+            return copy;
         }
+
         public override string ToString()
         {
             var sb = new StringBuilder();
             sb.Append('{');
             bool first = true;
-            foreach (var kv in Props)
+            foreach (var k in _order)
             {
                 if (!first) sb.Append(", ");
                 first = false;
-                sb.Append(kv.Key);
+                sb.Append(k);
                 sb.Append(": ");
-                sb.Append(kv.Value.ToString());
+                sb.Append(_map[k].ToString());
             }
             sb.Append('}');
             return sb.ToString();
@@ -670,7 +720,14 @@ namespace MiniDynLang
                     return MakeToken(TokenType.Dot, ".", null, start, startLine, startCol);
                 case '!':
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.NotEqual, "!=", null, start, startLine, startCol); }
-                    throw new MiniDynLexError("Unexpected '!'", startLine, startCol);
+                    // Support '!' as alias for 'not'
+                    return MakeToken(TokenType.Not, "!", null, start, startLine, startCol);
+                case '&':
+                    if (Peek() == '&') { Advance(); return MakeToken(TokenType.And, "&&", null, start, startLine, startCol); }
+                    throw new MiniDynLexError("Unexpected '&'", startLine, startCol);
+                case '|':
+                    if (Peek() == '|') { Advance(); return MakeToken(TokenType.Or, "||", null, start, startLine, startCol); }
+                    throw new MiniDynLexError("Unexpected '|'", startLine, startCol);
                 case '=':
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.Equal, "==", null, start, startLine, startCol); }
                     if (Peek() == '>') { Advance(); return MakeToken(TokenType.Arrow, "=>", null, start, startLine, startCol); }
@@ -1045,7 +1102,7 @@ namespace MiniDynLang
                 if (HasRest && RestPattern != null)
                 {
                     var rest = new ObjectValue();
-                    foreach (var kv in obj.Props)
+                    foreach (var kv in obj.Entries)
                     {
                         if (!used.Contains(kv.Key)) rest.Set(kv.Key, kv.Value);
                     }
@@ -2545,7 +2602,7 @@ namespace MiniDynLang
             {
                 var o = a[0].AsObject();
                 var arr = new ArrayValue();
-                foreach (var k in o.Props.Keys) arr.Items.Add(Value.String(k));
+                foreach (var k in o.Keys) arr.Items.Add(Value.String(k));
                 return Value.Array(arr);
             });
 
@@ -2553,7 +2610,7 @@ namespace MiniDynLang
             {
                 var o = a[0].AsObject();
                 var k = a[1].AsString();
-                return Value.Boolean(o.Props.ContainsKey(k));
+                return Value.Boolean(o.Contains(k));
             });
 
             DefineBuiltin("remove_key", 2, 2, (i, a) =>
@@ -2568,7 +2625,7 @@ namespace MiniDynLang
                 var o1 = a[0].AsObject();
                 var o2 = a[1].AsObject();
                 var res = o1.CloneShallow();
-                foreach (var kv in o2.Props) res.Set(kv.Key, kv.Value);
+                foreach (var kv in o2.Entries) res.Set(kv.Key, kv.Value);
                 return Value.Object(res);
             });
 
@@ -2758,7 +2815,7 @@ namespace MiniDynLang
             {
                 var o = a[0].AsObject();
                 var arr = new ArrayValue();
-                foreach (var v in o.Props.Values) arr.Items.Add(v);
+                foreach (var kv in o.Entries) arr.Items.Add(kv.Value);
                 return Value.Array(arr);
             });
 
@@ -2766,7 +2823,7 @@ namespace MiniDynLang
             {
                 var o = a[0].AsObject();
                 var arr = new ArrayValue();
-                foreach (var kv in o.Props)
+                foreach (var kv in o.Entries)
                 {
                     var pair = new ArrayValue(new[] { Value.String(kv.Key), kv.Value });
                     arr.Items.Add(Value.Array(pair));
@@ -2777,16 +2834,16 @@ namespace MiniDynLang
             DefineBuiltin("from_entries", 1, 1, (i, a) =>
             {
                 var src = a[0].AsArray();
-                var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+                var ov = new ObjectValue();
                 for (int k = 0; k < src.Length; k++)
                 {
                     var entry = src[k];
                     if (entry.Type != ValueType.Array) throw new MiniDynRuntimeError("from_entries expects array of [key, value] pairs");
                     var tup = entry.AsArray();
                     if (tup.Length != 2 || tup[0].Type != ValueType.String) throw new MiniDynRuntimeError("from_entries expects [string, any] pairs");
-                    dict[tup[0].AsString()] = tup[1];
+                    ov.Set(tup[0].AsString(), tup[1]);
                 }
-                return Value.Object(new ObjectValue(dict));
+                return Value.Object(ov);
             });
 
             DefineBuiltin("map", 2, 2, (i, a) =>
@@ -3192,7 +3249,7 @@ namespace MiniDynLang
                 var objVal = Evaluate(p.Target);
                 if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property assignment target must be object");
                 var obj = objVal.AsObject();
-                obj.Props.TryGetValue(p.Name, out var cur);
+                obj.TryGet(p.Name, out var cur);
                 var newVal = ApplyOp(cur, e.Op.Type, rhs);
                 obj.Set(p.Name, newVal);
                 return newVal;
@@ -3216,7 +3273,7 @@ namespace MiniDynLang
                 {
                     var obj = target.AsObject();
                     var key = ToStringValue(idxV);
-                    obj.Props.TryGetValue(key, out var cur);
+                    obj.TryGet(key, out var cur);
                     var newVal = ApplyOp(cur, e.Op.Type, rhs);
                     obj.Set(key, newVal);
                     return newVal;
@@ -3530,7 +3587,7 @@ namespace MiniDynLang
 
         public Value VisitObjectLiteral(Expr.ObjectLiteral e)
         {
-            var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+            var objv = new ObjectValue();
             foreach (var entry in e.Entries)
             {
                 string key;
@@ -3544,9 +3601,9 @@ namespace MiniDynLang
                     key = ToStringValue(kVal);
                 }
                 var val = Evaluate(entry.ValueExpr);
-                dict[key] = val;
+                objv.Set(key, val);
             }
-            return Value.Object(new ObjectValue(dict));
+            return Value.Object(objv);
         }
 
         public Value VisitProperty(Expr.Property e)
@@ -3697,7 +3754,7 @@ namespace MiniDynLang
                         var obj = v.AsObject();
                         if (obj.Count == 0) return "{}";
                         var parts = new List<string>(obj.Count);
-                        foreach (var kv in obj.Props)
+                        foreach (var kv in obj.Entries)
                         {
                             var key = "\"" + EscapeJson(kv.Key) + "\"";
                             var val = JsonStringifyValue(kv.Value, pretty, indent + 2);
@@ -3759,10 +3816,10 @@ namespace MiniDynLang
 
                 case JTokenType.Object:
                     {
-                        var dict = new Dictionary<string, Value>(StringComparer.Ordinal);
+                        var ov = new ObjectValue();
                         foreach (var prop in (JObject)t)
-                            dict[prop.Key] = JsonToValue(prop.Value);
-                        return Value.Object(new ObjectValue(dict));
+                            ov.Set(prop.Key, JsonToValue(prop.Value));
+                        return Value.Object(ov);
                     }
 
                 default:
