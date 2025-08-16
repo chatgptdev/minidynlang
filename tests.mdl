@@ -407,6 +407,79 @@ test_eq("adding new key appends at end", (fn(){
     return keys(o);
 })(), ["a", "b", "c"]);
 
+// Try/Catch/Finally & Throw
+section("Try/Catch/Finally and Throw");
+
+// Catch a thrown literal
+test_eq("catch literal thrown", (fn(){
+    let got = nil;
+    try { throw 123; }
+    catch (e) { got = e; }
+    return got;
+})(), 123);
+
+// finally runs on normal path
+test_eq("finally executes on normal path", (fn(){
+    let f = 0;
+    try { f = 1; }
+    finally { f = f + 1; }
+    return f;
+})(), 2);
+
+// finally runs on throw
+test_eq("finally executes on throw", (fn(){
+    let f = 0;
+    try { throw "x"; }
+    catch (e) { }
+    finally { f = 42; }
+    return f;
+})(), 42);
+
+// raise() throws an Error object
+test_eq("raise() produces Error object", (fn(){
+    let got = nil;
+    try { raise("boom"); }
+    catch (e) { got = [e.name, e.message]; }
+    return got;
+})(), ["Error", "boom"]);
+
+// error() returns an Error object (not thrown)
+test_eq("error() returns object", (fn(){
+    let e = error("just an object");
+    return [e.name, e.message];
+})(), ["Error", "just an object"]);
+
+// Catch a runtime error as value
+test_eq("catch runtime error as value", (fn(){
+    let got = nil;
+    try {
+        let x = 1 / 0; // Division by zero -> runtime error
+    } catch (e) {
+        got = [e.name, contains(e.message, "Division by zero")];
+    }
+    return got;
+})(), ["RuntimeError", true]);
+
+// catch without binding
+test_eq("catch without binding", (fn(){
+    let f = 0;
+    try { throw "oops"; }
+    catch { f = 7; }
+    return f;
+})(), 7);
+
+// finally runs even when returning from try
+let tracking2 = { flag: 0 };
+fn f_finally() {
+    try { return 10; }
+    finally { tracking2.flag = tracking2.flag + 1; }
+}
+test_eq("finally runs on return", (fn(){
+    tracking2.flag = 0;
+    let r = f_finally();
+    return [r, tracking2.flag];
+})(), [10, 1]);
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
