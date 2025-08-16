@@ -359,6 +359,54 @@ srand(123);
 let r2 = random();
 test_true("random repeatable after same seed", almost_number_equal(r1, r2));
 
+// --- Logical alias operators (&&, ||, !) --------------------------------
+section("Logical alias operators (&&, ||, !)");
+test_eq("false && does not eval right", (fn(){
+    let s = 0;
+    fn inc2() { s = s + 1; return true; }
+    false && inc2();
+    return s;
+})(), 0);
+
+test_eq("true || does not eval right", (fn(){
+    let s = 0;
+    fn inc2() { s = s + 1; return true; }
+    true || inc2();
+    return s;
+})(), 0);
+
+test_eq("true && evals right once", (fn(){
+    let s = 0;
+    fn inc2() { s = s + 1; return true; }
+    true && inc2();
+    return s;
+})(), 1);
+
+test_true("!false is true", !false);
+test_true("!(1 < 2 && false) is true", !(1 < 2 && false));
+test_true("1 < 2 && 3 < 4", 1 < 2 && 3 < 4);
+test_true("1 < 2 || 3 < 1", 1 < 2 || 3 < 1);
+test_true("1 != 2", 1 != 2);
+
+// --- Object insertion order and iteration -------------------------------
+section("Object insertion order and iteration");
+let ord = { b: 1, a: 2, c: 3 };
+test_eq("keys preserve insertion order", keys(ord), ["b", "a", "c"]);
+test_eq("entries preserve insertion order", map(entries(ord), e => e[0]), ["b", "a", "c"]);
+test_eq("json_stringify preserves order", json_stringify(ord), "{\"b\":1,\"a\":2,\"c\":3}");
+test_eq("merge preserves base order and appends",
+    keys(merge({ a: 1 }, { b: 2, a: 3, c: 4 })), ["a", "b", "c"]);
+test_eq("updating existing key does not reorder", (fn(){
+    let o = { a: 1, b: 2, c: 3 };
+    o.b = 9;
+    return keys(o);
+})(), ["a", "b", "c"]);
+test_eq("adding new key appends at end", (fn(){
+    let o = { a: 1, b: 2 };
+    o.c = 3;
+    return keys(o);
+})(), ["a", "b", "c"]);
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
