@@ -1730,45 +1730,6 @@ namespace MiniDynLang
             return expr;
         }
 
-        private Expr Call()
-        {
-            var expr = Primary();
-            while (true)
-            {
-                if (Match(TokenType.LParen))
-                {
-                    var args = new List<Expr.Call.Argument>();
-                    if (!Check(TokenType.RParen))
-                    {
-                        do
-                        {
-                            var nextToken = PeekAhead(1);
-                            // Check if this is a named argument
-                            if (Check(TokenType.Identifier) && nextToken?.Type == TokenType.Colon)
-                            {
-                                var nameTok = Advance();
-                                Consume(TokenType.Colon, "Expected ':'");
-                                var value = Ternary(); // allow ternary, not comma operator
-                                args.Add(new Expr.Call.Argument((string)nameTok.Literal, value));
-                            }
-                            else
-                            {
-                                // Positional argument
-                                args.Add(new Expr.Call.Argument(null, Ternary())); // allow ternary, not comma operator
-                            }
-                        } while (Match(TokenType.Comma));
-                    }
-                    Consume(TokenType.RParen, "Expected ')'");
-                    expr = new Expr.Call(expr, args);
-                }
-                else
-                {
-                    break;
-                }
-            }
-            return expr;
-        }
-
         private Expr Primary()
         {
             if (Match(TokenType.Number))
