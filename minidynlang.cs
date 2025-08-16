@@ -708,6 +708,7 @@ namespace MiniDynLang
             T VisitObjectLiteral(ObjectLiteral e);
             T VisitProperty(Property e);
             T VisitDestructuringAssign(DestructuringAssign e);
+            T VisitComma(Comma e);
         }
         public abstract T Accept<T>(IVisitor<T> v);
 
@@ -977,6 +978,15 @@ namespace MiniDynLang
                 Name = name; Default = def; IsRest = isRest;
             }
         }
+
+        // Comma expression (left, right) -> evaluates left then right, returns right
+        public sealed class Comma : Expr
+        {
+            public Expr Left;
+            public Expr Right;
+            public Comma(Expr left, Expr right) { Left = left; Right = right; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitComma(this);
+        }
     }
 
     public abstract class Stmt
@@ -1202,7 +1212,8 @@ namespace MiniDynLang
                     Expr def = null;
                     if (Match(TokenType.Assign))
                     {
-                        def = Expression();
+                        // default value should allow ternary but not comma operator
+                        def = Ternary();
                     }
                     parameters.Add(new Expr.Param(pname, def, isRest: false));
 
@@ -1246,7 +1257,8 @@ namespace MiniDynLang
                         Expr def = null;
                         if (Match(TokenType.Assign))
                         {
-                            def = Expression();
+                            // default value: allow ternary but not comma operator
+                            def = Ternary();
                         }
                         elements.Add(new Expr.PatternArray.Elem(pat, def));
                     } while (Match(TokenType.Comma));
@@ -1290,7 +1302,8 @@ namespace MiniDynLang
                         Expr def = null;
                         if (Match(TokenType.Assign))
                         {
-                            def = Expression();
+                            // default value: allow ternary but not comma operator
+                            def = Ternary();
                         }
                         props.Add(new Expr.PatternObject.Prop(key, aliasPat, def));
                     } while (Match(TokenType.Comma));
@@ -1506,8 +1519,20 @@ namespace MiniDynLang
             return new Stmt.ExprStmt(expr);
         }
 
-        // expression -> assignment
-        private Expr Expression() => Ternary();
+        // expression -> comma
+        private Expr Expression() => CommaExpr();
+
+        // lowest precedence comma operator: expr , expr , expr ...
+        private Expr CommaExpr()
+        {
+            var expr = Ternary();
+            while (Match(TokenType.Comma))
+            {
+                var right = Ternary();
+                expr = new Expr.Comma(expr, right);
+            }
+            return expr;
+        }
 
         // ternary -> or ('?' expression ':' expression)?
         private Expr Ternary()
@@ -1515,9 +1540,11 @@ namespace MiniDynLang
             var cond = Assignment();
             if (Match(TokenType.Question))
             {
-                var thenE = Expression();
+                // Do not allow the comma operator to bleed across argument/element boundaries.
+                // Use Assignment for 'then' and recurse to Ternary for right-associativity on 'else'.
+                var thenE = Assignment();
                 Consume(TokenType.Colon, "Expected ':' in ternary expression");
-                var elseE = Expression();
+                var elseE = Ternary();
                 return new Expr.Ternary(cond, thenE, elseE);
             }
             return cond;
@@ -1661,14 +1688,15 @@ namespace MiniDynLang
                             {
                                 var nameTok = Advance();          // identifier  
                                 Consume(TokenType.Colon, "Expected ':'");
+                                // allow ternary in argument value, but not comma operator
                                 args.Add(new Expr.Call.Argument(
                                     (string)nameTok.Literal,
-                                    Expression()));
+                                    Ternary()));
                             }
                             else
                             {
-                                // positional  
-                                args.Add(new Expr.Call.Argument(null, Expression()));
+                                // positional (allow ternary, not comma operator)
+                                args.Add(new Expr.Call.Argument(null, Ternary()));
                             }
                         } while (Match(TokenType.Comma));
                     }
@@ -1689,7 +1717,8 @@ namespace MiniDynLang
                 // 3. index access  
                 if (Match(TokenType.LBracket))
                 {
-                    var indexExpr = Expression();
+                    // allow ternary in index, not comma operator
+                    var indexExpr = Ternary();
                     Consume(TokenType.RBracket, "Expected ']'");
                     expr = new Expr.Index(expr, indexExpr);
                     continue;
@@ -1719,13 +1748,13 @@ namespace MiniDynLang
                             {
                                 var nameTok = Advance();
                                 Consume(TokenType.Colon, "Expected ':'");
-                                var value = Expression();
+                                var value = Ternary(); // allow ternary, not comma operator
                                 args.Add(new Expr.Call.Argument((string)nameTok.Literal, value));
                             }
                             else
                             {
                                 // Positional argument
-                                args.Add(new Expr.Call.Argument(null, Expression()));
+                                args.Add(new Expr.Call.Argument(null, Ternary())); // allow ternary, not comma operator
                             }
                         } while (Match(TokenType.Comma));
                     }
@@ -1767,7 +1796,8 @@ namespace MiniDynLang
                     }
                     else
                     {
-                        elems.Add(Expression());
+                        // IMPORTANT: Allow ternary, but not comma operator (comma separates elements)
+                        elems.Add(Ternary());
                     }
 
                     // If there is a comma, consume it and loop again.
@@ -1792,7 +1822,8 @@ namespace MiniDynLang
                             string keyName = (string)keyTok.Literal;
                             if (Match(TokenType.Colon))
                             {
-                                var valExpr = Expression();
+                                // Allow ternary in value, not comma operator
+                                var valExpr = Ternary();
                                 entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, valExpr));
                             }
                             else
@@ -1806,16 +1837,16 @@ namespace MiniDynLang
                             var keyTok = Advance();
                             string keyName = (string)keyTok.Literal;
                             Consume(TokenType.Colon, "Expected ':' after string key");
-                            var valExpr = Expression();
+                            var valExpr = Ternary(); // allow ternary value
                             entries.Add(new Expr.ObjectLiteral.Entry(keyName, null, valExpr));
                         }
                         else if (Match(TokenType.LBracket))
                         {
                             // computed key [expr] : value
-                            var keyExpr = Expression();
+                            var keyExpr = Ternary(); // allow ternary in key
                             Consume(TokenType.RBracket, "Expected ']'");
                             Consume(TokenType.Colon, "Expected ':' after computed key");
-                            var valExpr = Expression();
+                            var valExpr = Ternary(); // allow ternary in value
                             entries.Add(new Expr.ObjectLiteral.Entry(null, keyExpr, valExpr));
                         }
                         else
@@ -1864,7 +1895,8 @@ namespace MiniDynLang
                 else
                 {
                     // It's an expression body, like: n => n * 2
-                    var body = Expression();
+                    // Use Ternary() to avoid consuming commas that belong to the outer context (e.g. call args).
+                    var body = Ternary();
                     bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
                 }
 
@@ -1915,7 +1947,6 @@ namespace MiniDynLang
 
                 Consume(TokenType.Arrow, "Expected '=>'");
 
-                Expr body;
                 Stmt.Block bodyBlock;
 
                 if (Check(TokenType.LBrace))
@@ -1927,8 +1958,9 @@ namespace MiniDynLang
                 else
                 {
                     // Expression body
-                    body = Expression();
-                    bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(body) });
+                    // Use Ternary() so a trailing ', ...' is not captured into the arrow body.
+                    var bodyExpr = Ternary();
+                    bodyBlock = new Stmt.Block(new List<Stmt> { new Stmt.Return(bodyExpr) });
                 }
 
                 arrowFunc = new Expr.Function(parameters, bodyBlock, isArrow: true);
@@ -3210,6 +3242,13 @@ namespace MiniDynLang
             }
             e.Pat.Bind(this, src, assignLocal, allowConstReassign: true);
             return Value.Nil();
+        }
+
+        // Evaluate left, then right; return right
+        public Value VisitComma(Expr.Comma e)
+        {
+            Evaluate(e.Left);
+            return Evaluate(e.Right);
         }
 
         private static int NormalizeIndex(int idx, int len)
