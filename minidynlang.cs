@@ -24,9 +24,95 @@ namespace MiniDynLang
             return Message;
         }
     }
+
+    // Source position + call frame
+    public readonly struct SourceSpan
+    {
+        public string FileName { get; }
+        public int Line { get; }
+        public int Column { get; }
+        public int EndLine { get; }
+        public int EndColumn { get; }
+
+        public bool IsEmpty => Line <= 0 || Column <= 0;
+
+        public SourceSpan(string fileName, int line, int column, int endLine = -1, int endColumn = -1)
+        {
+            FileName = fileName ?? "<script>";
+            Line = line;
+            Column = column;
+            EndLine = endLine <= 0 ? line : endLine;
+            EndColumn = endColumn <= 0 ? column : endColumn;
+        }
+
+        public static SourceSpan FromToken(Token t)
+            => t == null ? new SourceSpan("<script>", -1, -1) : new SourceSpan(t.FileName, t.Line, t.Column);
+
+        public override string ToString()
+        {
+            if (string.IsNullOrEmpty(FileName)) return $"{Line}:{Column}";
+            return $"{FileName}:{Line}:{Column}";
+        }
+    }
+
+    public readonly struct CallFrame
+    {
+        public string FunctionName { get; }
+        public SourceSpan CallSite { get; }
+
+        public CallFrame(string functionName, SourceSpan callSite)
+        {
+            FunctionName = string.IsNullOrEmpty(functionName) ? "<anonymous>" : functionName;
+            CallSite = callSite;
+        }
+
+        public override string ToString()
+        {
+            // Example: at function foo (script.mdl:12:5)
+            var site = CallSite.IsEmpty ? "" : $" ({CallSite})";
+            return $"at function {FunctionName}{site}";
+        }
+    }
     public sealed class MiniDynLexError : MiniDynException { public MiniDynLexError(string msg, int l, int c) : base(msg, l, c) { } }
     public sealed class MiniDynParseError : MiniDynException { public MiniDynParseError(string msg, int l, int c) : base(msg, l, c) { } }
-    public sealed class MiniDynRuntimeError : MiniDynException { public MiniDynRuntimeError(string msg) : base(msg) { } }
+    public sealed class MiniDynRuntimeError : MiniDynException
+    {
+        public SourceSpan Span { get; set; } // nearest source span
+        public List<CallFrame> CallStack { get; set; } // call frames (top to bottom)
+
+        public MiniDynRuntimeError(string msg) : base(msg) { }
+
+        public MiniDynRuntimeError(string msg, SourceSpan span, List<CallFrame> stack = null) : base(msg)
+        {
+            Span = span;
+            CallStack = stack;
+        }
+
+        public MiniDynRuntimeError WithContext(SourceSpan span, IEnumerable<CallFrame> frames)
+        {
+            if (Span.IsEmpty) Span = span;
+            if (CallStack == null || CallStack.Count == 0)
+                CallStack = frames?.ToList() ?? new List<CallFrame>();
+            return this;
+        }
+
+        public override string ToString()
+        {
+            var sb = new StringBuilder();
+            sb.Append(Message);
+            if (!Span.IsEmpty)
+                sb.Append(" at ").Append(Span.ToString());
+            if (CallStack != null && CallStack.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Function stack:");
+                foreach (var frame in CallStack)
+                    sb.AppendLine(frame.ToString());
+                sb.Append("--------------------------");
+            }
+            return sb.ToString();
+        }
+    }
 
     // Value system
     public enum ValueType { Number, String, Boolean, Nil, Function, Array, Object }
@@ -438,11 +524,18 @@ namespace MiniDynLang
         public int Position { get; }
         public int Line { get; }
         public int Column { get; }
+        public string FileName { get; }
 
         public Token(TokenType type, string lexeme, object literal, int pos, int line, int column)
         {
-            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column;
+            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column; FileName = "<script>";
         }
+
+        public Token(TokenType type, string lexeme, object literal, int pos, int line, int column, string fileName)
+        {
+            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column; FileName = fileName ?? "<script>";
+        }
+
         public override string ToString() => $"{Type} '{Lexeme}' @ {Line}:{Column}";
     }
 
@@ -452,6 +545,7 @@ namespace MiniDynLang
         private int _pos;
         private int _line = 1;
         private int _col = 1;
+        private readonly string _fileName;
 
         private static readonly Dictionary<string, TokenType> Keywords = new Dictionary<string, TokenType>()
         {
@@ -473,7 +567,11 @@ namespace MiniDynLang
             ["return"] = TokenType.Return,
         };
 
-        public Lexer(string src) { _src = src ?? ""; }
+        public Lexer(string src, string fileName = "<script>")
+        {
+            _src = src ?? "";
+            _fileName = string.IsNullOrEmpty(fileName) ? "<script>" : fileName;
+        }
 
         private bool IsAtEnd => _pos >= _src.Length;
         private char Peek() => IsAtEnd ? '\0' : _src[_pos];
@@ -514,7 +612,7 @@ namespace MiniDynLang
         }
 
         private Token MakeToken(TokenType t, string lexeme, object lit, int startPos, int startLine, int startCol)
-            => new Token(t, lexeme, lit, startPos, startLine, startCol);
+            => new Token(t, lexeme, lit, startPos, startLine, startCol, _fileName);
 
         public Token NextToken()
         {
@@ -691,6 +789,7 @@ namespace MiniDynLang
     // AST
     public abstract class Expr
     {
+        public SourceSpan Span { get; set; } // populated by parser where convenient
         public interface IVisitor<T>
         {
             T VisitLiteral(Literal e);
@@ -991,6 +1090,7 @@ namespace MiniDynLang
 
     public abstract class Stmt
     {
+        public SourceSpan Span { get; set; } // populated by parser where convenient
         public interface IVisitor<T>
         {
             T VisitExpr(ExprStmt s);
@@ -2036,6 +2136,7 @@ namespace MiniDynLang
         public Stmt.Block Body { get; }
         public Environment Closure { get; }
         public string Name { get; }
+        public SourceSpan DefSpan { get; } // where function was defined
 
         private Value _boundThis;
 
@@ -2063,7 +2164,7 @@ namespace MiniDynLang
 
         // kind + capturedThis parameters (default to Normal/null for old call sites)
         public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure,
-                            Kind kind = Kind.Normal, Value capturedThis = null)
+                            Kind kind = Kind.Normal, Value capturedThis = null, SourceSpan defSpan = default(SourceSpan))
         {
             Name = name;
             Body = body;
@@ -2073,6 +2174,7 @@ namespace MiniDynLang
                 Params.Add(new ParamSpec(p.Name, p.Default, p.IsRest));
             FunctionKind = kind;
             _capturedThis = capturedThis;
+            DefSpan = defSpan;
         }
 
         public UserFunction BindThis(Value thisValue)
@@ -2080,7 +2182,7 @@ namespace MiniDynLang
             // arrows ignore rebinding
             if (FunctionKind == Kind.Arrow) return this;
 
-            var bound = new UserFunction(Name, ToExprParams(), Body, Closure, FunctionKind, _capturedThis);
+            var bound = new UserFunction(Name, ToExprParams(), Body, Closure, FunctionKind, _capturedThis, DefSpan);
             bound._boundThis = thisValue;
             return bound;
         }
@@ -2154,7 +2256,7 @@ namespace MiniDynLang
         }
 
         public UserFunction Bind(Environment newClosure) =>
-            new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis);
+            new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis, DefSpan);
 
         private List<Expr.Param> ToExprParams()
         {
@@ -2180,7 +2282,8 @@ namespace MiniDynLang
         public Environment CurrentEnv => _env;
 
         private readonly Dictionary<string, ICallable> _builtins = new Dictionary<string, ICallable>();
-
+        private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
+        private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
         public Interpreter()
         {
             _env = Globals;
@@ -2670,9 +2773,49 @@ namespace MiniDynLang
             foreach (var s in statements) Execute(s);
         }
 
-        private void Execute(Stmt s) => s.Accept(this);
+        private void Execute(Stmt s)
+        {
+            if (s != null && !s.Span.IsEmpty) _nodeSpanStack.Push(s.Span);
+            try
+            {
+                s.Accept(this);
+            }
+            catch (MiniDynRuntimeError ex)
+            {
+                AttachErrorContext(ex);
+                throw;
+            }
+            finally
+            {
+                if (s != null && !s.Span.IsEmpty && _nodeSpanStack.Count > 0) _nodeSpanStack.Pop();
+            }
+        }
 
-        private Value Evaluate(Expr e) => e.Accept(this);
+        private Value Evaluate(Expr e)
+        {
+            if (e != null && !e.Span.IsEmpty) _nodeSpanStack.Push(e.Span);
+            try
+            {
+                return e.Accept(this);
+            }
+            catch (MiniDynRuntimeError ex)
+            {
+                AttachErrorContext(ex);
+                throw;
+            }
+            finally
+            {
+                if (e != null && !e.Span.IsEmpty && _nodeSpanStack.Count > 0) _nodeSpanStack.Pop();
+            }
+        }
+
+        private void AttachErrorContext(MiniDynRuntimeError ex)
+        {
+            var span = _nodeSpanStack.Count > 0 ? _nodeSpanStack.Peek() : default(SourceSpan);
+            // Materialize frames from top to bottom (current call first)
+            var frames = _callStack.Reverse().ToList();
+            ex.WithContext(span, frames);
+        }
         public Value EvaluateWithEnv(Expr e, Environment env)
         {
             var prev = _env;
@@ -2772,7 +2915,7 @@ namespace MiniDynLang
         public object VisitFunction(Stmt.Function s)
         {
             var kind = s.FuncExpr.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
-            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null);
+            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null, s.FuncExpr.Span);
             _env.DefineVar(s.Name, Value.Function(fn));
             return null;
         }
@@ -3010,7 +3153,25 @@ namespace MiniDynLang
             if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
                 throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
 
-            return fn.Call(this, processedArgs);
+            string fnName =
+                fn is BuiltinFunction bf ? bf.Name :
+                fn is UserFunction uf && !string.IsNullOrEmpty(uf.Name) ? uf.Name :
+                "<anonymous>";
+            var callSite = e?.Span ?? default(SourceSpan);
+            _callStack.Push(new CallFrame(fnName, callSite));
+            try
+            {
+                return fn.Call(this, processedArgs);
+            }
+            catch (MiniDynRuntimeError ex)
+            {
+                AttachErrorContext(ex);
+                throw;
+            }
+            finally
+            {
+                _callStack.Pop();
+            }
         }
 
         private List<Value> ProcessNamedArguments(UserFunction fn, List<Expr.Call.Argument> args)
@@ -3116,7 +3277,7 @@ namespace MiniDynLang
             Value t;
             if (e.IsArrow && _env.TryGet("this", out t)) capturedThis = t;
             var kind = e.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
-            var uf = new UserFunction(null, e.Parameters, e.Body, _env, kind, capturedThis);
+            var uf = new UserFunction(null, e.Parameters, e.Body, _env, kind, capturedThis, e.Span);
             return Value.Function(uf);
         }
 
@@ -3411,7 +3572,7 @@ namespace MiniDynLang
     {
         static void Run(string source)
         {
-            var lexer = new Lexer(source);
+            var lexer = new Lexer(source, "<script>");
             var parser = new Parser(lexer);
             var program = parser.Parse();
             var interp = new Interpreter();
@@ -3426,7 +3587,11 @@ namespace MiniDynLang
                 return;
             }
             var source = File.ReadAllText(filePath);
-            Run(source);
+            var lexer = new Lexer(source, filePath);
+            var parser = new Parser(lexer);
+            var program = parser.Parse();
+            var interp = new Interpreter();
+            interp.Interpret(program);
         }
 
         static void Repl()
@@ -3441,7 +3606,7 @@ namespace MiniDynLang
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 try
                 {
-                    var lexer = new Lexer(line);
+                    var lexer = new Lexer(line, "<repl>");
                     var parser = new Parser(lexer);
                     var stmts = parser.Parse();
 
