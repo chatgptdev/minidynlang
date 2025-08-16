@@ -540,6 +540,10 @@ namespace MiniDynLang
         While,
         Break,
         Continue,
+        Try,
+        Catch,
+        Finally,
+        Throw,
 
         True,
         False,
@@ -607,6 +611,11 @@ namespace MiniDynLang
             ["while"] = TokenType.While,
             ["break"] = TokenType.Break,
             ["continue"] = TokenType.Continue,
+            ["try"] = TokenType.Try,
+            ["catch"] = TokenType.Catch,
+            ["finally"] = TokenType.Finally,
+            ["throw"] = TokenType.Throw,
+
             ["true"] = TokenType.True,
             ["false"] = TokenType.False,
             ["nil"] = TokenType.Nil,
@@ -1162,6 +1171,8 @@ namespace MiniDynLang
             T VisitBreak(Break s);
             T VisitContinue(Continue s);
             T VisitDestructuringDecl(DestructuringDecl s);
+            T VisitTryCatchFinally(TryCatchFinally s);
+            T VisitThrow(Throw s);
         }
         public abstract T Accept<T>(IVisitor<T> v);
 
@@ -1239,6 +1250,20 @@ namespace MiniDynLang
         public sealed class Continue : Stmt
         {
             public override T Accept<T>(IVisitor<T> v) => v.VisitContinue(this);
+        }
+        public sealed class TryCatchFinally : Stmt
+        {
+            public Block Try;
+            public string CatchName; // optional; null if no binding
+            public Block Catch;      // optional
+            public Block Finally;    // optional
+            public override T Accept<T>(IVisitor<T> v) => v.VisitTryCatchFinally(this);
+        }
+        public sealed class Throw : Stmt
+        {
+            public Expr Value;
+            public Throw(Expr value) { Value = value; }
+            public override T Accept<T>(IVisitor<T> v) => v.VisitThrow(this);
         }
     }
 
@@ -1588,6 +1613,56 @@ namespace MiniDynLang
                 Consume(TokenType.Semicolon, "Expected ';' after return value");
                 var s = new Stmt.Return(value);
                 s.Span = SourceSpan.FromToken(retTok);
+                return s;
+            }
+            if (Match(TokenType.Throw))
+            {
+                var thrTok = Previous();
+                var val = Expression();
+                Consume(TokenType.Semicolon, "Expected ';' after throw value");
+                var s = new Stmt.Throw(val) { Span = SourceSpan.FromToken(thrTok) };
+                return s;
+            }
+            if (Match(TokenType.Try))
+            {
+                var tryTok = Previous();
+                Consume(TokenType.LBrace, "Expected '{' after try");
+                var tryBlock = BlockStatementInternal();
+
+                Stmt.Block catchBlock = null;
+                string catchName = null;
+                Stmt.Block finallyBlock = null;
+
+                if (Match(TokenType.Catch))
+                {
+                    // Optional parameter: catch (name) { ... } or catch { ... }
+                    if (Match(TokenType.LParen))
+                    {
+                        if (Check(TokenType.Identifier))
+                            catchName = (string)Advance().Literal;
+                        Consume(TokenType.RParen, "Expected ')' after catch parameter");
+                    }
+                    Consume(TokenType.LBrace, "Expected '{' after catch");
+                    catchBlock = BlockStatementInternal();
+                }
+
+                if (Match(TokenType.Finally))
+                {
+                    Consume(TokenType.LBrace, "Expected '{' after finally");
+                    finallyBlock = BlockStatementInternal();
+                }
+
+                if (catchBlock == null && finallyBlock == null)
+                    throw new MiniDynParseError("Expected 'catch' or 'finally' after try block", Peek().Line, Peek().Column);
+
+                var s = new Stmt.TryCatchFinally
+                {
+                    Try = tryBlock,
+                    Catch = catchBlock,
+                    CatchName = catchName,
+                    Finally = finallyBlock,
+                    Span = SourceSpan.FromToken(tryTok)
+                };
                 return s;
             }
 
@@ -2517,6 +2592,11 @@ namespace MiniDynLang
         }
         public class BreakSignal : Exception { }
         public class ContinueSignal : Exception { }
+        public class ThrowSignal : Exception
+        {
+            public Value Value;
+            public ThrowSignal(Value v) { Value = v; }
+        }
 
         public readonly Environment Globals;
         private Environment _env;
@@ -2538,12 +2618,12 @@ namespace MiniDynLang
                 switch (v.Type)
                 {
                     case ValueType.String: return Value.Number(NumberValue.FromLong(v.AsString().Length));
-                    case ValueType.Array:  return Value.Number(NumberValue.FromLong(v.AsArray().Length));
+                    case ValueType.Array: return Value.Number(NumberValue.FromLong(v.AsArray().Length));
                     case ValueType.Object: return Value.Number(NumberValue.FromLong(v.AsObject().Count));
-                    case ValueType.Nil:    return Value.Number(NumberValue.FromLong(0));
-                    case ValueType.Boolean:return Value.Number(NumberValue.FromLong(1));
+                    case ValueType.Nil: return Value.Number(NumberValue.FromLong(0));
+                    case ValueType.Boolean: return Value.Number(NumberValue.FromLong(1));
                     case ValueType.Number: return Value.Number(NumberValue.FromLong(1));
-                    case ValueType.Function:return Value.Number(NumberValue.FromLong(1));
+                    case ValueType.Function: return Value.Number(NumberValue.FromLong(1));
                     default: return Value.Number(NumberValue.FromLong(0));
                 }
             });
@@ -2979,7 +3059,7 @@ namespace MiniDynLang
                 return Value.String(sb.ToString().Substring(0, len));
             });
 
-            // === New: Time ===
+            // === Time ===
             DefineBuiltin("sleep_ms", 1, 1, (i, a) =>
             {
                 var ms = (int)ToNumber(a[0]).ToDoubleNV().Dbl;
@@ -2999,6 +3079,18 @@ namespace MiniDynLang
                 // Use Newtonsoft.Json for .NET Framework
                 var token = JToken.Parse(s);
                 return JsonToValue(token);
+            });
+            // Simple error/raise builtins
+            DefineBuiltin("error", 1, 1, (i, a) =>
+            {
+                var msg = i.ToStringValue(a[0]);
+                return i.MakeError("Error", msg);
+            });
+            DefineBuiltin("raise", 1, 1, (i, a) =>
+            {
+                var msg = i.ToStringValue(a[0]);
+                var err = i.MakeError("Error", msg);
+                throw new ThrowSignal(err);
             });
         }
 
@@ -3188,6 +3280,60 @@ namespace MiniDynLang
 
         public object VisitBreak(Stmt.Break s) { throw new BreakSignal(); }
         public object VisitContinue(Stmt.Continue s) { throw new ContinueSignal(); }
+        public object VisitThrow(Stmt.Throw s)
+        {
+            var v = Evaluate(s.Value);
+            throw new ThrowSignal(v);
+        }
+        public object VisitTryCatchFinally(Stmt.TryCatchFinally s)
+        {
+            Value caught = null;
+            try
+            {
+                // Execute the try as a block (keeps normal block scoping)
+                Execute(s.Try);
+            }
+            catch (ThrowSignal ts)
+            {
+                if (s.Catch != null)
+                {
+                    caught = ts.Value;
+                    var catchEnv = new Environment(_env);
+                    if (!string.IsNullOrEmpty(s.CatchName))
+                        catchEnv.DefineLet(s.CatchName, caught);
+                    ExecuteBlock(s.Catch.Statements, catchEnv);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            catch (MiniDynRuntimeError ex)
+            {
+                // Bubble runtime errors as values into catch as a simple Error object
+                if (s.Catch != null)
+                {
+                    var errVal = MakeError("RuntimeError", ex.Message, ex);
+                    caught = errVal;
+                    var catchEnv = new Environment(_env);
+                    if (!string.IsNullOrEmpty(s.CatchName))
+                        catchEnv.DefineLet(s.CatchName, errVal);
+                    ExecuteBlock(s.Catch.Statements, catchEnv);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            finally
+            {
+                if (s.Finally != null)
+                {
+                    Execute(s.Finally);
+                }
+            }
+            return null;
+        }
 
         // Expr visitor
         public Value VisitLiteral(Expr.Literal e) => e.Value;
@@ -3727,6 +3873,29 @@ namespace MiniDynLang
             return sb.ToString();
         }
 
+        // Build a simple Error object from name/message and optional runtime error details
+        private Value MakeError(string name, string message, MiniDynRuntimeError ex = null)
+        {
+            var ov = new ObjectValue();
+            ov.Set("name", Value.String(name ?? "Error"));
+            ov.Set("message", Value.String(message ?? ""));
+            if (ex != null)
+            {
+                if (!ex.Span.IsEmpty)
+                {
+                    ov.Set("at", Value.String(ex.Span.ToString()));
+                }
+                if (ex.CallStack != null && ex.CallStack.Count > 0)
+                {
+                    var arr = new ArrayValue();
+                    foreach (var frame in ex.CallStack)
+                        arr.Items.Add(Value.String(frame.ToString()));
+                    ov.Set("stack", Value.Array(arr));
+                }
+            }
+            return Value.Object(ov);
+        }
+
         private string JsonStringifyValue(Value v, bool pretty = false, int indent = 0)
         {
             string Ind() => new string(' ', indent);
@@ -3879,6 +4048,10 @@ namespace MiniDynLang
                     {
                         interp.Interpret(stmts);
                     }
+                }
+                catch (Interpreter.ThrowSignal ex)
+                {
+                    Console.WriteLine("Uncaught exception: " + interp.ToStringValue(ex.Value));
                 }
                 catch (MiniDynException ex)
                 {
@@ -4208,12 +4381,12 @@ namespace MiniDynLang
                     println(""getArrow() -> expect 2:"", getArrow()); // lexical this = counter
 
                     // Borrow the functions onto another object and call as methods.
-                    let other = { n: 100 };
-                    other.get = getArrow;
-                    println(""borrowed arrow via other.get() -> expect 2:"", other.get()); // still 2 (arrow ignores call-site 'this')
+                    let other2 = { n: 100 };
+                    other2.get = getArrow;
+                    println(""borrowed arrow via other2.get() -> expect 2:"", other2.get()); // still 2 (arrow ignores call-site 'this')
 
-                    other.get = getNormal;
-                    println(""borrowed normal via other.get() -> expect 100:"", other.get()); // dynamic this = other
+                    other2.get = getNormal;
+                    println(""borrowed normal via other2.get() -> expect 100:"", other2.get()); // dynamic this = other
 
                     // Re-check that counter still unchanged by above calls other than our earlier incs.
                     println(""counter.n (still 2) ="", counter.n);
@@ -4225,9 +4398,9 @@ namespace MiniDynLang
                         norm: fn() { return this.v; }          // normal uses dynamic 'this'
                     };
 
-                    let a = holder.make();
-                    println(""a() -> expect 7:"", a());
-                    let bobj = { v: 123, call: a };
+                    let aa = holder.make();
+                    println(""aa() -> expect 7:"", aa());
+                    let bobj = { v: 123, call: aa };
                     println(""bobj.call() borrowed arrow -> expect 7:"", bobj.call()); // arrow ignores rebinding
 
                     let borrowNorm = { v: 123, m: holder.norm };
@@ -4322,6 +4495,49 @@ namespace MiniDynLang
                     let parsed = json_parse(j);
                     println(parsed);
 
+                    println();
+                    println(""=== TRY/CATCH/FINALLY & THROW ==="");
+
+                    println(""-- throw value and catch --"");
+                    try {
+                        throw 123;
+                    } catch (e) {
+                        println(""caught:"", e);
+                    } finally {
+                        println(""finally ran (1)"");
+                    }
+
+                    println(""-- raise() builtin throws Error object --"");
+                    try {
+                        raise(""boom!"");
+                    } catch (e) {
+                        println(""name="", e.name, "" message="", e.message);
+                    }
+
+                    println(""-- error() builtin returns Error object (not thrown) --"");
+                    let eobj = error(""just an object"");
+                    println(""eobj:"", eobj, "" name="", eobj.name, "" message="", eobj.message);
+
+                    println(""-- catch runtime error as value --"");
+                    try {
+                        let x = 1 / 0;
+                        println(x);
+                    } catch (e) {
+                        println(""caught runtime:"", e.name, e.message);
+                    }
+
+                    println(""-- throw arbitrary object --"");
+                    try {
+                        throw { code: 7, msg: ""custom"" };
+                    } catch (ex) {
+                        println(""obj code="", ex.code, "" msg="", ex.msg);
+                    }
+
+                    println(""-- catch without binding --"");
+                    try { throw ""oops""; }
+                    catch { println(""caught without binding""); }
+                    finally { println(""finally ran (2)""); }
+
                 ";
             try
             {
@@ -4349,6 +4565,10 @@ namespace MiniDynLang
                 {
                     RunFile(args[0]);
                 }
+            }
+            catch (Interpreter.ThrowSignal ex)
+            {
+                Console.WriteLine("Runtime error: Uncaught exception -> " + (ex.Value != null ? ex.Value.ToString() : "nil"));
             }
             catch (MiniDynException ex)
             {
