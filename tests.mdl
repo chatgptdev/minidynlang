@@ -128,6 +128,44 @@ test_eq("false or inc() calls inc twice total", (fn(){ false or inc(); return si
 section("Ternary");
 test_eq("1<2 ? 'yes' : 'no'", (1 < 2) ? "yes" : "no", "yes");
 
+// Comma operator
+section("Comma operator");
+
+// Basic behavior
+test_eq("chained comma returns last", (1, 2, 3), 3);
+test_eq("basic: left-to-right; return right", (fn(){ let x = 0; x = 1, x = x + 2; return x; })(), 3);
+test_eq("order of side effects", (fn(){ let log=[]; push(log,"a"), push(log,"b"); return log; })(), ["a","b"]);
+test_eq("assignment happens on left", (fn(){ let a=0; (a=1, 42); return a; })(), 1);
+test_eq("lowest precedence with + and =", (fn(){ let a=0; return (a=1, a+1); })(), 2);
+
+// In function args (must parenthesize to treat as one value)
+fn pair(a, b) { return [a, b]; }
+test_eq("paren comma as single arg", pair((1,2), 3), [2,3]);
+test_eq("paren comma in second arg", pair(1, (2,3)), [1,3]);
+
+// In array and object literals (with parentheses)
+test_eq("array element with paren-comma", [(1,2), 3], [2,3]);
+test_eq("object value with paren-comma", { a: (1,2), b: 3 }, { a: 2, b: 3 });
+
+// In index and computed keys
+test_eq("index with paren-comma", (fn(){ let a=[10,11,12]; return a[(1,2)]; })(), 12);
+test_eq("computed key with paren-comma", (fn(){ let o = { [(1,2)]: 5 }; return o["2"]; })(), 5);
+
+// With named arguments (value can be paren-comma)
+fn mk(name, age = 25) { return { name: name, age: age }; }
+test_eq("named arg with paren-comma", mk(name: ("Bob","Zed")), { name: "Zed", age: 25 });
+
+// In while condition (comma returns the last value)
+test_eq("comma in while condition", (fn(){
+    let seq = []; let i = 0;
+    while ((push(seq, i), i = i + 1, i < 3)) { }
+    return seq;
+})(), [0,1,2]);
+
+// In ternary arms when parenthesized
+test_eq("ternary arm may use paren-comma", (true ? (1,2) : 3), 2);
+test_eq("ternary else with paren-comma", (false ? 1 : (3,4)), 4);
+
 // Strings
 section("Strings");
 test_eq("'abc' + 'def'", "abc" + "def", "abcdef");
