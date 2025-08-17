@@ -480,6 +480,67 @@ test_eq("finally runs on return", (fn(){
     return [r, tracking2.flag];
 })(), [10, 1]);
 
+// --- Recursion and Tail-Call Optimization -----------------------------------
+section("Recursion and Tail-Call Optimization");
+
+// 1) Tail-recursive factorial (normal function)
+fn tco_fact(n, acc = 1) {
+    if (n <= 1) return acc;
+    return tco_fact(n - 1, acc * n);
+}
+test_eq("tco_fact(5)", tco_fact(5), 120);
+
+// 2) Tail-recursive factorial (arrow function)
+let tco_fact2 = (n, acc = 1) => n <= 1 ? acc : tco_fact2(n - 1, acc * n);
+test_eq("tco_fact2(6)", tco_fact2(6), 720);
+
+// 3) Deep tail recursion should not overflow the host stack
+fn tco_countdown(n) {
+    if (n == 0) return 0;
+    return tco_countdown(n - 1);
+}
+let tco_deep = 20000;
+test_eq("tco_countdown(20000)", tco_countdown(tco_deep), 0);
+
+// 4) Tail call via callee expression with side effects (callee evaluated once)
+let tco_side = 0;
+let tco_get_countdown = () => { tco_side = tco_side + 1; return tco_countdown; };
+fn tco_countdown2(n) {
+    if (n == 0) return 0;
+    return tco_get_countdown()(n - 1); // callee side-effect must still happen once
+}
+let tco_steps = 1000;
+test_eq("tco_countdown2(1000)", tco_countdown2(tco_steps), 0);
+test_eq("callee side-effects (1000)", tco_side, 1);
+
+// 5) Non-tail recursion path should still work (no optimization)
+fn tco_sum1(n) {
+    if (n == 0) return 0;
+    return 1 + tco_sum1(n - 1); // not a tail position
+}
+test_eq("tco_sum1(100)", tco_sum1(100), 100);
+
+// 6) Named/default params preserved across tail calls
+fn tco_bump_to(a, b = 10) {
+    if (a <= 0) return b;
+    return tco_bump_to(a - 1, b: b + 1); // named argument in tail position
+}
+test_eq("tco_bump_to(5, b:0)", tco_bump_to(5, b: 0), 5);
+test_eq("tco_bump_to(3)", tco_bump_to(3), 13);
+
+// 7) Tail recursion via method call (same function identity via property)
+let tco_obj = {};
+tco_obj.m = fn(n) {
+    if (n == 0) return 0;
+    return tco_obj.m(n - 1);
+};
+test_eq("tco_obj.m(1500)", tco_obj.m(1500), 0);
+
+// 8) Arrow method variant
+let tco_obj2 = {};
+tco_obj2.m = (n, acc = 0) => n == 0 ? acc : tco_obj2.m(n - 1, acc + 1);
+test_eq("tco_obj2.m(200)", tco_obj2.m(200), 200);
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
