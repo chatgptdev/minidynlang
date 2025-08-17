@@ -2629,6 +2629,86 @@ namespace MiniDynLang
             return list;
         }
     }
+    
+    // Host-provided module loader abstraction + default FS loader
+    public interface IModuleLoader
+    {
+        // Returns an absolute path for the specifier (or null if cannot resolve).
+        string Resolve(string specifier, string baseDirectory);
+        // Loads source for an absolute path. Returns true if found.
+        bool TryLoad(string absolutePath, out string source);
+    }
+
+    public sealed class FileSystemModuleLoader : IModuleLoader
+    {
+        private static readonly string[] DefaultExtensions = new[] { "", ".mdl", ".minidyn" };
+
+        public string Resolve(string specifier, string baseDirectory)
+        {
+            try
+            {
+                string candidate;
+                if (Path.IsPathRooted(specifier))
+                {
+                    candidate = specifier;
+                }
+                else
+                {
+                    // Relative or bare specifier: resolve from baseDirectory
+                    if (string.IsNullOrEmpty(baseDirectory))
+                        baseDirectory = Directory.GetCurrentDirectory();
+                    candidate = Path.Combine(baseDirectory, specifier);
+                }
+
+                // If candidate points to a directory, try index files
+                if (Directory.Exists(candidate))
+                {
+                    foreach (var ext in DefaultExtensions)
+                    {
+                        var idx = Path.Combine(candidate, "index" + ext);
+                        if (File.Exists(idx)) return Path.GetFullPath(idx);
+                    }
+                }
+
+                // Try with default extensions if no extension given
+                if (string.IsNullOrEmpty(Path.GetExtension(candidate)))
+                {
+                    foreach (var ext in DefaultExtensions)
+                    {
+                        var p = candidate + ext;
+                        if (File.Exists(p)) return Path.GetFullPath(p);
+                    }
+                }
+
+                // Otherwise, accept as-is if exists
+                if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public bool TryLoad(string absolutePath, out string source)
+        {
+            try
+            {
+                if (File.Exists(absolutePath))
+                {
+                    source = File.ReadAllText(absolutePath);
+                    return true;
+                }
+            }
+            catch
+            {
+                // fall through
+            }
+            source = null;
+            return false;
+        }
+    }
 
     // Interpreter
     public class Interpreter : Expr.IVisitor<Value>, Stmt.IVisitor<object>
@@ -2653,9 +2733,16 @@ namespace MiniDynLang
         private readonly Dictionary<string, ICallable> _builtins = new Dictionary<string, ICallable>();
         private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
-        public Interpreter()
+        private readonly IModuleLoader _moduleLoader;
+        private sealed class ModuleCacheEntry { public Value Exports; }
+        private readonly Dictionary<string, ModuleCacheEntry> _moduleCache =
+            new Dictionary<string, ModuleCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+        public Interpreter(IModuleLoader moduleLoader = null)
         {
-            // NEW: make top-level a function env so 'var' is truly global/function scoped
+            _moduleLoader = moduleLoader ?? new FileSystemModuleLoader();
+
+            // Make top-level a function env so 'var' is truly global/function scoped
             Globals = new FunctionEnvironment();
             _env = Globals;
 
@@ -3140,6 +3227,98 @@ namespace MiniDynLang
                 var err = i.MakeError("Error", msg);
                 throw new ThrowSignal(err);
             });
+            // --- Modules: require(path) ---
+            DefineBuiltin("require", 1, 1, (i, a) =>
+            {
+                var spec = a[0].AsString();
+                var baseDir = i.GetCallerDirectory();
+
+                var abs = i._moduleLoader.Resolve(spec, baseDir);
+                if (string.IsNullOrEmpty(abs))
+                    throw new MiniDynRuntimeError($"Cannot resolve module '{spec}' from '{baseDir}'");
+
+                if (i._moduleCache.TryGetValue(abs, out var cached) && cached.Exports != null)
+                {
+                    return cached.Exports;
+                }
+
+                if (!i._moduleCache.TryGetValue(abs, out cached))
+                {
+                    cached = new ModuleCacheEntry();
+                    i._moduleCache[abs] = cached;
+                }
+
+                if (!i._moduleLoader.TryLoad(abs, out var src))
+                    throw new MiniDynRuntimeError($"Cannot load module '{abs}'");
+
+                // Parse
+                var lexer = new Lexer(src, abs);
+                var parser = new Parser(lexer);
+                var stmts = parser.Parse();
+
+                // Module environment: child of Globals; mark as FunctionEnvironment so 'var' is module-local
+                var moduleEnv = new FunctionEnvironment(i.Globals);
+
+                // Predefine exports and module
+                var initialExportsObj = new ObjectValue();
+                moduleEnv.DefineVar("exports", Value.Object(initialExportsObj));
+                var moduleObj = new ObjectValue();
+                moduleObj.Set("exports", Value.Object(initialExportsObj));
+                moduleEnv.DefineVar("module", Value.Object(moduleObj));
+
+                // Seed cache for cyclic dependencies
+                cached.Exports = Value.Object(initialExportsObj);
+
+                // Execute program in this environment
+                i.InterpretInEnv(stmts, moduleEnv);
+
+                // Read final module.exports
+                Value moduleVal;
+                if (!moduleEnv.TryGetHere("module", out moduleVal))
+                    moduleVal = Value.Object(moduleObj);
+
+                Value finalExports = null;
+                if (moduleVal.Type == ValueType.Object)
+                {
+                    var mo = moduleVal.AsObject();
+                    mo.TryGet("exports", out finalExports);
+                }
+                if (finalExports == null)
+                    finalExports = Value.Object(initialExportsObj);
+
+                cached.Exports = finalExports;
+                return finalExports;
+            });
+        }
+
+        private string GetCallerDirectory()
+        {
+            try
+            {
+                if (_nodeSpanStack.Count > 0)
+                {
+                    var span = _nodeSpanStack.Peek();
+                    var fn = span.FileName;
+                    if (!string.IsNullOrEmpty(fn) && fn != "<script>" && fn != "<repl>")
+                    {
+                        var dir = Path.GetDirectoryName(fn);
+                        if (!string.IsNullOrEmpty(dir)) return dir;
+                    }
+                }
+            }
+            catch { }
+            return Directory.GetCurrentDirectory();
+        }
+
+        public void InterpretInEnv(List<Stmt> statements, Environment env)
+        {
+            var prev = _env;
+            try
+            {
+                _env = env;
+                foreach (var s in statements) Execute(s);
+            }
+            finally { _env = prev; }
         }
 
         private void DefineBuiltin(string name, int arityMin, int arityMax, Func<Interpreter, List<Value>, Value> fn)
@@ -3594,45 +3773,45 @@ namespace MiniDynLang
                 case TokenType.LessEq:
                 case TokenType.Greater:
                 case TokenType.GreaterEq:
-                {
-                    var l = Evaluate(e.Left);
-                    var r = Evaluate(e.Right);
-                    switch (e.Op.Type)
                     {
-                        case TokenType.Plus:
-                            if (l.Type == ValueType.Number && r.Type == ValueType.Number)
-                                return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
-                            if (l.Type == ValueType.String || r.Type == ValueType.String)
-                                return Value.String(ToStringValue(l) + ToStringValue(r));
-                            if (l.Type == ValueType.Array && r.Type == ValueType.Array)
-                            {
-                                var la = l.AsArray();
-                                var ra = r.AsArray();
-                                var res = new ArrayValue();
-                                res.Items.AddRange(la.Items);
-                                res.Items.AddRange(ra.Items);
-                                return Value.Array(res);
-                            }
-                            throw new MiniDynRuntimeError("Invalid '+' operands");
-                        case TokenType.Minus:   return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
-                        case TokenType.Star:    return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
-                        case TokenType.Slash:   return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
-                        case TokenType.Percent: return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
-                        case TokenType.Equal:      return Value.Boolean(CompareEqual(l, r));
-                        case TokenType.NotEqual:   return Value.Boolean(!CompareEqual(l, r));
-                        case TokenType.Less:       return Value.Boolean(CompareRel(l, r, "<"));
-                        case TokenType.LessEq:     return Value.Boolean(CompareRel(l, r, "<="));
-                        case TokenType.Greater:    return Value.Boolean(CompareRel(l, r, ">"));
-                        case TokenType.GreaterEq:  return Value.Boolean(CompareRel(l, r, ">="));
+                        var l = Evaluate(e.Left);
+                        var r = Evaluate(e.Right);
+                        switch (e.Op.Type)
+                        {
+                            case TokenType.Plus:
+                                if (l.Type == ValueType.Number && r.Type == ValueType.Number)
+                                    return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
+                                if (l.Type == ValueType.String || r.Type == ValueType.String)
+                                    return Value.String(ToStringValue(l) + ToStringValue(r));
+                                if (l.Type == ValueType.Array && r.Type == ValueType.Array)
+                                {
+                                    var la = l.AsArray();
+                                    var ra = r.AsArray();
+                                    var res = new ArrayValue();
+                                    res.Items.AddRange(la.Items);
+                                    res.Items.AddRange(ra.Items);
+                                    return Value.Array(res);
+                                }
+                                throw new MiniDynRuntimeError("Invalid '+' operands");
+                            case TokenType.Minus: return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
+                            case TokenType.Star: return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
+                            case TokenType.Slash: return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
+                            case TokenType.Percent: return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
+                            case TokenType.Equal: return Value.Boolean(CompareEqual(l, r));
+                            case TokenType.NotEqual: return Value.Boolean(!CompareEqual(l, r));
+                            case TokenType.Less: return Value.Boolean(CompareRel(l, r, "<"));
+                            case TokenType.LessEq: return Value.Boolean(CompareRel(l, r, "<="));
+                            case TokenType.Greater: return Value.Boolean(CompareRel(l, r, ">"));
+                            case TokenType.GreaterEq: return Value.Boolean(CompareRel(l, r, ">="));
+                        }
+                        break;
                     }
-                    break;
-                }
                 case TokenType.NullishCoalesce:
-                {
-                    var l = Evaluate(e.Left);
-                    if (l.Type != ValueType.Nil) return l;
-                    return Evaluate(e.Right);
-                }
+                    {
+                        var l = Evaluate(e.Left);
+                        if (l.Type != ValueType.Nil) return l;
+                        return Evaluate(e.Right);
+                    }
                 default:
                     throw new MiniDynRuntimeError("Unknown binary op");
             }
@@ -4161,7 +4340,8 @@ namespace MiniDynLang
             var lexer = new Lexer(source, "<script>");
             var parser = new Parser(lexer);
             var program = parser.Parse();
-            var interp = new Interpreter();
+            var loader = new FileSystemModuleLoader();
+            var interp = new Interpreter(loader);
             interp.Interpret(program);
         }
 
@@ -4176,14 +4356,16 @@ namespace MiniDynLang
             var lexer = new Lexer(source, filePath);
             var parser = new Parser(lexer);
             var program = parser.Parse();
-            var interp = new Interpreter();
+            var loader = new FileSystemModuleLoader();
+            var interp = new Interpreter(loader);
             interp.Interpret(program);
         }
 
         static void Repl()
         {
             Console.WriteLine("MiniDynLang REPL. Ctrl+C to exit.");
-            var interp = new Interpreter();
+            var loader = new FileSystemModuleLoader();
+            var interp = new Interpreter(loader);
             while (true)
             {
                 Console.Write("> ");
