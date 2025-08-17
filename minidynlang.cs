@@ -371,11 +371,21 @@ namespace MiniDynLang
             }
         }
 
-        public bool TryGet(string key, out Value v) => _map.TryGetValue(key, out v);
-        public bool Contains(string key) => _map.ContainsKey(key);
+        public bool TryGet(string key, out Value v)
+        {
+            if (_map.TryGetValue(key, out v)) return true;
+            v = Value.Nil(); // ensure callers get a defined nil value when missing
+            return false;
+        }
+        public bool Contains(string key)
+        {
+            key = StringInterner.Intern(key);
+            return _map.ContainsKey(key);
+        }
 
         public void Set(string key, Value v)
         {
+            key = StringInterner.Intern(key);
             if (!_map.ContainsKey(key))
                 _order.Add(key);
             _map[key] = v;
@@ -383,6 +393,7 @@ namespace MiniDynLang
 
         public bool Remove(string key)
         {
+            key = StringInterner.Intern(key);
             if (!_map.ContainsKey(key)) return false;
             _map.Remove(key);
             _order.Remove(key);
@@ -428,7 +439,24 @@ namespace MiniDynLang
         }
     }
 
-    public sealed class Value
+    // Add a small, process-local string interner for object property names.
+    internal static class StringInterner
+    {
+        private static readonly Dictionary<string, string> _pool = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        public static string Intern(string s)
+        {
+            if (s == null) return null;
+            lock (_pool)
+            {
+                if (_pool.TryGetValue(s, out var existing)) return existing;
+                _pool[s] = s;
+                return s;
+            }
+        }
+    }
+
+    public readonly struct Value : IEquatable<Value>
     {
         public ValueType Type { get; }
         private readonly NumberValue _num;
@@ -447,7 +475,7 @@ namespace MiniDynLang
             Type = t; _num = n; _str = s; _bool = b; _func = f; _arr = a; _obj = o;
         }
 
-        public static Value Number(NumberValue n) => new Value(ValueType.Number, n, null, false, null, null, null);
+        public static Value Number(in NumberValue n) => new Value(ValueType.Number, n, null, false, null, null, null);
         public static Value String(string s) => new Value(ValueType.String, default, s ?? "", false, null, null, null);
         public static Value Boolean(bool b) => b ? TrueVal : FalseVal;
         public static Value Nil() => NilVal;
@@ -455,12 +483,18 @@ namespace MiniDynLang
         public static Value Array(ArrayValue a) => new Value(ValueType.Array, default, null, false, null, a ?? new ArrayValue(), null);
         public static Value Object(ObjectValue o) => new Value(ValueType.Object, default, null, false, null, null, o ?? new ObjectValue());
 
-        public NumberValue AsNumber() => Type == ValueType.Number ? _num : throw new MiniDynRuntimeError("Expected number");
-        public string AsString() => Type == ValueType.String ? _str : throw new MiniDynRuntimeError("Expected string");
-        public bool AsBoolean() => Type == ValueType.Boolean ? _bool : throw new MiniDynRuntimeError("Expected boolean");
-        public ICallable AsFunction() => Type == ValueType.Function ? _func : throw new MiniDynRuntimeError("Expected function");
-        public ArrayValue AsArray() => Type == ValueType.Array ? _arr : throw new MiniDynRuntimeError("Expected array");
-        public ObjectValue AsObject() => Type == ValueType.Object ? _obj : throw new MiniDynRuntimeError("Expected object");
+        public NumberValue AsNumber()
+            => Type == ValueType.Number ? _num : throw new MiniDynRuntimeError("Expected number");
+        public string AsString()
+            => Type == ValueType.String ? _str : throw new MiniDynRuntimeError("Expected string");
+        public bool AsBoolean()
+            => Type == ValueType.Boolean ? _bool : throw new MiniDynRuntimeError("Expected boolean");
+        public ICallable AsFunction()
+            => Type == ValueType.Function ? _func : throw new MiniDynRuntimeError("Expected function");
+        public ArrayValue AsArray()
+            => Type == ValueType.Array ? _arr : throw new MiniDynRuntimeError("Expected array");
+        public ObjectValue AsObject()
+            => Type == ValueType.Object ? _obj : throw new MiniDynRuntimeError("Expected object");
 
         public override string ToString()
         {
@@ -476,7 +510,7 @@ namespace MiniDynLang
             }
         }
 
-        public static bool IsTruthy(Value v)
+        public static bool IsTruthy(in Value v)
         {
             switch (v.Type)
             {
@@ -491,10 +525,9 @@ namespace MiniDynLang
             }
         }
 
-        public override bool Equals(object obj)
+        public bool Equals(Value o)
         {
-            var o = obj as Value;
-            if (o == null || o.Type != Type) return false;
+            if (o.Type != Type) return false;
             switch (Type)
             {
                 case ValueType.Nil: return true;
@@ -507,6 +540,8 @@ namespace MiniDynLang
                 default: return false;
             }
         }
+        public override bool Equals(object obj) => obj is Value v && Equals(v);
+
         public override int GetHashCode()
         {
             switch (Type)
@@ -1972,7 +2007,7 @@ namespace MiniDynLang
             return Member();
         }
 
-        // New precedence level: nullish coalescing between Or() and Ternary()
+        // precedence level: nullish coalescing between Or() and Ternary()
         private Expr Nullish()
         {
             var expr = Or();
@@ -2343,7 +2378,7 @@ namespace MiniDynLang
         // NEW: helper – is name declared in this exact env (no parents)
         public bool HasHere(string name) => _values.ContainsKey(name);
 
-        // NEW: helper – get only from this env (throws if TDZ)
+        // helper – get only from this env (throws if TDZ)
         public bool TryGetHere(string name, out Value v)
         {
             if (_values.TryGetValue(name, out v))
@@ -2352,11 +2387,11 @@ namespace MiniDynLang
                     throw new MiniDynRuntimeError($"Cannot access '{name}' before initialization");
                 return true;
             }
-            v = null;
+            v = default(Value);
             return false;
         }
 
-        // NEW: nearest function/global env (fallback to self if none)
+        // nearest function/global env (fallback to self if none)
         private Environment GetNearestFunctionEnv()
         {
             var e = this;
@@ -2443,7 +2478,7 @@ namespace MiniDynLang
                 return true;
             }
             if (Enclosing != null) return Enclosing.TryGet(name, out v);
-            v = null;
+            v = default(Value);
             return false;
         }
 
@@ -2494,7 +2529,7 @@ namespace MiniDynLang
         // kind & captured 'this'
         public enum Kind { Normal, Arrow }
         public Kind FunctionKind { get; }
-        private readonly Value _capturedThis; // for arrows
+        private readonly Value? _capturedThis; // for arrows (nullable since Value is a struct)
 
         public List<ParamSpec> Params { get; }
         public Stmt.Block Body { get; }
@@ -2502,7 +2537,7 @@ namespace MiniDynLang
         public string Name { get; }
         public SourceSpan DefSpan { get; } // where function was defined
 
-        private Value _boundThis;
+        private Value? _boundThis;
 
         // Stable identity shared across bound clones for tail-call detection
         private static int _nextId;
@@ -2533,7 +2568,7 @@ namespace MiniDynLang
         // kind + capturedThis parameters (default to Normal/null for old call sites)
         // functionId (optional) to preserve identity across clones/binds
         public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure,
-                            Kind kind = Kind.Normal, Value capturedThis = null, SourceSpan defSpan = default(SourceSpan),
+                            Kind kind = Kind.Normal, Value? capturedThis = null, SourceSpan defSpan = default(SourceSpan),
                             int functionId = 0)
         {
             Name = name;
@@ -2572,11 +2607,11 @@ namespace MiniDynLang
                     // define 'this' according to kind (arrow uses captured lexical; normal uses bound call-site)
                     if (FunctionKind == Kind.Arrow)
                     {
-                        if (_capturedThis != null) env.DefineConst("this", _capturedThis);
+                        if (_capturedThis.HasValue) env.DefineConst("this", _capturedThis.Value);
                     }
-                    else if (_boundThis != null)
+                    else if (_boundThis.HasValue)
                     {
-                        env.DefineConst("this", _boundThis);
+                        env.DefineConst("this", _boundThis.Value);
                     }
 
                     // Bind parameters with defaults and rest
@@ -2635,7 +2670,7 @@ namespace MiniDynLang
                     }
                     catch (Interpreter.ReturnSignal ret)
                     {
-                        return ret.Value ?? Value.Nil();
+                        return ret.Value;
                     }
 
                     return Value.Nil();
@@ -2779,7 +2814,7 @@ namespace MiniDynLang
         private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
         private readonly IModuleLoader _moduleLoader;
-        private sealed class ModuleCacheEntry { public Value Exports; }
+        private sealed class ModuleCacheEntry { public Value? Exports; }
         private readonly Dictionary<string, ModuleCacheEntry> _moduleCache =
             new Dictionary<string, ModuleCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
@@ -3288,9 +3323,9 @@ namespace MiniDynLang
                 if (string.IsNullOrEmpty(abs))
                     throw new MiniDynRuntimeError($"Cannot resolve module '{spec}' from '{baseDir}'");
 
-                if (i._moduleCache.TryGetValue(abs, out var cached) && cached.Exports != null)
+                if (i._moduleCache.TryGetValue(abs, out var cached) && cached.Exports.HasValue)
                 {
-                    return cached.Exports;
+                    return cached.Exports.Value;
                 }
 
                 if (!i._moduleCache.TryGetValue(abs, out cached))
@@ -3328,14 +3363,17 @@ namespace MiniDynLang
                 if (!moduleEnv.TryGetHere("module", out moduleVal))
                     moduleVal = Value.Object(moduleObj);
 
-                Value finalExports = null;
+                Value finalExports = Value.Nil();
                 if (moduleVal.Type == ValueType.Object)
                 {
                     var mo = moduleVal.AsObject();
-                    mo.TryGet("exports", out finalExports);
+                    if (!mo.TryGet("exports", out finalExports))
+                        finalExports = Value.Object(initialExportsObj);
                 }
-                if (finalExports == null)
+                else
+                {
                     finalExports = Value.Object(initialExportsObj);
+                }
 
                 cached.Exports = finalExports;
                 return finalExports;
@@ -3590,7 +3628,7 @@ namespace MiniDynLang
                     processedArgs = ProcessNamedArguments(userFn2, callExpr.Args);
 
                     // Bind 'this' if we had a receiver and the function is a normal function
-                    if (receiver != null && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
                         fn = userFn2.BindThis(receiver);
                 }
                 else
@@ -3615,7 +3653,7 @@ namespace MiniDynLang
                 try
                 {
                     var res = fn.Call(this, processedArgs);
-                    throw new ReturnSignal(res ?? Value.Nil());
+                    throw new ReturnSignal(res);
                 }
                 catch (MiniDynRuntimeError ex)
                 {
@@ -3641,7 +3679,7 @@ namespace MiniDynLang
         }
         public object VisitTryCatchFinally(Stmt.TryCatchFinally s)
         {
-            Value caught = null;
+            Value caught = Value.Nil();
             try
             {
                 // Execute the try as a block (keeps normal block scoping)
@@ -3702,7 +3740,6 @@ namespace MiniDynLang
             // Helper to apply compound op (non-nullish-assign)
             Value ApplyOp(Value cur, TokenType op, Value rhsVal)
             {
-                if (cur == null) cur = Value.Nil();
                 switch (op)
                 {
                     case TokenType.Assign: return rhsVal;
@@ -3768,12 +3805,12 @@ namespace MiniDynLang
                 var objVal = Evaluate(p.Target);
                 if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property assignment target must be object");
                 var obj = objVal.AsObject();
-                obj.TryGet(p.Name, out var cur);
+                var exists = obj.TryGet(p.Name, out var cur);
 
                 Value newVal;
                 if (e.Op.Type == TokenType.NullishAssign)
                 {
-                    if (cur == null || cur.Type == ValueType.Nil)
+                    if (!exists || cur.Type == ValueType.Nil)
                     {
                         var rhs = Evaluate(e.Value);
                         newVal = rhs;
@@ -3835,12 +3872,12 @@ namespace MiniDynLang
                 {
                     var obj = target.AsObject();
                     var key = ToStringValue(idxV);
-                    obj.TryGet(key, out var cur);
+                    var exists = obj.TryGet(key, out var cur);
 
                     Value newVal;
                     if (e.Op.Type == TokenType.NullishAssign)
                     {
-                        if (cur == null || cur.Type == ValueType.Nil)
+                        if (!exists || cur.Type == ValueType.Nil)
                         {
                             var rhs = Evaluate(e.Value);
                             newVal = rhs;
@@ -3962,7 +3999,7 @@ namespace MiniDynLang
 
         public Value VisitCall(Expr.Call e)
         {
-            Value receiver = null;
+            Value receiver = Value.Nil();
             Value calleeVal;
 
             // Detect optional-chain short-circuit on callee (property/index)
@@ -4002,7 +4039,7 @@ namespace MiniDynLang
             {
                 processedArgs = ProcessNamedArguments(userFn, e.Args);
 
-                if (receiver != null && userFn.FunctionKind == UserFunction.Kind.Normal)
+                if (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
                 {
                     fn = userFn.BindThis(receiver);
                 }
@@ -4044,7 +4081,7 @@ namespace MiniDynLang
         // capturing receiver for method calls and honoring optional chaining short-circuit.
         private bool TryPrepareCalleeForCall(Expr calleeExpr, out Value calleeVal, out Value receiver, out bool shortCircuitToNil)
         {
-            receiver = null;
+            receiver = Value.Nil();
             shortCircuitToNil = false;
 
             if (calleeExpr is Expr.Property prop)
@@ -4184,7 +4221,7 @@ namespace MiniDynLang
 
         public Value VisitFunction(Expr.Function e)
         {
-            Value capturedThis = null;
+            Value? capturedThis = null;
             Value t;
             if (e.IsArrow && _env.TryGet("this", out t)) capturedThis = t;
             var kind = e.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
@@ -4616,7 +4653,7 @@ namespace MiniDynLang
             }
             catch (Interpreter.ThrowSignal ex)
             {
-                Console.WriteLine("Runtime error: Uncaught exception -> " + (ex.Value != null ? ex.Value.ToString() : "nil"));
+                Console.WriteLine("Runtime error: Uncaught exception -> " + ex.Value.ToString());
             }
             catch (MiniDynException ex)
             {
