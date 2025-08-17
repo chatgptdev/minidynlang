@@ -568,6 +568,9 @@ namespace MiniDynLang
         Ellipsis, // ...
         Dot, // .
         Arrow, // =>
+        QuestionDot,          // ?.
+        NullishCoalesce,      // ??
+        NullishAssign,        // ??=
     }
 
     public class Token
@@ -717,6 +720,22 @@ namespace MiniDynLang
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.PercentAssign, "%=", null, start, startLine, startCol); }
                     return MakeToken(TokenType.Percent, "%", null, start, startLine, startCol);
                 case '?':
+                    // Optional chaining '?.', nullish coalescing '??', and ternary '?'
+                    if (Peek() == '.')
+                    {
+                        Advance();
+                        return MakeToken(TokenType.QuestionDot, "?.", null, start, startLine, startCol);
+                    }
+                    if (Peek() == '?')
+                    {
+                        Advance();
+                        if (Peek() == '=')
+                        {
+                            Advance();
+                            return MakeToken(TokenType.NullishAssign, "??=", null, start, startLine, startCol);
+                        }
+                        return MakeToken(TokenType.NullishCoalesce, "??", null, start, startLine, startCol);
+                    }
                     return MakeToken(TokenType.Question, "?", null, start, startLine, startCol);
                 case ':':
                     return MakeToken(TokenType.Colon, ":", null, start, startLine, startCol);
@@ -970,7 +989,8 @@ namespace MiniDynLang
         {
             public Expr Target;
             public Expr IndexExpr;
-            public Index(Expr t, Expr i) { Target = t; IndexExpr = i; }
+            public bool IsOptional; // via '?.['
+            public Index(Expr t, Expr i, bool isOptional = false) { Target = t; IndexExpr = i; IsOptional = isOptional; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitIndex(this);
         }
         public sealed class ArrayLiteral : Expr
@@ -996,7 +1016,8 @@ namespace MiniDynLang
         {
             public Expr Target;
             public string Name;
-            public Property(Expr target, string name) { Target = target; Name = name; }
+            public bool IsOptional; // via '?.'
+            public Property(Expr target, string name, bool isOptional = false) { Target = target; Name = name; IsOptional = isOptional; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitProperty(this);
         }
 
@@ -1831,9 +1852,10 @@ namespace MiniDynLang
         // lvalue can be Variable, Property, Index, or Pattern (for destructuring)
         private Expr Assignment()
         {
-            var expr = Or();
+            // NOTE: precedence change: assignment consumes from Nullish() (which sits between Or() and Ternary()).
+            var expr = Nullish();
 
-            if (Match(TokenType.Assign, TokenType.PlusAssign, TokenType.MinusAssign, TokenType.StarAssign, TokenType.SlashAssign, TokenType.PercentAssign))
+            if (Match(TokenType.Assign, TokenType.PlusAssign, TokenType.MinusAssign, TokenType.StarAssign, TokenType.SlashAssign, TokenType.PercentAssign, TokenType.NullishAssign))
             {
                 Token op = Previous();
                 // handle destructuring assign e.g. [a,b] = RHS
@@ -1853,12 +1875,6 @@ namespace MiniDynLang
                 }
                 else
                 {
-                    // allow [a,b] = ...
-                    if (expr is Expr.ArrayLiteral || expr is Expr.ObjectLiteral)
-                    {
-                        // Convert literals-as-patterns? We only allow explicit patterns in statements; here support [a,b] or {x:y} in expressions by treating them as patterns-like is complex.
-                        throw new MiniDynParseError("Invalid assignment target", Previous().Line, Previous().Column);
-                    }
                     throw new MiniDynParseError("Invalid assignment target", Previous().Line, Previous().Column);
                 }
             }
@@ -1956,13 +1972,49 @@ namespace MiniDynLang
             return Member();
         }
 
+        // New precedence level: nullish coalescing between Or() and Ternary()
+        private Expr Nullish()
+        {
+            var expr = Or();
+            while (Match(TokenType.NullishCoalesce))
+            {
+                var op = Previous();
+                var right = Or();
+                var n = new Expr.Binary(expr, op, right) { Span = SourceSpan.FromToken(op) };
+                expr = n;
+            }
+            return expr;
+        }
+
         private Expr Member()
         {
             Expr expr = Primary();
 
             while (true)
             {
-                // 1. function / method call  
+                // Optional chaining: '?.' followed by identifier or '['
+                if (Match(TokenType.QuestionDot))
+                {
+                    // optional index a?.[expr]
+                    if (Match(TokenType.LBracket))
+                    {
+                        var lbrTok = Previous();
+                        var indexExpr = Ternary(); // allow ternary, not comma
+                        Consume(TokenType.RBracket, "Expected ']'");
+                        var idx = new Expr.Index(expr, indexExpr, isOptional: true);
+                        idx.Span = SourceSpan.FromToken(lbrTok);
+                        expr = idx;
+                        continue;
+                    }
+                    // optional property a?.prop
+                    var nameTok = Consume(TokenType.Identifier, "Expected property name after '?.'");
+                    var prop = new Expr.Property(expr, (string)nameTok.Literal, isOptional: true);
+                    prop.Span = SourceSpan.FromToken(nameTok);
+                    expr = prop;
+                    continue;
+                }
+
+                // 1. function / method call
                 if (Match(TokenType.LParen))
                 {
                     var lparTok = Previous();
@@ -1973,19 +2025,16 @@ namespace MiniDynLang
                         do
                         {
                             var nextToken = PeekAhead(1);
-                            // named argument?  
                             if (Check(TokenType.Identifier) && nextToken?.Type == TokenType.Colon)
                             {
-                                var nameTok = Advance();          // identifier  
+                                var nameTok = Advance();
                                 Consume(TokenType.Colon, "Expected ':'");
-                                // allow ternary in argument value, but not comma operator
                                 args.Add(new Expr.Call.Argument(
                                     (string)nameTok.Literal,
                                     Ternary()));
                             }
                             else
                             {
-                                // positional (allow ternary, not comma operator)
                                 args.Add(new Expr.Call.Argument(null, Ternary()));
                             }
                         } while (Match(TokenType.Comma));
@@ -1998,30 +2047,29 @@ namespace MiniDynLang
                     continue;
                 }
 
-                // 2. property access  
+                // 2. property access '.'
                 if (Match(TokenType.Dot))
                 {
                     var nameTok = Consume(TokenType.Identifier, "Expected property name after '.'");
-                    var prop = new Expr.Property(expr, (string)nameTok.Literal);
+                    var prop = new Expr.Property(expr, (string)nameTok.Literal, isOptional: false);
                     prop.Span = SourceSpan.FromToken(nameTok);
                     expr = prop;
                     continue;
                 }
 
-                // 3. index access  
+                // 3. index access '['
                 if (Match(TokenType.LBracket))
                 {
                     var lbrTok = Previous();
-                    // allow ternary in index, not comma operator
                     var indexExpr = Ternary();
                     Consume(TokenType.RBracket, "Expected ']'");
-                    var idx = new Expr.Index(expr, indexExpr);
+                    var idx = new Expr.Index(expr, indexExpr, isOptional: false);
                     idx.Span = SourceSpan.FromToken(lbrTok);
                     expr = idx;
                     continue;
                 }
 
-                break; // nothing more to fold  
+                break;
             }
 
             return expr;
@@ -3345,13 +3393,10 @@ namespace MiniDynLang
 
         public Value VisitAssign(Expr.Assign e)
         {
-            // Compute RHS
-            Value rhs = Evaluate(e.Value);
-
-            // Helper to apply compound op
+            // Helper to apply compound op (non-nullish-assign)
             Value ApplyOp(Value cur, TokenType op, Value rhsVal)
             {
-                if (cur == null) cur = Value.Nil(); // Treat uninitialized/null values as nil for compound assignments
+                if (cur == null) cur = Value.Nil();
                 switch (op)
                 {
                     case TokenType.Assign: return rhsVal;
@@ -3383,27 +3428,72 @@ namespace MiniDynLang
                 }
             }
 
+            // Variable
             if (e.Target is Expr.Variable v)
             {
                 var cur = _env.Get(v.Name);
-                var newVal = ApplyOp(cur, e.Op.Type, rhs);
-                _env.Assign(v.Name, newVal);
-                return newVal;
+                Value newVal;
+                if (e.Op.Type == TokenType.NullishAssign)
+                {
+                    if (cur.Type == ValueType.Nil)
+                    {
+                        var rhs = Evaluate(e.Value);
+                        newVal = rhs;
+                        _env.Assign(v.Name, newVal);
+                    }
+                    else
+                    {
+                        newVal = cur; // no-op
+                    }
+                    return newVal;
+                }
+                else
+                {
+                    var rhs = Evaluate(e.Value);
+                    newVal = ApplyOp(cur, e.Op.Type, rhs);
+                    _env.Assign(v.Name, newVal);
+                    return newVal;
+                }
             }
+            // Property
             else if (e.Target is Expr.Property p)
             {
+                if (p.IsOptional) throw new MiniDynRuntimeError("Cannot assign through optional chain");
                 var objVal = Evaluate(p.Target);
                 if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property assignment target must be object");
                 var obj = objVal.AsObject();
                 obj.TryGet(p.Name, out var cur);
-                var newVal = ApplyOp(cur, e.Op.Type, rhs);
-                obj.Set(p.Name, newVal);
-                return newVal;
+
+                Value newVal;
+                if (e.Op.Type == TokenType.NullishAssign)
+                {
+                    if (cur == null || cur.Type == ValueType.Nil)
+                    {
+                        var rhs = Evaluate(e.Value);
+                        newVal = rhs;
+                        obj.Set(p.Name, newVal);
+                    }
+                    else
+                    {
+                        newVal = cur; // no-op
+                    }
+                    return newVal;
+                }
+                else
+                {
+                    var rhs = Evaluate(e.Value);
+                    newVal = ApplyOp(cur, e.Op.Type, rhs);
+                    obj.Set(p.Name, newVal);
+                    return newVal;
+                }
             }
+            // Index
             else if (e.Target is Expr.Index idx)
             {
+                if (idx.IsOptional) throw new MiniDynRuntimeError("Cannot assign through optional chain");
                 var target = Evaluate(idx.Target);
                 var idxV = Evaluate(idx.IndexExpr);
+
                 if (target.Type == ValueType.Array)
                 {
                     var arr = target.AsArray();
@@ -3411,18 +3501,58 @@ namespace MiniDynLang
                     i = NormalizeIndex(i, arr.Length);
                     if (i < 0 || i >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
                     var cur = arr[i];
-                    var newVal = ApplyOp(cur, e.Op.Type, rhs);
-                    arr[i] = newVal;
-                    return newVal;
+
+                    Value newVal;
+                    if (e.Op.Type == TokenType.NullishAssign)
+                    {
+                        if (cur.Type == ValueType.Nil)
+                        {
+                            var rhs = Evaluate(e.Value);
+                            newVal = rhs;
+                            arr[i] = newVal;
+                        }
+                        else
+                        {
+                            newVal = cur;
+                        }
+                        return newVal;
+                    }
+                    else
+                    {
+                        var rhs = Evaluate(e.Value);
+                        newVal = ApplyOp(cur, e.Op.Type, rhs);
+                        arr[i] = newVal;
+                        return newVal;
+                    }
                 }
                 else if (target.Type == ValueType.Object)
                 {
                     var obj = target.AsObject();
                     var key = ToStringValue(idxV);
                     obj.TryGet(key, out var cur);
-                    var newVal = ApplyOp(cur, e.Op.Type, rhs);
-                    obj.Set(key, newVal);
-                    return newVal;
+
+                    Value newVal;
+                    if (e.Op.Type == TokenType.NullishAssign)
+                    {
+                        if (cur == null || cur.Type == ValueType.Nil)
+                        {
+                            var rhs = Evaluate(e.Value);
+                            newVal = rhs;
+                            obj.Set(key, newVal);
+                        }
+                        else
+                        {
+                            newVal = cur;
+                        }
+                        return newVal;
+                    }
+                    else
+                    {
+                        var rhs = Evaluate(e.Value);
+                        newVal = ApplyOp(cur, e.Op.Type, rhs);
+                        obj.Set(key, newVal);
+                        return newVal;
+                    }
                 }
                 else if (target.Type == ValueType.String)
                 {
@@ -3450,50 +3580,63 @@ namespace MiniDynLang
 
         public Value VisitBinary(Expr.Binary e)
         {
-            var l = Evaluate(e.Left);
-            var r = Evaluate(e.Right);
-
+            // Evaluate with per-op short-circuit where needed
             switch (e.Op.Type)
             {
                 case TokenType.Plus:
-                    if (l.Type == ValueType.Number && r.Type == ValueType.Number)
-                        return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
-                    if (l.Type == ValueType.String || r.Type == ValueType.String)
-                        return Value.String(ToStringValue(l) + ToStringValue(r));
-                    if (l.Type == ValueType.Array && r.Type == ValueType.Array)
-                    {
-                        // concatenate arrays
-                        var la = l.AsArray();
-                        var ra = r.AsArray();
-                        var res = new ArrayValue();
-                        res.Items.AddRange(la.Items);
-                        res.Items.AddRange(ra.Items);
-                        return Value.Array(res);
-                    }
-                    throw new MiniDynRuntimeError("Invalid '+' operands");
                 case TokenType.Minus:
-                    return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
                 case TokenType.Star:
-                    return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
                 case TokenType.Slash:
-                    return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
                 case TokenType.Percent:
-                    return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
                 case TokenType.Equal:
-                    return Value.Boolean(CompareEqual(l, r));
                 case TokenType.NotEqual:
-                    return Value.Boolean(!CompareEqual(l, r));
                 case TokenType.Less:
-                    return Value.Boolean(CompareRel(l, r, "<"));
                 case TokenType.LessEq:
-                    return Value.Boolean(CompareRel(l, r, "<="));
                 case TokenType.Greater:
-                    return Value.Boolean(CompareRel(l, r, ">"));
                 case TokenType.GreaterEq:
-                    return Value.Boolean(CompareRel(l, r, ">="));
+                {
+                    var l = Evaluate(e.Left);
+                    var r = Evaluate(e.Right);
+                    switch (e.Op.Type)
+                    {
+                        case TokenType.Plus:
+                            if (l.Type == ValueType.Number && r.Type == ValueType.Number)
+                                return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
+                            if (l.Type == ValueType.String || r.Type == ValueType.String)
+                                return Value.String(ToStringValue(l) + ToStringValue(r));
+                            if (l.Type == ValueType.Array && r.Type == ValueType.Array)
+                            {
+                                var la = l.AsArray();
+                                var ra = r.AsArray();
+                                var res = new ArrayValue();
+                                res.Items.AddRange(la.Items);
+                                res.Items.AddRange(ra.Items);
+                                return Value.Array(res);
+                            }
+                            throw new MiniDynRuntimeError("Invalid '+' operands");
+                        case TokenType.Minus:   return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
+                        case TokenType.Star:    return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
+                        case TokenType.Slash:   return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
+                        case TokenType.Percent: return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
+                        case TokenType.Equal:      return Value.Boolean(CompareEqual(l, r));
+                        case TokenType.NotEqual:   return Value.Boolean(!CompareEqual(l, r));
+                        case TokenType.Less:       return Value.Boolean(CompareRel(l, r, "<"));
+                        case TokenType.LessEq:     return Value.Boolean(CompareRel(l, r, "<="));
+                        case TokenType.Greater:    return Value.Boolean(CompareRel(l, r, ">"));
+                        case TokenType.GreaterEq:  return Value.Boolean(CompareRel(l, r, ">="));
+                    }
+                    break;
+                }
+                case TokenType.NullishCoalesce:
+                {
+                    var l = Evaluate(e.Left);
+                    if (l.Type != ValueType.Nil) return l;
+                    return Evaluate(e.Right);
+                }
                 default:
                     throw new MiniDynRuntimeError("Unknown binary op");
             }
+            throw new MiniDynRuntimeError("Unknown binary op");
         }
 
         public Value VisitLogical(Expr.Logical e)
@@ -3516,11 +3659,25 @@ namespace MiniDynLang
             Value receiver = null;
             Value calleeVal;
 
-            // Check if this is a method call (obj.method())
+            // Detect optional-chain short-circuit on callee (property/index)
             if (e.Callee is Expr.Property prop)
             {
-                receiver = Evaluate(prop.Target);
-                calleeVal = VisitProperty(prop);
+                var objVal = Evaluate(prop.Target);
+                if (prop.IsOptional && objVal.Type == ValueType.Nil) return Value.Nil(); // skip args, return nil
+                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property access target must be object");
+                var obj = objVal.AsObject();
+                obj.TryGet(prop.Name, out calleeVal);
+                receiver = objVal;
+            }
+            else if (e.Callee is Expr.Index idx)
+            {
+                var objVal = Evaluate(idx.Target);
+                if (idx.IsOptional && objVal.Type == ValueType.Nil) return Value.Nil(); // skip args, return nil
+                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Index access target must be object for method call");
+                var key = ToStringValue(Evaluate(idx.IndexExpr));
+                var obj = objVal.AsObject();
+                obj.TryGet(key, out calleeVal);
+                receiver = objVal;
             }
             else
             {
@@ -3532,14 +3689,13 @@ namespace MiniDynLang
 
             var fn = calleeVal.AsFunction();
 
-            // Process arguments
+            // Process arguments (defer evaluation until after we know we're calling)
             List<Value> processedArgs;
 
             if (fn is UserFunction userFn)
             {
                 processedArgs = ProcessNamedArguments(userFn, e.Args);
 
-                // Bind 'this' for method calls
                 if (receiver != null && userFn.FunctionKind == UserFunction.Kind.Normal)
                 {
                     fn = userFn.BindThis(receiver);
@@ -3547,10 +3703,8 @@ namespace MiniDynLang
             }
             else
             {
-                // Built-in functions only support positional arguments
                 if (e.Args.Any(a => a.IsNamed))
                     throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-
                 processedArgs = new List<Value>();
                 foreach (var arg in e.Args)
                     processedArgs.Add(Evaluate(arg.Value));
@@ -3697,10 +3851,11 @@ namespace MiniDynLang
         public Value VisitIndex(Expr.Index e)
         {
             var target = Evaluate(e.Target);
-            var idxV = Evaluate(e.IndexExpr);
+            if (e.IsOptional && target.Type == ValueType.Nil) return Value.Nil();
+
             if (target.Type == ValueType.Array)
             {
-                int idx = (int)ToNumber(idxV).ToDoubleNV().Dbl;
+                int idx = (int)ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
                 var arr = target.AsArray();
                 idx = NormalizeIndex(idx, arr.Length);
                 if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
@@ -3709,15 +3864,16 @@ namespace MiniDynLang
             if (target.Type == ValueType.String)
             {
                 var s = target.AsString();
-                int idx = (int)ToNumber(idxV).ToDoubleNV().Dbl;
+                int idx = (int)ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
                 idx = NormalizeIndex(idx, s.Length);
                 if (idx < 0 || idx >= s.Length) throw new MiniDynRuntimeError("String index out of range");
                 return Value.String(s[idx].ToString());
             }
             if (target.Type == ValueType.Object)
             {
+                var keyVal = Evaluate(e.IndexExpr);
+                var key = ToStringValue(keyVal);
                 var obj = target.AsObject();
-                var key = ToStringValue(idxV);
                 if (obj.TryGet(key, out var val)) return val;
                 return Value.Nil();
             }
@@ -3755,6 +3911,7 @@ namespace MiniDynLang
         public Value VisitProperty(Expr.Property e)
         {
             var objv = Evaluate(e.Target);
+            if (e.IsOptional && objv.Type == ValueType.Nil) return Value.Nil();
             if (objv.Type != ValueType.Object) throw new MiniDynRuntimeError("Property access target must be object");
             var obj = objv.AsObject();
             if (obj.TryGet(e.Name, out var v)) return v;
@@ -4537,6 +4694,13 @@ namespace MiniDynLang
                     try { throw ""oops""; }
                     catch { println(""caught without binding""); }
                     finally { println(""finally ran (2)""); }
+
+                    println("" -- Optional chaining -- "");
+                    let an = nil; println(an?.b); println(an?.[""x""]);
+                    let of = { f: fn(x) { return x * 2; } }; println(of?.f(5)); let n = nil; println(n?.f(3));
+
+                    println("" -- Nullish coalescing and assignment -- "");
+                    println(nil ?? 5); println(0 ?? 5); var x; println(x); x ??= 42; println(x); x ??= 99; println(x);
 
                 ";
             try
