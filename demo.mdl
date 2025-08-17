@@ -1,0 +1,448 @@
+println("=== BASIC FEATURES ===");
+
+// Objects and property access
+let o = { a: 1, b: 2, c: { nested: true }, d: "str" };
+println(o.a, o["b"], o.c.nested, o["d"]);
+o.a += 5;
+o["b"] = o["b"] * 10;
+println(o.a, o.b);
+
+// Computed keys and merge
+let k = "x";
+let o2 = { [k + "1"]: 11, [k+"2"]: 22 };
+println(o2["x1"], o2["x2"]);
+let o3 = merge(o, o2);
+println(keys(o3));
+
+// Arrays, index assignment and compound ops
+let arr = [1,2,3];
+arr[0] += 41;
+arr[2] = arr[2] * 3;
+println(arr);
+
+// Destructuring declarations
+let [p, q = 20, ...rest] = [10, , 30, 40, 50];
+println(p, q, rest);
+
+const { a, b: bb, z = 99, ...other } = o3;
+println(a, bb, z, other);
+
+// Destructuring assignment
+[p, q] = [100, 200];
+{ a: o.a, b: o.b } = { a: 7, b: 8 }; // assign into object properties
+println(p, q, o.a, o.b);
+
+// Object index assignment
+o["newKey"] = 123;
+println(has_key(o, "newKey"), o["newKey"]);
+
+// Strings and numbers still work
+println("Hello " + "World", 1 + 2 + 3);
+
+println();
+println("=== EXTRA FEATURES ===");
+
+// Arrow functions - expression body
+println("--- Arrow Functions ---");
+let add = (x, y) => x + y;
+println("add(5, 3) =", add(5, 3));
+
+// Single parameter arrow function (no parentheses)
+let double = x => x * 2;
+println("double(7) =", double(7));
+
+// Arrow function with no parameters
+let getMessage = () => "Hello from arrow function!";
+println(getMessage());
+
+// Arrow function with block body
+let factorial = n => {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+};
+println("factorial(5) =", factorial(5));
+
+// Arrow functions with default parameters
+let greet = (name, greeting = "Hello") => greeting + ", " + name + "!";
+println(greet("World"));
+println(greet("Alice", "Hi"));
+
+// Arrow function with rest parameters
+let sum = (...nums) => {
+    let total = 0;
+    let i = 0;
+    while (i < length(nums)) {
+        total = total + nums[i];
+        i = i + 1;
+}
+    return total;
+};
+println("sum(1, 2, 3, 4, 5) =", sum(1, 2, 3, 4, 5));
+
+// Using arrow functions with higher-order functions
+let numbers = [1, 2, 3, 4, 5];
+let doubled = [];
+let i = 0;
+while (i < length(numbers)) {
+    push(doubled, double(numbers[i]));
+    i = i + 1;
+}
+println("doubled:", doubled);
+
+// This-binding and methods
+println();
+println("--- This-binding and Methods ---");
+
+let person = {
+    name: "John",
+    age: 30,
+    greet: fn() {
+        return "Hello, I'm " + this.name + " and I'm " + this.age + " years old.";
+    },
+    haveBirthday: fn() {
+        this.age = this.age + 1;
+        return "Happy birthday! Now " + this.age + " years old.";
+    }
+};
+
+println(person.greet());
+println(person.haveBirthday());
+println(person.greet());
+
+// Method with arrow function - note: arrow functions don't bind their own 'this'
+let calculator = {
+    value: 10,
+    add: fn(n) { this.value = this.value + n; return this.value; },
+    multiply: fn(n) { this.value = this.value * n; return this.value; },
+    getValue: fn() { return this.value; },
+    // Test nested this access
+    getDoubler: fn() {
+        return fn() { return this.value * 2; };
+    }
+};
+
+println("Initial value:", calculator.getValue());
+println("After add(5):", calculator.add(5));
+println("After multiply(2):", calculator.multiply(2));
+let doubler = calculator.getDoubler();
+println("Doubled value:", doubler());
+
+// Named arguments
+println();
+println("--- Named Arguments ---");
+
+// Function with default parameters
+fn createUser(name, age = 25, city = "Unknown", active = true) {
+    return {
+        name: name,
+        age: age,
+        city: city,
+        active: active
+    };
+}
+
+// Call with positional arguments
+let user1 = createUser("Alice", 28, "New York", true);
+println("user1:", user1);
+
+// Call with named arguments
+let user2 = createUser(name: "Bob", city: "London", age: 35);
+println("user2:", user2);
+
+// Mixed positional and named arguments
+let user3 = createUser("Charlie", city: "Tokyo", active: false);
+println("user3:", user3);
+
+// All named arguments in different order
+let user4 = createUser(active: false, name: "David", age: 40, city: "Paris");
+println("user4:", user4);
+
+// Function with rest parameters and named arguments
+fn formatMessage(template, prefix = "MSG: ", suffix = "!", ...values) {
+    let result = prefix + template;
+    let i = 0;
+    while (i < length(values)) {
+        result = result + " [" + values[i] + "]";
+        i = i + 1;
+    }
+    return result + suffix;
+}
+
+// Pass explicit prefix/suffix when you also want extra trailing values:
+println(formatMessage("Error", "MSG: ", "!", "404", "Not Found"));
+println(formatMessage("Info", prefix: "INFO: ", suffix: " [OK]"));
+println(formatMessage(template: "Warning", prefix: "WARN: "));
+
+// Arrow function with named arguments
+let configure = (host = "localhost", port = 8080, ssl = false) => {
+    return {
+        url: (ssl ? "https://" : "http://") + host + ":" + port
+    };
+};
+
+println(configure());
+println(configure(port: 443, ssl: true));
+println(configure("example.com", ssl: true, port: 9000));
+
+println();
+println("=== REST-LAST TESTS ===");
+
+fn restLastDemo(a, b = 2, ...r) {
+    println("a=", a, " b=", b, " rest=", r);
+}
+restLastDemo(1);                  // a=1 b=2 rest=[]
+restLastDemo(1, 3, 4, 5);         // a=1 b=3 rest=[4, 5]
+restLastDemo(b: 10, a: 7, 8, 9);  // a=7 b=10 rest=[8, 9]
+
+// Complex example combining all features
+println();
+println("--- Combined Features Example ---");
+
+let team = {
+    name: "Development Team",
+    members: [],
+    addMember: fn(name, role = "Developer", skills = []) {
+        let member = {
+            name: name,
+            role: role,
+            skills: skills,
+            introduce: fn() {
+                return "Hi, I'm " + this.name + ", a " + this.role + 
+                    " with skills: " + join(this.skills, ", ");
+            }
+        };
+        push(this.members, member);
+        return member;
+    },
+    listMembers: fn() {
+        println("Team: " + this.name);
+        let i = 0;
+        while (i < length(this.members)) {
+            println("  - " + this.members[i].introduce());
+            i = i + 1;
+        }
+    }
+};
+
+// Add members using different argument styles
+team.addMember("Alice", "Lead Developer", ["JavaScript", "Python"]);
+team.addMember(name: "Bob", skills: ["Java", "C++"], role: "Senior Developer");
+team.addMember("Charlie", skills: ["Go", "Rust"]);
+
+// Arrow function to find members by skill
+let findBySkill = skill => {
+    let found = [];
+    let i = 0;
+    while (i < length(team.members)) {
+        let member = team.members[i];
+        let j = 0;
+        while (j < length(member.skills)) {
+            if (member.skills[j] == skill) {
+                push(found, member.name);
+                break;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return found;
+};
+
+team.listMembers();
+println("Members who know Python:", findBySkill("Python"));
+println("Members who know Go:", findBySkill("Go"));
+println();
+println("=== ARROW LEXICAL 'this' TESTS ===");
+
+// A counter object to test 'this' semantics.
+let counter = {
+    n: 0,
+    inc: fn() { this.n = this.n + 1; return this.n; },
+
+    // Returns an ARROW that uses 'this' lexically (captured at creation in inc/maker).
+    makeArrowGetter: fn() {
+        // lexical 'this' is the counter when this method is called
+        return () => this.n;
+    },
+
+    // Returns a NORMAL function; when called as a method of another object,
+    // it should use that object's 'this'.
+    makeNormalGetter: fn() {
+        return fn() { return this.n; };
+    }
+};
+
+// bump to a known state
+counter.inc(); // 1
+counter.inc(); // 2
+
+let getArrow = counter.makeArrowGetter();
+let getNormal = counter.makeNormalGetter();
+
+println("counter.n =", counter.n);
+println("getArrow() -> expect 2:", getArrow()); // lexical this = counter
+
+// Borrow the functions onto another object and call as methods.
+let other2 = { n: 100 };
+other2.get = getArrow;
+println("borrowed arrow via other2.get() -> expect 2:", other2.get()); // still 2 (arrow ignores call-site 'this')
+
+other2.get = getNormal;
+println("borrowed normal via other2.get() -> expect 100:", other2.get()); // dynamic this = other
+
+// Re-check that counter still unchanged by above calls other than our earlier incs.
+println("counter.n (still 2) =", counter.n);
+
+// Another object that exposes an arrow to its own 'this'
+let holder = {
+    v: 7,
+    make: fn() { return () => this.v; },   // arrow captures holder at creation
+    norm: fn() { return this.v; }          // normal uses dynamic 'this'
+};
+
+let aa = holder.make();
+println("aa() -> expect 7:", aa());
+let bobj = { v: 123, call: aa };
+println("bobj.call() borrowed arrow -> expect 7:", bobj.call()); // arrow ignores rebinding
+
+let borrowNorm = { v: 123, m: holder.norm };
+println("borrowed normal m() -> expect 123:", borrowNorm.m()); // normal respects call-site
+
+// Ensure property-call on an arrow returned from a method does not rebind:
+let wrapper = { m: getArrow, n: 999 };
+println("wrapper.m() (arrow) -> expect 2:", wrapper.m());
+
+println();
+println("=== BUILTIN SHOWCASE (non-interactive) ===");
+// gets() is interactive; omitted to keep demo non-blocking
+
+// Basics
+print("print without newline -> "); println("done");
+println("to_number('42.5') =", to_number("42.5"));
+println("to_string(123) =", to_string(123));
+println("type([1,2,3]) =", type([1,2,3]));
+
+// Object key ops
+let objDemo = { k1: 1, k2: 2 };
+println("remove_key k2 =", remove_key(objDemo, "k2"), " keys=", keys(objDemo));
+
+println();
+println("--- Math ---");
+println("abs(-5) =", abs(-5));
+println("floor(3.7) =", floor(3.7), " ceil(3.1) =", ceil(3.1), " round(3.5) =", round(3.5));
+println("sqrt(9) =", sqrt(9), " pow(2,10) =", pow(2,10));
+println("min(3,1,2) =", min(3,1,2), " max(3,1,2) =", max(3,1,2));
+srand(123);
+println("random seeded -> ", random(), " ", random());
+
+println();
+println("--- String ---");
+let s = "  Hello, MiniDyn!  ";
+println("substring(s, 2, 5) =", substring(s, 2, 5));
+println("index_of(s, 'Mini') =", index_of(s, "Mini"));
+println("contains(s, 'Dyn') =", contains(s, "Dyn"));
+println("starts_with(s, '  He') =", starts_with(s, "  He"));
+println("ends_with(s, '!  ') =", ends_with(s, "!  "));
+println("to_upper(s) =", to_upper(s));
+println("to_lower(s) =", to_lower(s));
+println("trim(s) =", trim(s));
+let parts = split("a,b,c", ","); println("split -> ", parts);
+println("parse_int('123') =", parse_int("123"), " parse_float('3.14') =", parse_float("3.14"));
+
+println();
+println("--- Array ---");
+let arr2 = array(10, 20, 30);
+println("array -> ", arr2);
+println("push -> length =", push(arr2, 40, 50), " arr2=", arr2);
+println("pop -> ", pop(arr2), " arr2=", arr2);
+println("at(arr2, -1) =", at(arr2, -1));
+println("slice(arr2, 1) =", slice(arr2, 1));
+set_at(arr2, 0, 99); println("set_at -> ", arr2);
+let arrClone = clone(arr2); println("clone(arr2) =", arrClone);
+
+println("now_ms() =", now_ms());
+
+println();
+println("--- Object helpers ---");
+let obj2 = { a: 1, b: 2, c: 3 };
+println("values(obj2) =", values(obj2));
+let ents = entries(obj2); println("entries(obj2) =", ents);
+let obj3 = from_entries(ents); println("from_entries(entries(obj2)) =", obj3);
+
+println();
+println("--- Functional array helpers ---");
+let nums = [1,2,3,4,5,2,3];
+println("map x*2 -> ", map(nums, x => x * 2));
+println("filter x>2 -> ", filter(nums, x => x > 2));
+println("reduce sum -> ", reduce(nums, (a, b) => a + b, 0));
+println("sort default -> ", sort(nums));
+println("sort desc -> ", sort(nums, (a, b) => b - a));
+println("unique(nums) -> ", unique(nums));
+println("range(5) -> ", range(5));
+println("range(2, 8, 2) -> ", range(2, 8, 2));
+
+println();
+println("--- More strings ---");
+println("replace('foo bar','bar','baz') -> ", replace("foo bar", "bar", "baz"));
+println("repeat('ab',3) -> ", repeat("ab", 3));
+println("pad_start('7',3,'0') -> ", pad_start("7", 3, "0"));
+println("pad_end('7',3,'0') -> ", pad_end("7", 3, "0"));
+
+println("sleeping 10ms..."); sleep_ms(10); println("awake");
+
+println();
+println("--- JSON ---");
+let j = json_stringify({ msg: "ok", data: [1,2,3] }, true);
+println(j);
+let parsed = json_parse(j);
+println(parsed);
+
+println();
+println("=== TRY/CATCH/FINALLY & THROW ===");
+
+println("-- throw value and catch --");
+try {
+    throw 123;
+} catch (e) {
+    println("caught:", e);
+} finally {
+    println("finally ran (1)");
+}
+
+println("-- raise() builtin throws Error object --");
+try {
+    raise("boom!");
+} catch (e) {
+    println("name=", e.name, " message=", e.message);
+}
+
+println("-- error() builtin returns Error object (not thrown) --");
+let eobj = error("just an object");
+println("eobj:", eobj, " name=", eobj.name, " message=", eobj.message);
+
+println("-- catch runtime error as value --");
+try {
+    let x = 1 / 0;
+    println(x);
+} catch (e) {
+    println("caught runtime:", e.name, e.message);
+}
+
+println("-- throw arbitrary object --");
+try {
+    throw { code: 7, msg: "custom" };
+} catch (ex) {
+    println("obj code=", ex.code, " msg=", ex.msg);
+}
+
+println("-- catch without binding --");
+try { throw "oops"; }
+catch { println("caught without binding"); }
+finally { println("finally ran (2)"); }
+
+println(" -- Optional chaining -- ");
+let an = nil; println(an?.b); println(an?.["x"]);
+let of = { f: fn(x) { return x * 2; } }; println(of?.f(5)); let n = nil; println(n?.f(3));
+
+println(" -- Nullish coalescing and assignment -- ");
+println(nil ?? 5); println(0 ?? 5); var x; println(x); x ??= 42; println(x); x ??= 99; println(x);
