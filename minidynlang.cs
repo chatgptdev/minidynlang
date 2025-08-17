@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text;
+using System.Runtime.CompilerServices;
 
 namespace MiniDynLang
 {
@@ -802,6 +803,12 @@ namespace MiniDynLang
                     if (Peek() == '=') { Advance(); return MakeToken(TokenType.GreaterEq, ">=", null, start, startLine, startCol); }
                     return MakeToken(TokenType.Greater, ">", null, start, startLine, startCol);
                 case '"':
+                    // Raw triple-quote """...""" (multiline, no escapes)
+                    if (Peek() == '"' && PeekNext() == '"')
+                    {
+                        Advance(); Advance(); // consume the two extra quotes
+                        return RawStringToken(start, startLine, startCol);
+                    }
                     return StringToken(start, startLine, startCol);
             }
 
@@ -816,6 +823,14 @@ namespace MiniDynLang
             }
 
             throw new MiniDynLexError($"Unexpected character '{c}'", startLine, startCol);
+        }
+
+        private static int HexDigit(char ch)
+        {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+            if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+            return -1;
         }
 
         private Token StringToken(int start, int startLine, int startCol)
@@ -835,8 +850,27 @@ namespace MiniDynLang
                         case '"': c = '"'; break;
                         case '\\': c = '\\'; break;
                         case '0': c = '\0'; break;
+                        case 'x':
+                            {
+                                int h1 = HexDigit(Peek()); Advance();
+                                int h2 = HexDigit(Peek()); Advance();
+                                if (h1 < 0 || h2 < 0) throw new MiniDynLexError("Invalid \\xNN escape", _line, _col);
+                                c = (char)((h1 << 4) | h2);
+                                break;
+                            }
+                        case 'u':
+                            {
+                                int h1 = HexDigit(Peek()); Advance();
+                                int h2 = HexDigit(Peek()); Advance();
+                                int h3 = HexDigit(Peek()); Advance();
+                                int h4 = HexDigit(Peek()); Advance();
+                                if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) throw new MiniDynLexError("Invalid \\uNNNN escape", _line, _col);
+                                c = (char)((((h1 << 4) | h2) << 8) | ((h3 << 4) | h4));
+                                break;
+                            }
                         default: c = e; break;
-                    };
+                    }
+                    ;
                 }
                 sb.Append(c);
             }
@@ -846,16 +880,86 @@ namespace MiniDynLang
             return MakeToken(TokenType.String, text, text, start, startLine, startCol);
         }
 
+
+        private Token RawStringToken(int start, int startLine, int startCol)
+        {
+            // Already consumed the leading """ in NextToken
+            StringBuilder sb = new StringBuilder();
+            while (!IsAtEnd)
+            {
+                if (Peek() == '"' && PeekNext() == '"' && PeekNext2() == '"')
+                {
+                    Advance(); Advance(); Advance(); // consume closing """
+                    string text = sb.ToString();
+                    return MakeToken(TokenType.String, text, text, start, startLine, startCol);
+                }
+                sb.Append(Advance());
+            }
+            throw new MiniDynLexError("Unterminated raw string", startLine, startCol);
+        }
+
         private Token NumberToken(int start, int startLine, int startCol)
         {
+            // Base prefixes and underscores in digits
+            // 0x... hex, 0b... binary
+            if (_src[start] == '0' && (_pos < _src.Length))
+            {
+                char kind = _src[_pos];
+                if (kind == 'x' || kind == 'X')
+                {
+                    Advance(); // consume x
+                    while (true)
+                    {
+                        char p = Peek();
+                        if (p == '_') { Advance(); continue; }
+                        int hv = HexDigit(p);
+                        if (hv >= 0) { Advance(); continue; }
+                        break;
+                    }
+                    string hextext = _src.Substring(start, _pos - start);
+                    string digits = hextext.Substring(2).Replace("_", "");
+                    if (digits.Length == 0) throw new MiniDynLexError("Invalid hex literal", startLine, startCol);
+                    BigInteger bi = BigInteger.Parse(digits, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+                    object lit = (bi >= long.MinValue && bi <= long.MaxValue)
+                        ? (object)NumberValue.FromLong((long)bi)
+                        : NumberValue.FromBigInt(bi);
+                    return MakeToken(TokenType.Number, hextext, lit, start, startLine, startCol);
+                }
+                if (kind == 'b' || kind == 'B')
+                {
+                    Advance(); // consume b
+                    bool sawDigit = false;
+                    BigInteger bi = BigInteger.Zero;
+                    while (!IsAtEnd)
+                    {
+                        char p = Peek();
+                        if (p == '_') { Advance(); continue; }
+                        if (p == '0' || p == '1')
+                        {
+                            sawDigit = true;
+                            bi = (bi << 1) + (p == '1' ? BigInteger.One : BigInteger.Zero);
+                            Advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    if (!sawDigit) throw new MiniDynLexError("Invalid binary literal", startLine, startCol);
+                    string bintext = _src.Substring(start, _pos - start);
+                    object lit = (bi >= long.MinValue && bi <= long.MaxValue)
+                        ? (object)NumberValue.FromLong((long)bi)
+                        : NumberValue.FromBigInt(bi);
+                    return MakeToken(TokenType.Number, bintext, lit, start, startLine, startCol);
+                }
+            }
+
             bool hasDot = false;
             bool hasExp = false;
 
-            // Integer and optional fractional part
+            // Integer and optional fractional part (allow underscores)
             while (true)
             {
                 char p = Peek();
-                if (char.IsDigit(p)) { Advance(); continue; }
+                if (char.IsDigit(p) || p == '_') { Advance(); continue; }
                 if (!hasDot && p == '.' && char.IsDigit(PeekNext()))
                 {
                     hasDot = true; Advance(); continue;
@@ -863,7 +967,7 @@ namespace MiniDynLang
                 break;
             }
 
-            // Optional exponent part: e[+|-]?digits
+            // Optional exponent part: e[+|-]?digits (allow underscores in digits)
             if (Peek() == 'e' || Peek() == 'E')
             {
                 hasExp = true;
@@ -873,27 +977,27 @@ namespace MiniDynLang
 
                 if (!char.IsDigit(Peek()))
                     throw new MiniDynLexError("Invalid exponent in number literal", startLine, startCol);
-
-                while (char.IsDigit(Peek())) Advance();
+                while (char.IsDigit(Peek()) || Peek() == '_') Advance();
             }
 
-            string text = _src.Substring(start, _pos - start);
-            object lit;
+            string textAll = _src.Substring(start, _pos - start);
+            string text = textAll.Replace("_", "");
+            object lit2;
 
             if (hasDot || hasExp)
             {
                 if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
                     throw new MiniDynLexError("Invalid number literal", startLine, startCol);
-                lit = NumberValue.FromDouble(d);
+                lit2 = NumberValue.FromDouble(d);
             }
             else
             {
                 if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
-                    lit = NumberValue.FromLong(i);
+                    lit2 = NumberValue.FromLong(i);
                 else
-                    lit = NumberValue.FromBigInt(BigInteger.Parse(text, CultureInfo.InvariantCulture));
+                    lit2 = NumberValue.FromBigInt(BigInteger.Parse(text, CultureInfo.InvariantCulture));
             }
-            return MakeToken(TokenType.Number, text, lit, start, startLine, startCol);
+            return MakeToken(TokenType.Number, textAll, lit2, start, startLine, startCol);
         }
 
         private Token IdentifierToken(int start, int startLine, int startCol)
@@ -2122,9 +2226,8 @@ namespace MiniDynLang
             if (Match(TokenType.String))
             {
                 var tok = Previous();
-                var lit = new Expr.Literal(Value.String((string)tok.Literal));
-                lit.Span = SourceSpan.FromToken(tok);
-                return lit;
+                var expr = BuildStringExprFromToken(tok);
+                return expr;
             }
             if (Match(TokenType.True))
             {
@@ -2304,6 +2407,101 @@ namespace MiniDynLang
                 return v;
             }
             throw new MiniDynParseError("Expected expression", Peek().Line, Peek().Column);
+        }
+
+        // Build plain literal or interpolated string expression from a string token.
+        private Expr BuildStringExprFromToken(Token tok)
+        {
+            var span = SourceSpan.FromToken(tok);
+            var text = (string)tok.Literal ?? "";
+            const string marker = "${";
+            if (text.IndexOf(marker, StringComparison.Ordinal) < 0)
+            {
+                var lit = new Expr.Literal(Value.String(text));
+                lit.Span = span;
+                return lit;
+            }
+
+            // Split into parts: text and embedded expressions delimited by ${ ... }
+            var parts = new List<object>(); // string or Expr
+            int i = 0;
+            while (i < text.Length)
+            {
+                int j = text.IndexOf(marker, i, StringComparison.Ordinal);
+                if (j < 0)
+                {
+                    var tail = text.Substring(i);
+                    if (tail.Length > 0) parts.Add(tail);
+                    break;
+                }
+                // literal chunk before ${
+                if (j > i) parts.Add(text.Substring(i, j - i));
+                int endExpr = FindMatchingBrace(text, j + 1); // returns index of closing '}'
+                if (endExpr < 0) throw new MiniDynParseError("Unterminated interpolation '${...}' in string", tok.Line, tok.Column);
+                int exprStart = j + 2;
+                int exprLen = endExpr - exprStart;
+                string exprSrc = exprLen > 0 ? text.Substring(exprStart, exprLen) : "";
+                var exprNode = ParseExpressionFromString(exprSrc, tok.FileName);
+                parts.Add(exprNode);
+                i = endExpr + 1; // continue after '}'
+            }
+
+            // Fold into left-associated additions for evaluation order
+            Expr result = null;
+            foreach (var part in parts)
+            {
+                Expr partExpr;
+                if (part is string s)
+                {
+                    partExpr = new Expr.Literal(Value.String(s)) { Span = span };
+                }
+                else
+                {
+                    partExpr = (Expr)part;
+                }
+                if (result == null) result = partExpr;
+                else result = new Expr.Binary(result, new Token(TokenType.Plus, "+", null, 0, 0, 0, tok.FileName), partExpr) { Span = span };
+            }
+            // If string started with interpolation, result may be null if parts empty; ensure empty string
+            if (result == null) result = new Expr.Literal(Value.String("")) { Span = span };
+            return result;
+        }
+
+        private static int FindMatchingBrace(string s, int openBraceIndex /* points at '{' */)
+        {
+            // openBraceIndex is index of '{' in the source (we pass j+1 from "${")
+            int i = openBraceIndex + 1;
+            int depth = 1;
+            bool inString = false;
+            while (i < s.Length)
+            {
+                char ch = s[i];
+                if (inString)
+                {
+                    if (ch == '\\') { i += 2; continue; }
+                    if (ch == '"') { inString = false; i++; continue; }
+                    i++; continue;
+                }
+                if (ch == '"') { inString = true; i++; continue; }
+                if (ch == '{') { depth++; i++; continue; }
+                if (ch == '}')
+                {
+                    depth--;
+                    if (depth == 0) return i;
+                    i++; continue;
+                }
+                i++;
+            }
+            return -1;
+        }
+
+        private Expr ParseExpressionFromString(string expr, string fileName)
+        {
+            var lx = new Lexer(expr, fileName ?? "<interp>");
+            var p2 = new Parser(lx);
+            var e = p2.Expression();
+            // We don't require explicit EOF check here; trailing whitespace is fine.
+            return e;
         }
 
         private Token PeekAhead(int distance)
@@ -3228,6 +3426,9 @@ namespace MiniDynLang
                     if (seen.Add(arr[k])) res.Items.Add(arr[k]);
                 return Value.Array(res);
             });
+
+            // Deep structural equality
+            DefineBuiltin("deep_equal", 2, 2, (i, a) => Value.Boolean(i.DeepEqual(a[0], a[1])));
 
             DefineBuiltin("range", 1, 3, (i, a) =>
             {
@@ -4348,6 +4549,66 @@ namespace MiniDynLang
                 return false;
             }
             return false;
+        }
+
+        // Deep structural equality with cycle detection
+        private bool DeepEqual(Value a, Value b)
+        {
+            var seen = new HashSet<(object, object)>(new RefPairEq());
+            return DeepEqualCore(a, b, seen);
+        }
+        private sealed class RefPairEq : IEqualityComparer<(object, object)>
+        {
+            public bool Equals((object, object) x, (object, object) y)
+                => ReferenceEquals(x.Item1, y.Item1) && ReferenceEquals(x.Item2, y.Item2);
+            public int GetHashCode((object, object) obj)
+                => (RuntimeHelpers.GetHashCode(obj.Item1) * 397) ^ RuntimeHelpers.GetHashCode(obj.Item2);
+        }
+        private bool DeepEqualCore(Value a, Value b, HashSet<(object, object)> seen)
+        {
+            if (a.Type != b.Type)
+            {
+                // Allow numeric coercion equality like normal '==' does
+                if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+                    return NumberValue.Compare(a.AsNumber(), b.AsNumber()) == 0;
+                return false;
+            }
+            switch (a.Type)
+            {
+                case ValueType.Nil: return true;
+                case ValueType.Boolean: return a.AsBoolean() == b.AsBoolean();
+                case ValueType.Number: return NumberValue.Compare(a.AsNumber(), b.AsNumber()) == 0;
+                case ValueType.String: return string.Equals(a.AsString(), b.AsString(), StringComparison.Ordinal);
+                case ValueType.Function: return ReferenceEquals(a.AsFunction(), b.AsFunction());
+                case ValueType.Array:
+                    {
+                        var aa = a.AsArray();
+                        var ab = b.AsArray();
+                        if (ReferenceEquals(aa, ab)) return true;
+                        if (aa.Length != ab.Length) return false;
+                        if (!seen.Add((aa, ab))) return true; // already compared
+                        for (int i = 0; i < aa.Length; i++)
+                            if (!DeepEqualCore(aa[i], ab[i], seen)) return false;
+                        return true;
+                    }
+                case ValueType.Object:
+                    {
+                        var oa = a.AsObject();
+                        var ob = b.AsObject();
+                        if (ReferenceEquals(oa, ob)) return true;
+                        if (oa.Count != ob.Count) return false;
+                        if (!seen.Add((oa, ob))) return true;
+                        // Compare key sets
+                        foreach (var kv in oa.Entries)
+                        {
+                            if (!ob.TryGet(kv.Key, out var bv)) return false;
+                            if (!DeepEqualCore(kv.Value, bv, seen)) return false;
+                        }
+                        return true;
+                    }
+                default:
+                    return false;
+            }
         }
 
         private static bool CompareRel(Value a, Value b, string op)
