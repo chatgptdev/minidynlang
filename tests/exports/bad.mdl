@@ -1,0 +1,2 @@
+// Incorrect: reassigning 'exports' breaks its link to module.exports, so nothing is exported.
+exports = { bad: true };

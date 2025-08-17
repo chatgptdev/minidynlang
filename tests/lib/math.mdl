@@ -1,0 +1,3 @@
+// Reassign module.exports (OK): replace the default exports object
+fn square(x) { return x * x; }
+module.exports = { square: square };

@@ -1,0 +1,7 @@
+// Export by mutating 'exports' (OK); also write via module.exports (same object initially)
+exports.add = fn(a, b) { return a + b; };
+exports.answer = 42;
+exports.name = "util";
+
+// Add another property through module.exports (same object by default)
+module.exports.version = "1.0.0";

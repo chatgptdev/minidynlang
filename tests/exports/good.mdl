@@ -1,0 +1,5 @@
+// Correct: assign the final object to module.exports
+module.exports = {
+    ok: true,
+    make: fn(x) { return x + 1; }
+};

@@ -1,0 +1,10 @@
+// A requires B during evaluation (cycle). Cache is seeded to avoid crashes.
+exports.name = "A";
+exports.doneA = false;
+
+let b = require("./b");
+// What did B observe about A at the time?
+exports.seesBSeenA = b.seenA;
+exports.bName = b.name;
+
+exports.doneA = true;

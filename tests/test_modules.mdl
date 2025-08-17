@@ -1,0 +1,36 @@
+println("=== require() module system demo ===");
+
+// 1) Basic require: relative to caller; caching; shared export object
+let util = require("./lib/util");
+println("util.add(2,3) =", util.add(2, 3), " answer =", util.answer, " version =", util.version);
+
+// 2) Default extension resolution (.minidyn)
+let math = require("./lib/math");
+println("math.square(5) =", math.square(5));
+
+// 3) Directory resolution to index.mdl and nested require relative to module
+let pkg = require("./pkg"); // resolves ./pkg/index.mdl
+println("pkg.tag =", pkg.tag, " sub.name =", pkg.sub.name);
+
+// 4) Cache: same instance across calls; stateful module
+let c1 = require("./cache/counter");
+let c2 = require("./cache/counter");
+println("counter next ->", c1.next(), c2.next()); // expect 1 then 2
+println("same instance =", c1 == c2);            // true
+
+// 5) module.exports vs exports
+let good = require("./exports/good");
+println("good.ok =", good.ok, " make(10) =", good.make(10));
+
+let bad = require("./exports/bad");
+println("bad has_key 'bad' =", has_key(bad, "bad"), "(expected false; reassigning 'exports' does not export)");
+
+// 6) Cyclic dependencies: A <-> B
+let a = require("./cycle/a");
+let b = require("./cycle/b");
+println("cycle A seenB.seenA =", a.seesBSeenA, " bName =", a.bName);
+println("cycle B seenA =", b.seenA, " aName =", b.aName);
+
+// 7) Cache identity again
+let util2 = require("./lib/util");
+println("util === util2 ->", util == util2);

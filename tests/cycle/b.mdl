@@ -1,0 +1,7 @@
+// B requires A back; sees A's early state during the cycle.
+exports.name = "B";
+
+let a = require("./a");
+exports.aName = a.name;
+exports.seenA = a.doneA;  // likely false here (set true later in A)
+exports.doneB = true;

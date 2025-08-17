@@ -1,0 +1,3 @@
+// Directory index resolution; nested requires resolve relative to this file
+let sub = require("./sub");
+module.exports = { tag: "pkg-index", sub: sub };
