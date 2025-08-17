@@ -3552,26 +3552,79 @@ namespace MiniDynLang
 
         public object VisitReturn(Stmt.Return s)
         {
-            // Tail-recursive optimization: if returning a call to the same function,
-            // convert it into a TailCallSignal and trampoline in UserFunction.Call
+            // Tail-call optimization without double-evaluating the callee:
+            // - Evaluate callee once (preserving side effects).
+            // - If it's a self-tail call, trampoline.
+            // - Otherwise, perform the call using the already-evaluated callee to avoid re-evaluating it.
             if (s.Value is Expr.Call callExpr)
             {
                 var currentFn = CurrentFunction;
-                if (currentFn != null)
+
+                // Evaluate callee once, capturing receiver and optional short-circuit
+                Value calleeVal; Value receiver; bool shortCircuitToNil;
+                TryPrepareCalleeForCall(callExpr.Callee, out calleeVal, out receiver, out shortCircuitToNil);
+
+                if (shortCircuitToNil)
                 {
-                    // Evaluate callee (preserve its side-effects)
-                    var calleeVal = Evaluate(callExpr.Callee);
-                    if (calleeVal.Type == ValueType.Function && calleeVal.AsFunction() is UserFunction targetFn)
-                    {
-                        // Match by stable function identity (works across bound clones)
-                        if (targetFn.FunctionId == currentFn.FunctionId)
-                        {
-                            // Map/evaluate arguments exactly like a normal call would
-                            var finalArgs = ProcessNamedArguments(currentFn, callExpr.Args);
-                            // Signal tail-call with evaluated args; no extra call frame is pushed
-                            throw new TailCallSignal(currentFn, finalArgs);
-                        }
-                    }
+                    // Optional chain produced nil callee -> call short-circuits to nil (no args eval)
+                    throw new ReturnSignal(Value.Nil());
+                }
+
+                if (currentFn != null && calleeVal.Type == ValueType.Function && calleeVal.AsFunction() is UserFunction targetFn
+                    && targetFn.FunctionId == currentFn.FunctionId)
+                {
+                    // Self tail-call: evaluate args and trampoline
+                    var finalArgs = ProcessNamedArguments(currentFn, callExpr.Args);
+                    throw new TailCallSignal(currentFn, finalArgs);
+                }
+
+                // Not a self tail call: complete the call using the evaluated callee (no second callee evaluation)
+                if (calleeVal.Type != ValueType.Function)
+                    throw new MiniDynRuntimeError("Can only call functions");
+
+                var fn = calleeVal.AsFunction();
+                List<Value> processedArgs;
+
+                if (fn is UserFunction userFn2)
+                {
+                    processedArgs = ProcessNamedArguments(userFn2, callExpr.Args);
+
+                    // Bind 'this' if we had a receiver and the function is a normal function
+                    if (receiver != null && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                        fn = userFn2.BindThis(receiver);
+                }
+                else
+                {
+                    // Builtins: no named args
+                    if (callExpr.Args.Any(a => a.IsNamed))
+                        throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
+                    processedArgs = new List<Value>();
+                    foreach (var arg in callExpr.Args)
+                        processedArgs.Add(Evaluate(arg.Value));
+                }
+
+                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                string fnName =
+                    fn is BuiltinFunction bf ? bf.Name :
+                    fn is UserFunction uf && !string.IsNullOrEmpty(uf.Name) ? uf.Name :
+                    "<anonymous>";
+                var callSite = callExpr?.Span ?? default(SourceSpan);
+                _callStack.Push(new CallFrame(fnName, callSite));
+                try
+                {
+                    var res = fn.Call(this, processedArgs);
+                    throw new ReturnSignal(res ?? Value.Nil());
+                }
+                catch (MiniDynRuntimeError ex)
+                {
+                    AttachErrorContext(ex);
+                    throw;
+                }
+                finally
+                {
+                    _callStack.Pop();
                 }
             }
 
@@ -3984,6 +4037,51 @@ namespace MiniDynLang
             finally
             {
                 _callStack.Pop();
+            }
+        }
+
+        // Helper used by VisitReturn to evaluate a call's callee once,
+        // capturing receiver for method calls and honoring optional chaining short-circuit.
+        private bool TryPrepareCalleeForCall(Expr calleeExpr, out Value calleeVal, out Value receiver, out bool shortCircuitToNil)
+        {
+            receiver = null;
+            shortCircuitToNil = false;
+
+            if (calleeExpr is Expr.Property prop)
+            {
+                var objVal = Evaluate(prop.Target);
+                if (prop.IsOptional && objVal.Type == ValueType.Nil)
+                {
+                    calleeVal = Value.Nil();
+                    shortCircuitToNil = true;
+                    return true;
+                }
+                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property access target must be object");
+                var obj = objVal.AsObject();
+                obj.TryGet(prop.Name, out calleeVal);
+                receiver = objVal;
+                return true;
+            }
+            else if (calleeExpr is Expr.Index idx)
+            {
+                var objVal = Evaluate(idx.Target);
+                if (idx.IsOptional && objVal.Type == ValueType.Nil)
+                {
+                    calleeVal = Value.Nil();
+                    shortCircuitToNil = true;
+                    return true;
+                }
+                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Index access target must be object for method call");
+                var key = ToStringValue(Evaluate(idx.IndexExpr));
+                var obj = objVal.AsObject();
+                obj.TryGet(key, out calleeVal);
+                receiver = objVal;
+                return true;
+            }
+            else
+            {
+                calleeVal = Evaluate(calleeExpr);
+                return true;
             }
         }
 
