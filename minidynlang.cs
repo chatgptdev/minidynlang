@@ -2504,6 +2504,10 @@ namespace MiniDynLang
 
         private Value _boundThis;
 
+        // Stable identity shared across bound clones for tail-call detection
+        private static int _nextId;
+        public int FunctionId { get; }
+
         public int ArityMin
         {
             get
@@ -2527,8 +2531,10 @@ namespace MiniDynLang
         }
 
         // kind + capturedThis parameters (default to Normal/null for old call sites)
+        // functionId (optional) to preserve identity across clones/binds
         public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure,
-                            Kind kind = Kind.Normal, Value capturedThis = null, SourceSpan defSpan = default(SourceSpan))
+                            Kind kind = Kind.Normal, Value capturedThis = null, SourceSpan defSpan = default(SourceSpan),
+                            int functionId = 0)
         {
             Name = name;
             Body = body;
@@ -2539,6 +2545,7 @@ namespace MiniDynLang
             FunctionKind = kind;
             _capturedThis = capturedThis;
             DefSpan = defSpan;
+            FunctionId = functionId != 0 ? functionId : ++_nextId;
         }
 
         public UserFunction BindThis(Value thisValue)
@@ -2546,72 +2553,98 @@ namespace MiniDynLang
             // arrows ignore rebinding
             if (FunctionKind == Kind.Arrow) return this;
 
-            var bound = new UserFunction(Name, ToExprParams(), Body, Closure, FunctionKind, _capturedThis, DefSpan);
+            var bound = new UserFunction(Name, ToExprParams(), Body, Closure, FunctionKind, _capturedThis, DefSpan, FunctionId);
             bound._boundThis = thisValue;
             return bound;
         }
 
         public Value Call(Interpreter interp, List<Value> args)
         {
-            var env = new Environment(Closure);
-
-            // define 'this' according to kind (arrow uses captured lexical; normal uses bound call-site)
-            if (FunctionKind == Kind.Arrow)
-            {
-                if (_capturedThis != null) env.DefineConst("this", _capturedThis);
-            }
-            else if (_boundThis != null)
-            {
-                env.DefineConst("this", _boundThis);
-            }
-
-            // Bind parameters with defaults and rest
-            int i = 0;
-            int argsCount = args.Count;
-            bool hasRest = false;
-            for (int pi = 0; pi < Params.Count; pi++)
-            {
-                var p = Params[pi];
-                if (p.IsRest)
-                {
-                    hasRest = true;
-                    var rest = new ArrayValue();
-                    for (int ai = i; ai < argsCount; ai++)
-                    {
-                        rest.Items.Add(args[ai]);
-                    }
-                    env.DefineVar(p.Name, Value.Array(rest));
-                    i = argsCount;
-                    continue;     // << keep looping so later parameters get defaults / named values
-                }
-                if (i < argsCount)
-                {
-                    env.DefineVar(p.Name, args[i++]);
-                }
-                else
-                {
-                    if (p.Default != null)
-                    {
-                        env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
-                    }
-                    else
-                    {
-                        throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
-                    }
-                }
-            }
-            if (!hasRest && i < argsCount)
-                throw new MiniDynRuntimeError($"Function {ToString()} expected at most {ArityMax} args, got {argsCount}");
-
+            // trampoline loop + function-current stack for tail-call detection
+            interp.PushFunction(this);
             try
             {
-                interp.ExecuteBlock(Body.Statements, env);
+                var currentArgs = args;
+                while (true)
+                {
+                    var env = new Environment(Closure);
+
+                    // define 'this' according to kind (arrow uses captured lexical; normal uses bound call-site)
+                    if (FunctionKind == Kind.Arrow)
+                    {
+                        if (_capturedThis != null) env.DefineConst("this", _capturedThis);
+                    }
+                    else if (_boundThis != null)
+                    {
+                        env.DefineConst("this", _boundThis);
+                    }
+
+                    // Bind parameters with defaults and rest
+                    int i = 0;
+                    int argsCount = currentArgs.Count;
+                    bool hasRest = false;
+                    for (int pi = 0; pi < Params.Count; pi++)
+                    {
+                        var p = Params[pi];
+                        if (p.IsRest)
+                        {
+                            hasRest = true;
+                            var rest = new ArrayValue();
+                            for (int ai = i; ai < argsCount; ai++)
+                            {
+                                rest.Items.Add(currentArgs[ai]);
+                            }
+                            env.DefineVar(p.Name, Value.Array(rest));
+                            i = argsCount;
+                            continue;
+                        }
+                        if (i < argsCount)
+                        {
+                            env.DefineVar(p.Name, currentArgs[i++]);
+                        }
+                        else
+                        {
+                            if (p.Default != null)
+                            {
+                                env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                            }
+                            else
+                            {
+                                throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                            }
+                        }
+                    }
+                    if (!hasRest && i < argsCount)
+                        throw new MiniDynRuntimeError($"Function {ToString()} expected at most {ArityMax} args, got {argsCount}");
+
+                    try
+                    {
+                        interp.ExecuteBlock(Body.Statements, env);
+                    }
+                    catch (Interpreter.TailCallSignal tcs)
+                    {
+                        // Only handle tail-calls to the same function identity (including bound clones)
+                        var uf = tcs.Function;
+                        if (uf != null && uf.FunctionId == this.FunctionId)
+                        {
+                            currentArgs = tcs.Args ?? new List<Value>();
+                            // loop again with new args; do not grow C# stack
+                            continue;
+                        }
+                        throw;
+                    }
+                    catch (Interpreter.ReturnSignal ret)
+                    {
+                        return ret.Value ?? Value.Nil();
+                    }
+
+                    return Value.Nil();
+                }
             }
-            catch (Interpreter.ReturnSignal ret)
+            finally
             {
-                return ret.Value ?? Value.Nil();
+                interp.PopFunction();
             }
-            return Value.Nil();
         }
 
         public override string ToString()
@@ -2620,7 +2653,7 @@ namespace MiniDynLang
         }
 
         public UserFunction Bind(Environment newClosure) =>
-            new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis, DefSpan);
+            new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis, DefSpan, FunctionId);
 
         private List<Expr.Param> ToExprParams()
         {
@@ -2726,6 +2759,18 @@ namespace MiniDynLang
             public ThrowSignal(Value v) { Value = v; }
         }
 
+        // Tail-call trampoline signal
+        public class TailCallSignal : Exception
+        {
+            public UserFunction Function { get; }
+            public List<Value> Args { get; }
+            public TailCallSignal(UserFunction fn, List<Value> args)
+            {
+                Function = fn;
+                Args = args;
+            }
+        }
+
         public readonly Environment Globals;
         private Environment _env;
         public Environment CurrentEnv => _env;
@@ -2737,6 +2782,12 @@ namespace MiniDynLang
         private sealed class ModuleCacheEntry { public Value Exports; }
         private readonly Dictionary<string, ModuleCacheEntry> _moduleCache =
             new Dictionary<string, ModuleCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+        // stack of currently executing user functions (for tail-call detection)
+        private readonly Stack<UserFunction> _fnExecStack = new Stack<UserFunction>();
+        internal void PushFunction(UserFunction fn) => _fnExecStack.Push(fn);
+        internal void PopFunction() { if (_fnExecStack.Count > 0) _fnExecStack.Pop(); }
+        internal UserFunction CurrentFunction => _fnExecStack.Count > 0 ? _fnExecStack.Peek() : null;
 
         public Interpreter(IModuleLoader moduleLoader = null)
         {
@@ -3501,6 +3552,29 @@ namespace MiniDynLang
 
         public object VisitReturn(Stmt.Return s)
         {
+            // Tail-recursive optimization: if returning a call to the same function,
+            // convert it into a TailCallSignal and trampoline in UserFunction.Call
+            if (s.Value is Expr.Call callExpr)
+            {
+                var currentFn = CurrentFunction;
+                if (currentFn != null)
+                {
+                    // Evaluate callee (preserve its side-effects)
+                    var calleeVal = Evaluate(callExpr.Callee);
+                    if (calleeVal.Type == ValueType.Function && calleeVal.AsFunction() is UserFunction targetFn)
+                    {
+                        // Match by stable function identity (works across bound clones)
+                        if (targetFn.FunctionId == currentFn.FunctionId)
+                        {
+                            // Map/evaluate arguments exactly like a normal call would
+                            var finalArgs = ProcessNamedArguments(currentFn, callExpr.Args);
+                            // Signal tail-call with evaluated args; no extra call frame is pushed
+                            throw new TailCallSignal(currentFn, finalArgs);
+                        }
+                    }
+                }
+            }
+
             Value v = s.Value != null ? Evaluate(s.Value) : Value.Nil();
             throw new ReturnSignal(v);
         }
