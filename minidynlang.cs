@@ -607,6 +607,9 @@ namespace MiniDynLang
         QuestionDot,          // ?.
         NullishCoalesce,      // ??
         NullishAssign,        // ??=
+        For,                  // for
+        In,                   // in
+        Of,                   // of
     }
 
     public class Token
@@ -654,6 +657,9 @@ namespace MiniDynLang
             ["catch"] = TokenType.Catch,
             ["finally"] = TokenType.Finally,
             ["throw"] = TokenType.Throw,
+            ["for"] = TokenType.For,
+            ["in"] = TokenType.In,
+            ["of"] = TokenType.Of,
 
             ["true"] = TokenType.True,
             ["false"] = TokenType.False,
@@ -1342,8 +1348,19 @@ namespace MiniDynLang
             T VisitDestructuringDecl(DestructuringDecl s);
             T VisitTryCatchFinally(TryCatchFinally s);
             T VisitThrow(Throw s);
+            T VisitForEach(ForEach s);
+            T VisitForClassic(ForClassic s);
+            T VisitDeclList(DeclList s);
         }
         public abstract T Accept<T>(IVisitor<T> v);
+
+       // A sequence of declarations that must run in the current scope (no new block scope).
+       public sealed class DeclList : Stmt
+       {
+           public List<Stmt> Decls;
+           public DeclList(List<Stmt> decls) { Decls = decls; }
+           public override T Accept<T>(IVisitor<T> v) => v.VisitDeclList(this);
+       }
 
         public sealed class ExprStmt : Stmt
         {
@@ -1433,6 +1450,28 @@ namespace MiniDynLang
             public Expr Value;
             public Throw(Expr value) { Value = value; }
             public override T Accept<T>(IVisitor<T> v) => v.VisitThrow(this);
+        }
+
+        // for ( ... ; ... ; ... ) { body }
+        public sealed class ForClassic : Stmt
+        {
+            public Stmt Initializer; // null or Var/Let/Const/ExprStmt (without trailing ;)
+            public Expr Condition;   // null => true
+            public Expr Increment;   // null => no-op
+            public Stmt Body;
+            public override T Accept<T>(IVisitor<T> v) => v.VisitForClassic(this);
+        }
+
+        // for ( [decl] pattern in|of iterable ) { body }
+        public sealed class ForEach : Stmt
+        {
+            public Expr.Pattern Pattern;
+            public bool IsDeclaration;
+            public DestructuringDecl.Kind DeclKind; // valid when IsDeclaration
+            public bool IsOf;       // true => of; false => in
+            public Expr Iterable;
+            public Stmt Body;
+            public override T Accept<T>(IVisitor<T> v) => v.VisitForEach(this);
         }
     }
 
@@ -1707,14 +1746,19 @@ namespace MiniDynLang
                 d.Span = SourceSpan.FromToken(kwTok);
                 return d;
             }
-            var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-            Expr init2 = null;
-            if (Match(TokenType.Assign))
-                init2 = Expression();
-            Consume(TokenType.Semicolon, "Expected ';'");
-            var s = new Stmt.Var((string)nameTok.Literal, init2);
-            s.Span = SourceSpan.FromToken(kwTok);
-            return s;
+           // Multiple declarators: var a = ..., b = ... ;
+           var decls = new List<Stmt>();
+           do
+           {
+               var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+               Expr init2 = null;
+               if (Match(TokenType.Assign))
+                   init2 = Ternary(); // prevent comma from bleeding into initializer
+               var s = new Stmt.Var((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
+               decls.Add(s);
+           } while (Match(TokenType.Comma));
+           Consume(TokenType.Semicolon, "Expected ';'");
+           return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
         }
 
         private Stmt LetDeclOrDestructuring()
@@ -1731,14 +1775,20 @@ namespace MiniDynLang
                 d.Span = SourceSpan.FromToken(kwTok);
                 return d;
             }
-            var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-            Expr init2 = null;
-            if (Match(TokenType.Assign))
-                init2 = Expression();
-            Consume(TokenType.Semicolon, "Expected ';'");
-            var s = new Stmt.Let((string)nameTok.Literal, init2);
-            s.Span = SourceSpan.FromToken(kwTok);
-            return s;
+            // Multiple declarators: let a = ..., b = ... ;
+            var decls = new List<Stmt>();
+            do
+            {
+                var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+                Expr init2 = null;
+                if (Match(TokenType.Assign))
+                   init2 = Ternary(); // prevent comma from bleeding into initializer
+               var s = new Stmt.Let((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
+               decls.Add(s);
+           } while (Match(TokenType.Comma));
+           Consume(TokenType.Semicolon, "Expected ';'");
+           return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
+
         }
 
         private Stmt ConstDeclOrDestructuring()
@@ -1753,13 +1803,18 @@ namespace MiniDynLang
                 d.Span = SourceSpan.FromToken(kwTok);
                 return d;
             }
-            var nameTok = Consume(TokenType.Identifier, "Expected constant name");
-            Consume(TokenType.Assign, "Expected '=' after const name");
-            var init2 = Expression();
+            // Multiple declarators: const a = ..., b = ... ; (each requires initializer)
+            var decls = new List<Stmt>();
+            do
+            {
+                var nameTok = Consume(TokenType.Identifier, "Expected constant name");
+                Consume(TokenType.Assign, "Expected '=' after const name");
+                var init2 = Ternary(); // prevent comma from bleeding into initializer
+                var s = new Stmt.Const((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
+                decls.Add(s);
+            } while (Match(TokenType.Comma));
             Consume(TokenType.Semicolon, "Expected ';'");
-            var s = new Stmt.Const((string)nameTok.Literal, init2);
-            s.Span = SourceSpan.FromToken(kwTok);
-            return s;
+            return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
         }
 
         private Expr ParseInitializerRequired()
@@ -1833,6 +1888,114 @@ namespace MiniDynLang
                     Span = SourceSpan.FromToken(tryTok)
                 };
                 return s;
+            }
+
+            if (Match(TokenType.For))
+            {
+                var forTok = Previous();
+                Consume(TokenType.LParen, "Expected '(' after 'for'");
+
+                // Lookahead: classic if a ';' appears before matching ')'
+                if (SeesSemicolonBeforeRParen())
+                {
+                    var fc = new Stmt.ForClassic();
+                    // Initializer
+                    if (Match(TokenType.Semicolon))
+                    {
+                        fc.Initializer = null;
+                    }
+                    else if (Match(TokenType.Var))
+                    {
+                        fc.Initializer = ParseForInitializerDecl(Stmt.DestructuringDecl.Kind.Var);
+                        Consume(TokenType.Semicolon, "Expected ';' after for-initializer");
+                    }
+                    else if (Match(TokenType.Let))
+                    {
+                        fc.Initializer = ParseForInitializerDecl(Stmt.DestructuringDecl.Kind.Let);
+                        Consume(TokenType.Semicolon, "Expected ';' after for-initializer");
+                    }
+                    else if (Match(TokenType.Const))
+                    {
+                        fc.Initializer = ParseForInitializerDecl(Stmt.DestructuringDecl.Kind.Const);
+                        Consume(TokenType.Semicolon, "Expected ';' after for-initializer");
+                    }
+                    else
+                    {
+                        var initExpr = CommaExpr();
+                        Consume(TokenType.Semicolon, "Expected ';' after for-initializer");
+                        fc.Initializer = new Stmt.ExprStmt(initExpr) { Span = initExpr?.Span ?? default(SourceSpan) };
+                    }
+
+                    // Condition
+                    if (Match(TokenType.Semicolon))
+                        fc.Condition = null;
+                    else
+                    {
+                        fc.Condition = Expression();
+                        Consume(TokenType.Semicolon, "Expected ';' after for-condition");
+                    }
+
+                    // Increment
+                    if (Match(TokenType.RParen))
+                        fc.Increment = null;
+                    else
+                    {
+                        fc.Increment = Expression();
+                        Consume(TokenType.RParen, "Expected ')' after for-increment");
+                    }
+
+                    fc.Body = Statement();
+                    fc.Span = SourceSpan.FromToken(forTok);
+                    return fc;
+                }
+                else
+                {
+                    // for-in/of
+                    var fe = new Stmt.ForEach();
+                    fe.Span = SourceSpan.FromToken(forTok);
+
+                    bool isDecl = false;
+                    Stmt.DestructuringDecl.Kind declKind = Stmt.DestructuringDecl.Kind.Let; // default
+
+                    if (Match(TokenType.Var))
+                    {
+                        isDecl = true; declKind = Stmt.DestructuringDecl.Kind.Var;
+                        fe.Pattern = ParseForHeadPatternDeclaration();
+                    }
+                    else if (Match(TokenType.Let))
+                    {
+                        isDecl = true; declKind = Stmt.DestructuringDecl.Kind.Let;
+                        fe.Pattern = ParseForHeadPatternDeclaration();
+                    }
+                    else if (Match(TokenType.Const))
+                    {
+                        isDecl = true; declKind = Stmt.DestructuringDecl.Kind.Const;
+                        fe.Pattern = ParseForHeadPatternDeclaration();
+                    }
+                    else
+                    {
+                        // Not a declaration: allow destructuring or lvalue pattern
+                        if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+                            fe.Pattern = ParsePattern();
+                        else
+                            fe.Pattern = ParseAliasPatternOrLValue();
+                    }
+
+                    if (Match(TokenType.Of))
+                        fe.IsOf = true;
+                    else if (Match(TokenType.In))
+                        fe.IsOf = false;
+                    else
+                        throw new MiniDynParseError("Expected 'of' or 'in' in for-statement", Peek().Line, Peek().Column);
+
+                    fe.IsDeclaration = isDecl;
+                    fe.DeclKind = declKind;
+
+                    fe.Iterable = Expression();
+                    Consume(TokenType.RParen, "Expected ')' after for-head");
+                    fe.Body = Statement();
+                    return fe;
+                }
             }
 
             // Array destructuring assignment: [a,b] = expr;
@@ -1917,6 +2080,77 @@ namespace MiniDynLang
             }
 
             return ExprStatement();
+        }
+
+        // Scan tokens from current position to find a ';' before the matching ')'
+        private bool SeesSemicolonBeforeRParen()
+        {
+            int i = _current;
+            int depth = 0; // nested parentheses
+            while (i < _tokens.Count)
+            {
+                var t = _tokens[i];
+                if (t.Type == TokenType.LParen) depth++;
+                else if (t.Type == TokenType.RParen)
+                {
+                    if (depth == 0) return false;
+                    depth--;
+                }
+                else if (t.Type == TokenType.Semicolon && depth == 0)
+                {
+                    return true;
+                }
+                i++;
+            }
+            return false;
+        }
+
+        // Parse an initializer declaration in classic for (without consuming the trailing ';')
+        private Stmt ParseForInitializerDecl(Stmt.DestructuringDecl.Kind kind)
+        {
+            // Pattern or single name
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                var pat = ParsePattern();
+                // initializer required
+                Consume(TokenType.Assign, "Destructuring declaration requires initializer");
+                var init = Expression();
+                return new Stmt.DestructuringDecl(pat, init, kind);
+            }
+            else
+            {
+                var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+                if (kind == Stmt.DestructuringDecl.Kind.Const)
+                {
+                    Consume(TokenType.Assign, "Expected '=' after const name");
+                    var init = Expression();
+                    return new Stmt.Const((string)nameTok.Literal, init);
+                }
+                else
+                {
+                    Expr init = null;
+                    if (Match(TokenType.Assign)) init = Expression();
+                    return (kind == Stmt.DestructuringDecl.Kind.Var)
+                        ? (Stmt)new Stmt.Var((string)nameTok.Literal, init)
+                        : new Stmt.Let((string)nameTok.Literal, init);
+                }
+            }
+        }
+
+        // Parse pattern after var/let/const in for-of/in head; initializers are NOT allowed
+        private Expr.Pattern ParseForHeadPatternDeclaration()
+        {
+            if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
+            {
+                var pat = ParsePattern();
+                if (Check(TokenType.Assign))
+                    throw new MiniDynParseError("Initializer not allowed in for-in/of declaration", Peek().Line, Peek().Column);
+                return pat;
+            }
+            var nameTok = Consume(TokenType.Identifier, "Expected identifier");
+            if (Check(TokenType.Assign))
+                throw new MiniDynParseError("Initializer not allowed in for-in/of declaration", Peek().Line, Peek().Column);
+            return new Expr.PatternIdentifier((string)nameTok.Literal);
         }
 
         private Stmt IfStatement(Token ifTok)
@@ -2574,15 +2808,15 @@ namespace MiniDynLang
         private readonly Dictionary<string, Value> _values = new Dictionary<string, Value>();
         private readonly HashSet<string> _consts = new HashSet<string>();
         private readonly HashSet<string> _lets = new HashSet<string>(); // tracks block-scoped let/const by name
-        // NEW: track "uninitialized" for TDZ-like checks on let without initializer
+        // track "uninitialized" for TDZ-like checks on let without initializer
         private readonly HashSet<string> _uninitialized = new HashSet<string>();
 
-        public virtual bool IsFunction => false; // NEW: mark function/global boundaries
+        public virtual bool IsFunction => false; // mark function/global boundaries
         public Environment Enclosing { get; }
 
         public Environment(Environment enclosing = null) { Enclosing = enclosing; }
 
-        // NEW: helper – is name declared in this exact env (no parents)
+        // helper – is name declared in this exact env (no parents)
         public bool HasHere(string name) => _values.ContainsKey(name);
 
         // helper – get only from this env (throws if TDZ)
@@ -2606,7 +2840,7 @@ namespace MiniDynLang
             return e ?? this;
         }
 
-        // NEW: var belongs to nearest function/global env; error if collides with block-scoped in that env
+        // var belongs to nearest function/global env; error if collides with block-scoped in that env
         public void DeclareVarInFunctionOrGlobal(string name, Value value)
         {
             var target = GetNearestFunctionEnv();
@@ -2629,7 +2863,7 @@ namespace MiniDynLang
             _uninitialized.Remove(name);
         }
 
-        // NEW: let without initializer => TDZ sentinel
+        // let without initializer => TDZ sentinel
         public void DefineLetUninitialized(string name)
         {
             if (HasHere(name))
@@ -3721,6 +3955,13 @@ namespace MiniDynLang
             return null;
         }
 
+       public object VisitDeclList(Stmt.DeclList s)
+       {
+           // Execute declarations sequentially in the current scope (no new block environment).
+           foreach (var d in s.Decls) Execute(d);
+           return null;
+       }
+
         public object VisitDestructuringDecl(Stmt.DestructuringDecl s)
         {
             var src = Evaluate(s.Initializer);
@@ -3730,7 +3971,7 @@ namespace MiniDynLang
                 switch (s.DeclKind)
                 {
                     case Stmt.DestructuringDecl.Kind.Var:
-                        // NEW: var pattern bindings go to function/global env
+                        // var pattern bindings go to function/global env
                         _env.DeclareVarInFunctionOrGlobal(name, v);
                         break;
                     case Stmt.DestructuringDecl.Kind.Let:
@@ -3787,6 +4028,210 @@ namespace MiniDynLang
                 }
             }
             return null;
+        }
+
+        public object VisitForClassic(Stmt.ForClassic s)
+        {
+            // Create a loop-local lexical environment when the initializer declares let/const.
+            // This matches JS-like semantics where "let" in the for-head is scoped to that for statement.
+            bool hasBlockScopedInit =
+                s.Initializer is Stmt.Let ||
+                s.Initializer is Stmt.Const ||
+                (s.Initializer is Stmt.DestructuringDecl dd &&
+                 (dd.DeclKind == Stmt.DestructuringDecl.Kind.Let || dd.DeclKind == Stmt.DestructuringDecl.Kind.Const));
+
+            var loopEnv = hasBlockScopedInit ? new Environment(_env) : _env;
+
+            // Run initializer in loopEnv (if any)
+            if (s.Initializer != null)
+            {
+                var prev = _env;
+                try { _env = loopEnv; Execute(s.Initializer); }
+                finally { _env = prev; }
+            }
+
+            while (true)
+            {
+                // Condition evaluates in loopEnv
+                if (s.Condition != null)
+                {
+                    var prev = _env;
+                    try
+                    {
+                        _env = loopEnv;
+                        var c = Evaluate(s.Condition);
+                        if (!Value.IsTruthy(c)) break;
+                    }
+                    finally { _env = prev; }
+                }
+
+                try
+                {
+                    // Execute body with loopEnv as the outer scope of the body
+                    var prev = _env;
+                    try { _env = loopEnv; Execute(s.Body); }
+                    finally { _env = prev; }
+                }
+                catch (ContinueSignal)
+                {
+                    // fallthrough to increment
+                }
+                catch (BreakSignal)
+                {
+                    break;
+                }
+
+                // Increment in loopEnv
+                if (s.Increment != null)
+                {
+                    var prev = _env;
+                    try { _env = loopEnv; Evaluate(s.Increment); }
+                    finally { _env = prev; }
+                }
+            }
+            return null;
+        }
+
+        // foreach (for-in/of)
+        public object VisitForEach(Stmt.ForEach s)
+        {
+            var iterable = Evaluate(s.Iterable);
+
+            if (s.IsOf)
+            {
+                var values = MaterializeForOf(iterable);
+                foreach (var item in values)
+                {
+                    try
+                    {
+                        ExecuteForEachIteration(s, item);
+                    }
+                    catch (ContinueSignal)
+                    {
+                        continue;
+                    }
+                    catch (BreakSignal)
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                var keys = MaterializeForIn(iterable);
+                foreach (var key in keys)
+                {
+                    try
+                    {
+                        ExecuteForEachIteration(s, Value.String(key));
+                    }
+                    catch (ContinueSignal)
+                    {
+                        continue;
+                    }
+                    catch (BreakSignal)
+                    {
+                        break;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private void ExecuteForEachIteration(Stmt.ForEach s, Value iterValue)
+        {
+            // Declaration vs assignment
+            if (s.IsDeclaration)
+            {
+                if (s.DeclKind == Stmt.DestructuringDecl.Kind.Var)
+                {
+                    // var: function/global scope, same binding reused; redeclare allowed
+                    void dec(string name, Value v) => _env.DeclareVarInFunctionOrGlobal(name, v);
+                    s.Pattern.Bind(this, iterValue, dec, allowConstReassign: false);
+                    // body executes in current env
+                    try { Execute(s.Body); }
+                    catch (ContinueSignal) { return; }
+                    catch (BreakSignal) { throw; }
+                }
+                else
+                {
+                    // let/const: fresh block environment per iteration
+                    var loopEnv = new Environment(_env);
+                    void declare(string name, Value v)
+                    {
+                        if (s.DeclKind == Stmt.DestructuringDecl.Kind.Let) loopEnv.DefineLet(name, v);
+                        else loopEnv.DefineConst(name, v);
+                    }
+                    s.Pattern.Bind(this, iterValue, declare, allowConstReassign: false);
+                    try { ExecuteBlock((s.Body as Stmt.Block)?.Statements ?? new List<Stmt> { s.Body }, loopEnv); }
+                    catch (ContinueSignal) { return; }
+                    catch (BreakSignal) { throw; }
+                }
+            }
+            else
+            {
+                // Assignment into existing lvalues/bindings
+                void assignLocal(string name, Value v) => _env.Assign(name, v);
+                s.Pattern.Bind(this, iterValue, assignLocal, allowConstReassign: true);
+                try { Execute(s.Body); }
+                catch (ContinueSignal) { return; }
+                catch (BreakSignal) { throw; }
+            }
+        }
+
+        private List<Value> MaterializeForOf(Value v)
+        {
+            switch (v.Type)
+            {
+                case ValueType.Array:
+                    return new List<Value>(v.AsArray().Items);
+                case ValueType.String:
+                    {
+                        var s = v.AsString();
+                        var list = new List<Value>(s.Length);
+                        for (int i = 0; i < s.Length; i++)
+                            list.Add(Value.String(s[i].ToString()));
+                        return list;
+                    }
+                case ValueType.Object:
+                    {
+                        var list = new List<Value>();
+                        foreach (var kv in v.AsObject().Entries)
+                            list.Add(kv.Value);
+                        return list;
+                    }
+                case ValueType.Nil:
+                    return new List<Value>();
+                default:
+                    throw new MiniDynRuntimeError("Value is not iterable for 'for ... of'");
+            }
+        }
+
+        private List<string> MaterializeForIn(Value v)
+        {
+            switch (v.Type)
+            {
+                case ValueType.Object:
+                    return v.AsObject().Keys.ToList();
+                case ValueType.Array:
+                    {
+                        var arr = v.AsArray();
+                        var list = new List<string>(arr.Length);
+                        for (int i = 0; i < arr.Length; i++) list.Add(i.ToString(CultureInfo.InvariantCulture));
+                        return list;
+                    }
+                case ValueType.String:
+                    {
+                        var s = v.AsString();
+                        var list = new List<string>(s.Length);
+                        for (int i = 0; i < s.Length; i++) list.Add(i.ToString(CultureInfo.InvariantCulture));
+                        return list;
+                    }
+                case ValueType.Nil:
+                    return new List<string>();
+                default:
+                    throw new MiniDynRuntimeError("Value is not indexable for 'for ... in'");
+            }
         }
 
         public object VisitFunction(Stmt.Function s)
