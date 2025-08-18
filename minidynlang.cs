@@ -919,10 +919,19 @@ namespace MiniDynLang
                     string hextext = _src.Substring(start, _pos - start);
                     string digits = hextext.Substring(2).Replace("_", "");
                     if (digits.Length == 0) throw new MiniDynLexError("Invalid hex literal", startLine, startCol);
+
+                    // Parse as hex (two's complement). If negative, convert to unsigned by adding 2^(nibbles*4).
                     BigInteger bi = BigInteger.Parse(digits, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
-                    object lit = (bi >= long.MinValue && bi <= long.MaxValue)
-                        ? (object)NumberValue.FromLong((long)bi)
-                        : NumberValue.FromBigInt(bi);
+                    BigInteger unsigned = bi;
+                    if (bi.Sign < 0)
+                    {
+                        int bitCount = digits.Length * 4;
+                        unsigned = bi + (BigInteger.One << bitCount);
+                    }
+
+                    object lit = (unsigned <= long.MaxValue)
+                        ? (object)NumberValue.FromLong((long)unsigned)
+                        : NumberValue.FromBigInt(unsigned);
                     return MakeToken(TokenType.Number, hextext, lit, start, startLine, startCol);
                 }
                 if (kind == 'b' || kind == 'B')
