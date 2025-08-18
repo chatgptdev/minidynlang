@@ -3219,6 +3219,1118 @@ namespace MiniDynLang
         }
     }
 
+    // Simple bytecode for expression-bodied functions
+    internal enum OpCode
+    {
+        // stack: push/pop Value
+        LoadConst,       // A = const index
+        LoadName,        // O = string name
+        StoreName,       // O = string name (pop value, assign)
+        Pop,
+        LoadParam,       // A = param index
+
+        Neg, Not,
+        Add, Sub, Mul, Div, Mod,
+
+        CmpEq, CmpNe, CmpLt, CmpLe, CmpGt, CmpGe,
+
+        // logical / nullish via control flow
+        Jump,            // A = target ip
+        JumpIfFalse,     // A = target ip (pop cond)
+        JumpIfTruthy,    // A = target ip (pop cond)
+        JumpIfNotNil,    // A = target ip (pop value, if not nil jump, else push back? see usage)
+        Dup,             // duplicate top-of-stack
+
+        // property/method and calls
+        GetProp,         // O = string name; pop target, push value (nil if missing)
+        Call,            // A = argCount; stack: ..., callee, arg1..argN -> pushes result
+        CallMethod,      // A = argCount; stack: ..., receiver, callee, arg1..argN -> pushes result (binds receiver for normal UserFunction)
+
+        Return,          // return top-of-stack
+        Noop,
+        
+        // locals + index access
+        LoadLocal,       // A = local slot index (params+locals array)
+        StoreLocal,      // A = local slot index (pop value, store, push back)
+        GetIndex         // stack: ..., target, index -> pops both, pushes value (nil if missing)
+    }
+
+    internal sealed class Instruction
+    {
+        public OpCode Op;
+        public int A;
+        public object O; // used for names (string) or future operands
+
+        public Instruction(OpCode op, int a = 0, object o = null)
+        {
+            Op = op; A = a; O = o;
+        }
+    }
+
+    internal sealed class Chunk
+    {
+        public readonly List<Instruction> Code = new List<Instruction>(64);
+        public readonly List<Value> Constants = new List<Value>(32);
+
+        public int AddConst(Value v)
+        {
+            int idx = Constants.Count;
+            Constants.Add(v);
+            return idx;
+        }
+
+        public int Emit(OpCode op, int a = 0, object o = null)
+        {
+            Code.Add(new Instruction(op, a, o));
+            return Code.Count - 1;
+        }
+
+        public void PatchJump(int at, int targetIp)
+        {
+                Code[at].A = targetIp;
+        }
+
+        // trivial peephole: remove Jump to next, collapse Noop
+        public void Peephole()
+        {
+            for (int i = 0; i < Code.Count; i++)
+            {
+                var ins = Code[i];
+                if (ins.Op == OpCode.Jump && ins.A == i + 1)
+                    Code[i].Op = OpCode.Noop;
+            }
+            // No need to physically remove Noop; the VM will skip fast.
+        }
+    }
+
+    internal sealed class BytecodeVM
+    {
+        private readonly Interpreter _interp;
+        public BytecodeVM(Interpreter interp) { _interp = interp; }
+
+        public Value Run(Chunk chunk, Environment env, Value[] locals = null)
+        {
+            var stack = new List<Value>(16);
+            int ip = 0;
+
+            Value Pop()
+            {
+                if (stack.Count == 0) throw new MiniDynRuntimeError("VM stack underflow");
+                var v = stack[stack.Count - 1];
+                stack.RemoveAt(stack.Count - 1);
+                return v;
+            }
+            void Push(Value v) => stack.Add(v);
+            bool Truthy(Value v) => Value.IsTruthy(v);
+
+            while (ip < chunk.Code.Count)
+            {
+                var ins = chunk.Code[ip++];
+                switch (ins.Op)
+                {
+                    case OpCode.Noop: break;
+
+                    case OpCode.LoadConst:
+                        Push(chunk.Constants[ins.A]); break;
+
+                    case OpCode.LoadName:
+                        Push(env.Get((string)ins.O)); break;
+
+                    case OpCode.StoreName:
+                        {
+                            var v = Pop();
+                            env.Assign((string)ins.O, v);
+                            Push(v);
+                            break;
+                        }
+
+                    case OpCode.Pop:
+                        Pop(); break;
+
+                    case OpCode.LoadParam:
+                        {
+                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                throw new MiniDynRuntimeError("Invalid parameter access");
+                           Push(locals[ins.A]);
+                           break;
+                       }
+                    // locals
+                    case OpCode.LoadLocal:
+                        {
+                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                throw new MiniDynRuntimeError("Invalid local access");
+                            Push(locals[ins.A]);
+                            break;
+                        }
+                    case OpCode.StoreLocal:
+                        {
+                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                throw new MiniDynRuntimeError("Invalid local access");
+                            var v = Pop();
+                            locals[ins.A] = v;
+                            Push(v);
+                            break;
+                        }
+                    case OpCode.Neg:
+                        {
+                            var r = Pop();
+                            Push(Value.Number(NumberValue.Neg(ToNum(r))));
+                            break;
+                        }
+                    case OpCode.Not:
+                        {
+                            var r = Pop();
+                            Push(Value.Boolean(!Truthy(r)));
+                            break;
+                        }
+
+                    case OpCode.Add:
+                        {
+                            var b = Pop(); var a = Pop();
+                            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+                                Push(Value.Number(NumberValue.Add(a.AsNumber(), b.AsNumber())));
+                            else if (a.Type == ValueType.String || b.Type == ValueType.String)
+                                Push(Value.String(_interp.ToStringValue(a) + _interp.ToStringValue(b)));
+                            else if (a.Type == ValueType.Array && b.Type == ValueType.Array)
+                            {
+                                var la = a.AsArray(); var rb = b.AsArray();
+                                var res = new ArrayValue();
+                                res.Items.AddRange(la.Items);
+                                res.Items.AddRange(rb.Items);
+                                Push(Value.Array(res));
+                            }
+                            else throw new MiniDynRuntimeError("Invalid '+' operands");
+                            break;
+                        }
+                    case OpCode.Sub:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Number(NumberValue.Sub(ToNum(a), ToNum(b))));
+                            break;
+                        }
+                    case OpCode.Mul:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Number(NumberValue.Mul(ToNum(a), ToNum(b))));
+                            break;
+                        }
+                    case OpCode.Div:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Number(NumberValue.Div(ToNum(a), ToNum(b))));
+                            break;
+                        }
+                    case OpCode.Mod:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Number(NumberValue.Mod(ToNum(a), ToNum(b))));
+                            break;
+                        }
+
+                    case OpCode.CmpEq:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Boolean(CompareEq(a, b)));
+                            break;
+                        }
+                    case OpCode.CmpNe:
+                        {
+                            var b = Pop(); var a = Pop();
+                            Push(Value.Boolean(!CompareEq(a, b)));
+                            break;
+                        }
+                    case OpCode.CmpLt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<"))); break; }
+                    case OpCode.CmpLe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<="))); break; }
+                    case OpCode.CmpGt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">"))); break; }
+                    case OpCode.CmpGe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">="))); break; }
+
+                    case OpCode.Dup:
+                        {
+                            var v = stack[stack.Count - 1];
+                            Push(v); break;
+                        }
+
+                    case OpCode.Jump:
+                        ip = ins.A; break;
+
+                    case OpCode.JumpIfFalse:
+                        {
+                            var c = Pop();
+                            if (!Truthy(c)) ip = ins.A;
+                            break;
+                        }
+
+                    case OpCode.JumpIfTruthy:
+                        {
+                            var c = Pop();
+                            if (Truthy(c)) ip = ins.A;
+                            break;
+                        }
+
+                    case OpCode.JumpIfNotNil:
+                        {
+                            var v = Pop();
+                            if (v.Type != ValueType.Nil) ip = ins.A;
+                            else Push(v); // keep nil for right-side consumer if needed
+                            break;
+                        }
+
+                    case OpCode.GetProp:
+                        {
+                            var target = Pop();
+                            if (target.Type != ValueType.Object)
+                                throw new MiniDynRuntimeError("Property access target must be object");
+                            var obj = target.AsObject();
+                            if (obj.TryGet((string)ins.O, out var vv)) Push(vv);
+                            else Push(Value.Nil());
+                            break;
+                       }
+
+                    // index access
+                    case OpCode.GetIndex:
+                        {
+                            var index = Pop();
+                            var target = Pop();
+                            if (target.Type == ValueType.Array)
+                            {
+                                var arr = target.AsArray();
+                                int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                                idx = NormalizeIndex(idx, arr.Length);
+                                if (idx < 0 || idx >= arr.Length)
+                                    throw new MiniDynRuntimeError("Array index out of range");
+                                Push(arr[idx]);
+                            }
+                            else if (target.Type == ValueType.String)
+                            {
+                                var s = target.AsString();
+                                int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                                idx = NormalizeIndex(idx, s.Length);
+                                if (idx < 0 || idx >= s.Length)
+                                    throw new MiniDynRuntimeError("String index out of range");
+                                Push(Value.String(s[idx].ToString()));
+                            }
+                            else if (target.Type == ValueType.Object)
+                            {
+                                var key = _interp.ToStringValue(index);
+                                var obj = target.AsObject();
+                                if (obj.TryGet(key, out var vv)) Push(vv);
+                                else Push(Value.Nil());
+                            }
+                            else
+                            {
+                                throw new MiniDynRuntimeError("Indexing supported only on arrays, strings, or objects");
+                            }
+                            break;
+                        }
+
+                   case OpCode.Call:
+                       {
+                           int argc = ins.A;
+                           var args = new List<Value>(argc);
+                           for (int k = 0; k < argc; k++) args.Add(Pop());
+                           args.Reverse();
+                           var callee = Pop();
+                           if (callee.Type != ValueType.Function)
+                               throw new MiniDynRuntimeError("Can only call functions");
+                           var fn = callee.AsFunction();
+                           var res = fn.Call(_interp, args);
+                          Push(res);
+                           break;
+                       }
+
+                   case OpCode.CallMethod:
+                       {
+                           int argc = ins.A;
+                           var args = new List<Value>(argc);
+                          for (int k = 0; k < argc; k++) args.Add(Pop());
+                           args.Reverse();
+                           var callee = Pop();
+                           var receiver = Pop();
+                           if (callee.Type != ValueType.Function)
+                               throw new MiniDynRuntimeError("Can only call functions");
+                          var fn = callee.AsFunction();
+                           // Bind receiver for normal user functions
+                          if (fn is UserFunction uf && uf.FunctionKind == UserFunction.Kind.Normal)
+                               fn = uf.BindThis(receiver);
+                          else if (fn is BytecodeFunction bf && bf.FunctionKind == UserFunction.Kind.Normal)
+                               fn = bf.BindThis(receiver);
+                           var res = fn.Call(_interp, args);
+                           Push(res);
+                           break;
+                       }
+                    case OpCode.Return:
+                        return Pop();
+
+                    default:
+                        throw new MiniDynRuntimeError("Unknown opcode");
+                }
+            }
+            return Value.Nil();
+
+            NumberValue ToNum(Value v)
+            {
+                switch (v.Type)
+                {
+                    case ValueType.Number: return v.AsNumber();
+                    case ValueType.Boolean: return NumberValue.FromBool(v.AsBoolean());
+                    case ValueType.Nil: return NumberValue.FromLong(0);
+                    case ValueType.String:
+                        return NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0);
+                    default: return NumberValue.FromLong(0);
+                }
+            }
+
+            // index normalization
+            int NormalizeIndex(int idx, int len)
+            {
+                if (idx < 0) idx = len + idx;
+                return idx;
+            }
+
+            bool CompareEq(Value a, Value b)
+            {
+                if (a.Type == b.Type) return a.Equals(b);
+                if (a.Type == ValueType.Number && b.Type == ValueType.String)
+                {
+                    if (NumberValue.TryFromString(b.AsString(), out var nb)) return NumberValue.Compare(a.AsNumber(), nb) == 0;
+                    return false;
+                }
+                if (a.Type == ValueType.String && b.Type == ValueType.Number)
+                {
+                    if (NumberValue.TryFromString(a.AsString(), out var na)) return NumberValue.Compare(na, b.AsNumber()) == 0;
+                    return false;
+                }
+                return false;
+            }
+
+            bool CmpRel(Value a, Value b, string op)
+            {
+                if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+                {
+                    int cmp = NumberValue.Compare(a.AsNumber(), b.AsNumber());
+                    switch (op)
+                    {
+                        case "<": return cmp < 0;
+                        case "<=": return cmp <= 0;
+                        case ">": return cmp > 0;
+                        case ">=": return cmp >= 0;
+                    }
+                }
+                if (a.Type == ValueType.String && b.Type == ValueType.String)
+                {
+                    int cmp = string.CompareOrdinal(a.AsString(), b.AsString());
+                    switch (op)
+                    {
+                        case "<": return cmp < 0;
+                        case "<=": return cmp <= 0;
+                        case ">": return cmp > 0;
+                        case ">=": return cmp >= 0;
+                    }
+                }
+                throw new MiniDynRuntimeError("Relational comparison only on numbers or strings");
+            }
+        }
+    }
+
+    internal sealed class BytecodeFunction : ICallable
+    {
+        private readonly string _name;
+        private readonly List<Expr.Param> _params;
+        private readonly Environment _closure;
+        private readonly Chunk _chunk;
+        private readonly Interpreter _interp;
+        private readonly UserFunction.Kind _kind;
+        private readonly Value? _capturedThis;
+        private readonly Value? _boundThis;
+
+        // locals count
+        private readonly int _localCount;
+
+        public int ArityMin { get; }
+        public int ArityMax { get; }
+
+        public BytecodeFunction(string name, List<Expr.Param> ps, Environment closure, Chunk chunk, Interpreter interp,
+                                UserFunction.Kind kind, Value? capturedThis, Value? boundThis = null,
+                                int localCount = 0)
+        {
+            _name = name;
+            _params = ps;
+            _closure = closure;
+            _chunk = chunk;
+            _interp = interp;
+            _kind = kind;
+            _capturedThis = capturedThis;
+            _boundThis = boundThis;
+            _localCount = localCount;
+
+            // Only support no-default, no-rest in first step
+            int min = 0, max = ps.Count;
+            foreach (var p in ps)
+            {
+                if (p.IsRest || p.Default != null) { min = 0; max = int.MaxValue; break; }
+                min++;
+            }
+            ArityMin = min;
+            ArityMax = max;
+        }
+
+       public UserFunction.Kind FunctionKind => _kind;
+
+       public BytecodeFunction BindThis(Value thisValue)
+       {
+           // Arrow ignores rebinding
+           if (_kind == UserFunction.Kind.Arrow) return this;
+            return new BytecodeFunction(_name, _params, _closure, _chunk, _interp, _kind, _capturedThis, thisValue, _localCount);
+       }
+        public Value Call(Interpreter interp, List<Value> args)
+        {
+            // same env handling as user fn but simpler; no defaults/rest in this first step
+            var env = new Environment(_closure);
+
+            if (_kind == UserFunction.Kind.Arrow)
+            {
+                if (_capturedThis.HasValue) env.DefineConst("this", _capturedThis.Value);
+            }
+            else
+            {
+                if (_boundThis.HasValue) env.DefineConst("this", _boundThis.Value);
+            }
+
+            for (int i = 0; i < _params.Count; i++)
+            {
+                var p = _params[i];
+                if (p.IsRest || p.Default != null)
+                    throw new MiniDynRuntimeError("Bytecode function: rest/default params not supported yet");
+                if (i < args.Count) env.DefineVar(p.Name, args[i]);
+                else throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {_name ?? "<fn>"}");
+            }
+            if (args.Count > _params.Count)
+                throw new MiniDynRuntimeError($"Function {_name ?? "<fn>"} expected {_params.Count} args, got {args.Count}");
+
+            // params + locals array for VM
+            int totalSlots = _params.Count + _localCount;
+            var paramLocals = new Value[totalSlots];
+            for (int i = 0; i < _params.Count && i < args.Count; i++) paramLocals[i] = args[i];
+            for (int i = _params.Count; i < totalSlots; i++) paramLocals[i] = Value.Nil();
+
+            var vm = new BytecodeVM(interp);
+            return vm.Run(_chunk, env, paramLocals);
+        }
+
+        public override string ToString() => _name != null ? $"<fn {_name}>" : "<fn>";
+    }
+
+    internal sealed class BytecodeCompiler
+    {
+        private readonly Interpreter _interp;
+        private Dictionary<string, int> _paramIndex; // name -> param slot
+        // locals map
+        private Dictionary<string, int> _localsIndex;
+        private int _localCount;
+        public BytecodeCompiler(Interpreter interp) { _interp = interp; }
+
+        public bool TryCompileFunction(Expr.Function fn, out BytecodeFunction bc)
+        {
+            bc = null;
+
+            // First try the old "single return expr" fast-path
+            if (TryExtractReturnExpr(fn.Body, out var expr))
+            {
+                // Only support params without defaults/rest for now
+                if (fn.Parameters.Any(p => p.Default != null || p.IsRest)) return false;
+
+                // Do not compile if the return expression contains a call (would defeat interpreter TCO)
+                if (ContainsCallExpr(expr)) return false;
+
+                // Prepare param index map
+                _paramIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+                for (int i = 0; i < fn.Parameters.Count; i++) _paramIndex[fn.Parameters[i].Name] = i;
+                _localsIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+                _localCount = 0;
+
+                var chunk = new Chunk();
+                if (!TryEmitExpr(expr, chunk)) return false;
+                chunk.Emit(OpCode.Return);
+                chunk.Peephole();
+
+                var kind = fn.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+                Value? capturedThis = null;
+                if (fn.IsArrow && _interp.CurrentEnv != null)
+                {
+                    Value t;
+                    if (_interp.CurrentEnv.TryGet("this", out t))
+                        capturedThis = t;
+                }
+
+                bc = new BytecodeFunction(null, fn.Parameters, _interp.CurrentEnv, chunk, _interp, kind, capturedThis, null, _localCount);
+                return true;
+            }
+
+            // compile a subset of statement-bodied functions
+            // Only support params without defaults/rest for now
+            if (fn.Parameters.Any(p => p.Default != null || p.IsRest)) return false;
+
+            _paramIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < fn.Parameters.Count; i++) _paramIndex[fn.Parameters[i].Name] = i;
+            _localsIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            _localCount = 0;
+
+            var chunk2 = new Chunk();
+            foreach (var st in fn.Body.Statements)
+            {
+                if (!TryEmitStmt(st, chunk2)) return false;
+            }
+            // implicit return nil at end if not returned
+            int nilIdx = chunk2.AddConst(Value.Nil());
+            chunk2.Emit(OpCode.LoadConst, nilIdx);
+            chunk2.Emit(OpCode.Return);
+            chunk2.Peephole();
+
+            var kind2 = fn.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+            Value? capturedThis2 = null;
+            if (fn.IsArrow && _interp.CurrentEnv != null)
+            {
+                Value t;
+                if (_interp.CurrentEnv.TryGet("this", out t))
+                    capturedThis2 = t;
+            }
+
+            bc = new BytecodeFunction(null, fn.Parameters, _interp.CurrentEnv, chunk2, _interp, kind2, capturedThis2, null, _localCount);
+            return true;
+        }
+        
+        // NEW: statement emitter for a supported subset
+        private bool TryEmitStmt(Stmt s, Chunk c)
+        {
+            switch (s)
+            {
+                case Stmt.Block b:
+                    foreach (var st in b.Statements)
+                        if (!TryEmitStmt(st, c)) return false;
+                    return true;
+
+                case Stmt.Return r:
+                    {
+                        // If the return value contains a call, bail to interpreter so TCO works.
+                        if (r.Value != null && ContainsCallExpr(r.Value)) return false;
+
+                        if (r.Value != null)
+                        {
+                            if (!TryEmitExpr(r.Value, c)) return false;
+                        }
+                        else
+                        {
+                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                        }
+                        c.Emit(OpCode.Return);
+                        return true;
+                    }
+
+                case Stmt.ExprStmt es:
+                    {
+                        if (!TryEmitExpr(es.Expression, c)) return false;
+                        c.Emit(OpCode.Pop);
+                        return true;
+                    }
+
+                case Stmt.DeclList dl:
+                    {
+                        foreach (var d in dl.Decls)
+                            if (!TryEmitStmt(d, c)) return false;
+                        return true;
+                    }
+
+                case Stmt.Var v:
+                    {
+                        int slot = EnsureLocal(v.Name);
+                        if (v.Initializer != null)
+                        {
+                            if (!TryEmitExpr(v.Initializer, c)) return false;
+                        }
+                        else
+                        {
+                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                        }
+                        c.Emit(OpCode.StoreLocal, ParamCount + slot);
+                        return true;
+                    }
+
+                case Stmt.Let l:
+                    {
+                        int slot = EnsureLocal(l.Name);
+                        if (l.Initializer != null)
+                        {
+                            if (!TryEmitExpr(l.Initializer, c)) return false;
+                        }
+                        else
+                        {
+                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                        }
+                        c.Emit(OpCode.StoreLocal, ParamCount + slot);
+                        return true;
+                    }
+
+                case Stmt.Const cn:
+                    {
+                        int slot = EnsureLocal(cn.Name);
+                        if (cn.Initializer == null) return false; // require initializer
+                        if (!TryEmitExpr(cn.Initializer, c)) return false;
+                        c.Emit(OpCode.StoreLocal, ParamCount + slot);
+                        return true;
+                    }
+
+                case Stmt.If iff:
+                    {
+                        if (!TryEmitExpr(iff.Condition, c)) return false;
+                        int jf = c.Emit(OpCode.JumpIfFalse, 0);
+                        if (!TryEmitStmt(iff.Then, c)) return false;
+                        int jend = c.Emit(OpCode.Jump, 0);
+                        c.PatchJump(jf, c.Code.Count);
+                        if (iff.Else != null)
+                        {
+                            if (!TryEmitStmt(iff.Else, c)) return false;
+                        }
+                        c.PatchJump(jend, c.Code.Count);
+                        return true;
+                    }
+
+                default:
+                    return false;
+            }
+        }
+
+        private int ParamCount => _paramIndex?.Count ?? 0;
+
+        private int EnsureLocal(string name)
+        {
+            if (_localsIndex.TryGetValue(name, out var idx)) return idx;
+            idx = _localCount++;
+            _localsIndex[name] = idx;
+            return idx;
+        }
+
+        private bool TryEmitExpr(Expr e, Chunk c)
+        {
+            // Constant folding for nested binary/unary where both sides literal
+            if (TryFold(e, out var constVal))
+            {
+                c.Emit(OpCode.LoadConst, c.AddConst(constVal));
+                return true;
+            }
+
+            switch (e)
+            {
+                case Expr.Literal lit:
+                    c.Emit(OpCode.LoadConst, c.AddConst(lit.Value));
+                    return true;
+
+                case Expr.Variable v:
+                    {
+                        if (_localsIndex != null && _localsIndex.TryGetValue(v.Name, out var lidx))
+                        {
+                            c.Emit(OpCode.LoadLocal, ParamCount + lidx);
+                            return true;
+                        }
+                        if (_paramIndex != null && _paramIndex.TryGetValue(v.Name, out var pidx))
+                        {
+                            c.Emit(OpCode.LoadParam, pidx);
+                            return true;
+                        }
+                        c.Emit(OpCode.LoadName, 0, v.Name);
+                        return true;
+                    }
+
+                case Expr.Grouping g:
+                    return TryEmitExpr(g.Inner, c);
+
+                case Expr.Unary u:
+                    if (!TryEmitExpr(u.Right, c)) return false;
+                    if (u.Op.Type == TokenType.Minus) c.Emit(OpCode.Neg);
+                    else if (u.Op.Type == TokenType.Not) c.Emit(OpCode.Not);
+                    else if (u.Op.Type == TokenType.Plus) { /* no-op */ }
+                    else return false;
+                    return true;
+
+                case Expr.Binary b:
+                    {
+                        if (!TryEmitExpr(b.Left, c)) return false;
+                        if (!TryEmitExpr(b.Right, c)) return false;
+                        switch (b.Op.Type)
+                        {
+                            case TokenType.Plus: c.Emit(OpCode.Add); return true;
+                            case TokenType.Minus: c.Emit(OpCode.Sub); return true;
+                            case TokenType.Star: c.Emit(OpCode.Mul); return true;
+                            case TokenType.Slash: c.Emit(OpCode.Div); return true;
+                            case TokenType.Percent: c.Emit(OpCode.Mod); return true;
+
+                            case TokenType.Equal: c.Emit(OpCode.CmpEq); return true;
+                            case TokenType.NotEqual: c.Emit(OpCode.CmpNe); return true;
+                            case TokenType.Less: c.Emit(OpCode.CmpLt); return true;
+                            case TokenType.LessEq: c.Emit(OpCode.CmpLe); return true;
+                            case TokenType.Greater: c.Emit(OpCode.CmpGt); return true;
+                            case TokenType.GreaterEq: c.Emit(OpCode.CmpGe); return true;
+
+                            case TokenType.NullishCoalesce:
+                                {
+                                    c.Emit(OpCode.Dup);
+                                    int j = c.Emit(OpCode.JumpIfNotNil, 0);
+                                    c.Emit(OpCode.Pop);
+                                    if (!TryEmitExpr(b.Right, c)) return false;
+                                    c.PatchJump(j, c.Code.Count);
+                                    return true;
+                                }
+                            default:
+                                return false;
+                        }
+                    }
+
+                case Expr.Logical l:
+                    {
+                        if (l.Op.Type == TokenType.And)
+                        {
+                            // left && right:
+                            // stack flow:
+                            //   push left
+                            //   dup                         -> [left, left]
+                            //   jump_if_false L_end         (pops top copy; if false, jumps with one left on stack as result)
+                            //   pop                         (remove remaining left before computing right)
+                            //   emit right                  (right becomes result)
+                            // L_end:
+                            if (!TryEmitExpr(l.Left, c)) return false;
+                            c.Emit(OpCode.Dup);
+                            int jf = c.Emit(OpCode.JumpIfFalse, 0);
+                            c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(l.Right, c)) return false;
+                            c.PatchJump(jf, c.Code.Count);
+                            return true;
+                        }
+                        else if (l.Op.Type == TokenType.Or)
+                        {
+                            // left || right:
+                            //   push left
+                            //   dup
+                            //   jump_if_truthy L_end        (pops top copy; if true, jumps with one left on stack as result)
+                            //   pop                         (remove remaining left before computing right)
+                            //   emit right
+                            // L_end:
+                            if (!TryEmitExpr(l.Left, c)) return false;
+                            c.Emit(OpCode.Dup);
+                            int jt = c.Emit(OpCode.JumpIfTruthy, 0);
+                            c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(l.Right, c)) return false;
+                            c.PatchJump(jt, c.Code.Count);
+                            return true;
+                        }
+                        return false;
+                    }
+
+                case Expr.Ternary t:
+                    {
+                        if (!TryEmitExpr(t.Cond, c)) return false;
+                        int jf = c.Emit(OpCode.JumpIfFalse, 0);
+                        c.Emit(OpCode.Pop);
+                        if (!TryEmitExpr(t.Then, c)) return false;
+                        int j = c.Emit(OpCode.Jump, 0);
+                        c.PatchJump(jf, c.Code.Count);
+                        if (!TryEmitExpr(t.Else, c)) return false;
+                        c.PatchJump(j, c.Code.Count);
+                        return true;
+                    }
+
+                // NEW: property with optional chaining
+                case Expr.Property prop:
+                    {
+                        if (prop.IsOptional)
+                        {
+                            // target
+                            if (!TryEmitExpr(prop.Target, c)) return false;
+                            c.Emit(OpCode.Dup);
+                            int jNotNil = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);
+                            // when nil -> leave nil as result
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+                            c.PatchJump(jNotNil, c.Code.Count);
+                            // non-nil: get prop
+                            c.Emit(OpCode.GetProp, 0, prop.Name);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
+                        // normal
+                        if (!TryEmitExpr(prop.Target, c)) return false;
+                        c.Emit(OpCode.GetProp, 0, prop.Name);
+                        return true;
+                    }
+
+                // NEW: index access (with optional chain)
+                case Expr.Index idx:
+                    {
+                        if (!TryEmitExpr(idx.Target, c)) return false;
+                        if (idx.IsOptional)
+                        {
+                            c.Emit(OpCode.Dup);
+                            int jNotNil = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+                            c.PatchJump(jNotNil, c.Code.Count);
+                            if (!TryEmitExpr(idx.IndexExpr, c)) return false;
+                            c.Emit(OpCode.GetIndex);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
+                        if (!TryEmitExpr(idx.IndexExpr, c)) return false;
+                        c.Emit(OpCode.GetIndex);
+                        return true;
+                    }
+
+                case Expr.Call call:
+                    {
+                        // Named args unsupported for bytecode path
+                        if (call.Args.Any(a => a.IsNamed)) return false;
+
+                        // Optional method call: a?.f(args) or a?.[k](args)
+                        if (call.Callee is Expr.Property pcal && pcal.IsOptional)
+                        {
+                            // receiver
+                            if (!TryEmitExpr(pcal.Target, c)) return false;      // stack: [recv]
+                            c.Emit(OpCode.Dup);                                   // [recv, recv]
+                            int jNotNil = c.Emit(OpCode.JumpIfNotNil, 0);        // pop top; if non-nil -> L1; else push back nil
+                            c.Emit(OpCode.Pop);                                   // drop duplicate/nil
+                            // short-circuit to nil result (skip args)
+                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+
+                            // L1: non-nil path: [recv]
+                            c.PatchJump(jNotNil, c.Code.Count);
+                            c.Emit(OpCode.Dup);                                   // [recv, recv]
+                            c.Emit(OpCode.GetProp, 0, pcal.Name);                 // [recv, callee]
+                            foreach (var a in call.Args)
+                                if (!TryEmitExpr(a.Value, c)) return false;
+                            c.Emit(OpCode.CallMethod, call.Args.Count);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
+
+                        if (call.Callee is Expr.Index ical && ical.IsOptional)
+                        {
+                            // receiver
+                            if (!TryEmitExpr(ical.Target, c)) return false;       // [recv]
+                            c.Emit(OpCode.Dup);                                    // [recv, recv]
+                            int jNotNil = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);                                    // drop duplicate/nil
+                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+
+                            c.PatchJump(jNotNil, c.Code.Count);                   // [recv]
+                            c.Emit(OpCode.Dup);                                    // [recv, recv]
+                            if (!TryEmitExpr(ical.IndexExpr, c)) return false;    // [recv, recv, key]
+                            c.Emit(OpCode.GetIndex);                              // [recv, callee]
+                            foreach (var a in call.Args)
+                                if (!TryEmitExpr(a.Value, c)) return false;
+                            c.Emit(OpCode.CallMethod, call.Args.Count);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
+
+                        // Method call via property (non-optional)
+                        if (call.Callee is Expr.Property p && !p.IsOptional)
+                        {
+                            if (!TryEmitExpr(p.Target, c)) return false;  // push receiver
+                            c.Emit(OpCode.Dup);
+                            c.Emit(OpCode.GetProp, 0, p.Name);            // consumes dup, pushes callee
+                            foreach (var a in call.Args)
+                                if (!TryEmitExpr(a.Value, c)) return false;
+                            c.Emit(OpCode.CallMethod, call.Args.Count);
+                            return true;
+                        }
+
+                        // Method call via index (non-optional)
+                        if (call.Callee is Expr.Index ic && !ic.IsOptional)
+                        {
+                            if (!TryEmitExpr(ic.Target, c)) return false;         // [recv]
+                            c.Emit(OpCode.Dup);                                    // [recv, recv]
+                            if (!TryEmitExpr(ic.IndexExpr, c)) return false;      // [recv, recv, key]
+                            c.Emit(OpCode.GetIndex);                              // [recv, callee]
+                            foreach (var a in call.Args)
+                                if (!TryEmitExpr(a.Value, c)) return false;
+                            c.Emit(OpCode.CallMethod, call.Args.Count);
+                            return true;
+                        }
+
+                        // Simple call
+                        if (!TryEmitExpr(call.Callee, c)) return false;
+                        foreach (var a in call.Args)
+                            if (!TryEmitExpr(a.Value, c)) return false;
+                        c.Emit(OpCode.Call, call.Args.Count);
+                        return true;
+                    }
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryExtractReturnExpr(Stmt.Block body, out Expr expr)
+        {
+            expr = null;
+            if (body?.Statements == null || body.Statements.Count != 1) return false;
+            if (body.Statements[0] is Stmt.Return r && r.Value != null)
+            {
+                expr = r.Value; return true;
+            }
+            return false;
+        }
+
+        // NEW: conservative detector for any call within an expression
+        private static bool ContainsCallExpr(Expr e)
+        {
+            if (e == null) return false;
+            switch (e)
+            {
+                case Expr.Call _: return true;
+                case Expr.Grouping g: return ContainsCallExpr(g.Inner);
+                case Expr.Unary u: return ContainsCallExpr(u.Right);
+                case Expr.Binary b: return ContainsCallExpr(b.Left) || ContainsCallExpr(b.Right);
+                case Expr.Logical l: return ContainsCallExpr(l.Left) || ContainsCallExpr(l.Right);
+                case Expr.Ternary t: return ContainsCallExpr(t.Cond) || ContainsCallExpr(t.Then) || ContainsCallExpr(t.Else);
+                case Expr.Index i: return ContainsCallExpr(i.Target) || ContainsCallExpr(i.IndexExpr);
+                case Expr.Property p: return ContainsCallExpr(p.Target);
+                case Expr.ArrayLiteral a:
+                    foreach (var el in a.Elements) if (ContainsCallExpr(el)) return true;
+                    return false;
+                case Expr.ObjectLiteral o:
+                    foreach (var ent in o.Entries)
+                    {
+                        if (ent.KeyExpr != null && ContainsCallExpr(ent.KeyExpr)) return true;
+                        if (ContainsCallExpr(ent.ValueExpr)) return true;
+                    }
+                    return false;
+                case Expr.Function _: return false; // function literal itself is not a call
+                case Expr.Variable _: return false;
+                case Expr.Literal _: return false;
+                case Expr.Assign asg:
+                    return ContainsCallExpr(asg.Target) || ContainsCallExpr(asg.Value);
+                case Expr.DestructuringAssign da:
+                    return ContainsCallExpr(da.Value);
+                case Expr.Comma c:
+                    return ContainsCallExpr(c.Left) || ContainsCallExpr(c.Right);
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryFold(Expr e, out Value v)
+        {
+            v = default(Value);
+            switch (e)
+            {
+                case Expr.Literal lit:
+                    v = lit.Value; return true;
+
+                case Expr.Unary u:
+                    if (TryFold(u.Right, out var rv))
+                    {
+                        switch (u.Op.Type)
+                        {
+                            case TokenType.Minus:
+                                if (rv.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Neg(rv.AsNumber())); return true; }
+                                break;
+                            case TokenType.Not:
+                                v = Value.Boolean(!Value.IsTruthy(rv)); return true;
+                            case TokenType.Plus:
+                                v = rv; return true;
+                        }
+                    }
+                    return false;
+
+                case Expr.Binary b:
+                    if (TryFold(b.Left, out var lv) && TryFold(b.Right, out var rv2))
+                    {
+                        switch (b.Op.Type)
+                        {
+                            case TokenType.Plus:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Add(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                if (lv.Type == ValueType.String && rv2.Type == ValueType.String)
+                                { v = Value.String(lv.AsString() + rv2.AsString()); return true; }
+                                return false;
+                            case TokenType.Minus:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Sub(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                return false;
+                            case TokenType.Star:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Mul(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                return false;
+                            case TokenType.Slash:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Div(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                return false;
+                            case TokenType.Percent:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                { v = Value.Number(NumberValue.Mod(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                return false;
+                            case TokenType.Equal:
+                                v = Value.Boolean(lv.Equals(rv2)); return true;
+                            case TokenType.NotEqual:
+                                v = Value.Boolean(!lv.Equals(rv2)); return true;
+                            case TokenType.Less:
+                            case TokenType.LessEq:
+                            case TokenType.Greater:
+                            case TokenType.GreaterEq:
+                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                                {
+                                    int cmp = NumberValue.Compare(lv.AsNumber(), rv2.AsNumber());
+                                    bool res = b.Op.Type == TokenType.Less ? (cmp < 0)
+                                        : b.Op.Type == TokenType.LessEq ? (cmp <= 0)
+                                        : b.Op.Type == TokenType.Greater ? (cmp > 0) : (cmp >= 0);
+                                    v = Value.Boolean(res); return true;
+                                }
+                                if (lv.Type == ValueType.String && rv2.Type == ValueType.String)
+                                {
+                                    int cmp = string.CompareOrdinal(lv.AsString(), rv2.AsString());
+                                    bool res = b.Op.Type == TokenType.Less ? (cmp < 0)
+                                        : b.Op.Type == TokenType.LessEq ? (cmp <= 0)
+                                        : b.Op.Type == TokenType.Greater ? (cmp > 0) : (cmp >= 0);
+                                    v = Value.Boolean(res); return true;
+                                }
+                                return false;
+                            case TokenType.NullishCoalesce:
+                                v = (lv.Type != ValueType.Nil) ? lv : rv2; return true;
+                        }
+                    }
+                    return false;
+
+                case Expr.Logical l:
+                    if (TryFold(l.Left, out var lv2))
+                    {
+                        if (l.Op.Type == TokenType.And)
+                        {
+                            if (!Value.IsTruthy(lv2)) { v = lv2; return true; }
+                            if (TryFold(l.Right, out var rv3)) { v = rv3; return true; }
+                        }
+                        else if (l.Op.Type == TokenType.Or)
+                        {
+                            if (Value.IsTruthy(lv2)) { v = lv2; return true; }
+                            if (TryFold(l.Right, out var rv3)) { v = rv3; return true; }
+                        }
+                    }
+                    return false;
+
+                case Expr.Ternary t:
+                    if (TryFold(t.Cond, out var c))
+                    {
+                        if (Value.IsTruthy(c) && TryFold(t.Then, out var tv)) { v = tv; return true; }
+                        if (!Value.IsTruthy(c) && TryFold(t.Else, out var ev)) { v = ev; return true; }
+                    }
+                    return false;
+
+                default:
+                    return false;
+            }
+        }
+    }
+
     // Interpreter
     public class Interpreter : Expr.IVisitor<Value>, Stmt.IVisitor<object>
     {
@@ -3955,12 +5067,12 @@ namespace MiniDynLang
             return null;
         }
 
-       public object VisitDeclList(Stmt.DeclList s)
-       {
-           // Execute declarations sequentially in the current scope (no new block environment).
-           foreach (var d in s.Decls) Execute(d);
-           return null;
-       }
+        public object VisitDeclList(Stmt.DeclList s)
+        {
+            // Execute declarations sequentially in the current scope (no new block environment).
+            foreach (var d in s.Decls) Execute(d);
+            return null;
+        }
 
         public object VisitDestructuringDecl(Stmt.DestructuringDecl s)
         {
@@ -4286,6 +5398,16 @@ namespace MiniDynLang
                     if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
                         fn = userFn2.BindThis(receiver);
                 }
+                else if (fn is BytecodeFunction byteFn2)
+                {
+                    if (callExpr.Args.Any(a => a.IsNamed))
+                        throw new MiniDynRuntimeError("Bytecode-compiled functions do not support named arguments");
+                    processedArgs = new List<Value>();
+                   foreach (var arg in callExpr.Args)
+                       processedArgs.Add(Evaluate(arg.Value));
+                   if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
+                       fn = byteFn2.BindThis(receiver);
+               }
                 else
                 {
                     // Builtins: no named args
@@ -4699,6 +5821,18 @@ namespace MiniDynLang
                     fn = userFn.BindThis(receiver);
                 }
             }
+            else if (fn is BytecodeFunction byteFn)
+            {
+                if (e.Args.Any(a => a.IsNamed))
+                    throw new MiniDynRuntimeError("Bytecode-compiled functions do not support named arguments");
+                processedArgs = new List<Value>();
+                foreach (var arg in e.Args)
+                    processedArgs.Add(Evaluate(arg.Value));
+                if (receiver.Type != ValueType.Nil && byteFn.FunctionKind == UserFunction.Kind.Normal)
+                {
+                   fn = byteFn.BindThis(receiver);
+                }
+            }
             else
             {
                 if (e.Args.Any(a => a.IsNamed))
@@ -4876,6 +6010,12 @@ namespace MiniDynLang
 
         public Value VisitFunction(Expr.Function e)
         {
+            // Try fast bytecode path for simple expression-bodied functions
+            var compiler = new BytecodeCompiler(this);
+            if (compiler.TryCompileFunction(e, out var bcFn))
+                return Value.Function(bcFn);
+
+            // Fallback to existing user function
             Value? capturedThis = null;
             Value t;
             if (e.IsArrow && _env.TryGet("this", out t)) capturedThis = t;
