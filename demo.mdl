@@ -442,7 +442,7 @@ finally { println("finally ran (2)"); }
 
 println(" -- Optional chaining -- ");
 let an = nil; println(an?.b); println(an?.["x"]);
-let of = { f: fn(x) { return x * 2; } }; println(of?.f(5)); let n = nil; println(n?.f(3));
+let objf = { f: fn(x) { return x * 2; } }; println(objf?.f(5)); let n = nil; println(n?.f(3));
 
 println(" -- Nullish coalescing and assignment -- ");
 println(nil ?? 5); println(0 ?? 5); var x; println(x); x ??= 42; println(x); x ??= 99; println(x);
