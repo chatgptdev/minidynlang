@@ -3240,9 +3240,11 @@ namespace MiniDynLang
         JumpIfTruthy,    // A = target ip (pop cond)
         JumpIfNotNil,    // A = target ip (pop value, if not nil jump, else push back? see usage)
         Dup,             // duplicate top-of-stack
+        Dup2,            // duplicate top two stack items ( ... a b -> ... a b a b )
 
         // property/method and calls
         GetProp,         // O = string name; pop target, push value (nil if missing)
+       StoreProp,       // O = string name; pop value, pop target, set, push value
         Call,            // A = argCount; stack: ..., callee, arg1..argN -> pushes result
         CallMethod,      // A = argCount; stack: ..., receiver, callee, arg1..argN -> pushes result (binds receiver for normal UserFunction)
 
@@ -3252,7 +3254,8 @@ namespace MiniDynLang
         // locals + index access
         LoadLocal,       // A = local slot index (params+locals array)
         StoreLocal,      // A = local slot index (pop value, store, push back)
-        GetIndex         // stack: ..., target, index -> pops both, pushes value (nil if missing)
+       GetIndex,        // stack: ..., target, index -> pops both, pushes value (nil if missing)
+       StoreIndex       // stack: ..., target, index, value -> store, push value
     }
 
     internal sealed class Instruction
@@ -3449,7 +3452,15 @@ namespace MiniDynLang
                             var v = stack[stack.Count - 1];
                             Push(v); break;
                         }
-
+                    case OpCode.Dup2:
+                        {
+                            if (stack.Count < 2) throw new MiniDynRuntimeError("VM stack underflow");
+                            var b = stack[stack.Count - 1];
+                            var a = stack[stack.Count - 2];
+                            Push(a);
+                            Push(b);
+                            break;
+                       }
                     case OpCode.Jump:
                         ip = ins.A; break;
 
@@ -3485,9 +3496,19 @@ namespace MiniDynLang
                             else Push(Value.Nil());
                             break;
                        }
-
+                   case OpCode.StoreProp:
+                       {
+                           var value = Pop();
+                           var target = Pop();
+                           if (target.Type != ValueType.Object)
+                               throw new MiniDynRuntimeError("Property assignment target must be object");
+                           var obj = target.AsObject();
+                           obj.Set((string)ins.O, value);
+                           Push(value);
+                           break;
+                       }
                     // index access
-                    case OpCode.GetIndex:
+                   case OpCode.GetIndex:
                         {
                             var index = Pop();
                             var target = Pop();
@@ -3522,6 +3543,36 @@ namespace MiniDynLang
                             }
                             break;
                         }
+                   case OpCode.StoreIndex:
+                       {
+                           var value = Pop();
+                           var index = Pop();
+                           var target = Pop();
+                           if (target.Type == ValueType.Array)
+                           {
+                               var arr = target.AsArray();
+                               int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                               idx = NormalizeIndex(idx, arr.Length);
+                               if (idx < 0 || idx >= arr.Length)
+                                   throw new MiniDynRuntimeError("Array index out of range");
+                               arr[idx] = value;
+                               Push(value);
+                               break;
+                           }
+                           else if (target.Type == ValueType.Object)
+                           {
+                               var key = _interp.ToStringValue(index);
+                               var obj = target.AsObject();
+                               obj.Set(key, value);
+                               Push(value);
+                               break;
+                           }
+                           else if (target.Type == ValueType.String)
+                           {
+                               throw new MiniDynRuntimeError("Cannot assign into string by index");
+                           }
+                           throw new MiniDynRuntimeError("Index assignment target must be array or object");
+                       }
 
                    case OpCode.Call:
                        {
@@ -3727,6 +3778,14 @@ namespace MiniDynLang
         // locals map
         private Dictionary<string, int> _localsIndex;
         private int _localCount;
+        // simple loop context for break/continue
+        private sealed class LoopContext
+        {
+            public List<int> BreakJumps = new List<int>();
+            public List<int> ContinueJumps = new List<int>();
+            public int LoopStartIp;
+        }
+        private readonly Stack<LoopContext> _loopStack = new Stack<LoopContext>();
         public BytecodeCompiler(Interpreter interp) { _interp = interp; }
 
         public bool TryCompileFunction(Expr.Function fn, out BytecodeFunction bc)
@@ -3893,6 +3952,49 @@ namespace MiniDynLang
                         c.PatchJump(jend, c.Code.Count);
                         return true;
                     }
+               case Stmt.While w:
+                   {
+                       // loopStart:
+                       var ctx = new LoopContext();
+                       ctx.LoopStartIp = c.Code.Count;
+                       _loopStack.Push(ctx);
+
+                       // condition
+                       if (!TryEmitExpr(w.Condition, c)) { _loopStack.Pop(); return false; }
+                       int jf = c.Emit(OpCode.JumpIfFalse, 0);
+
+                       // body
+                       if (!TryEmitStmt(w.Body, c)) { _loopStack.Pop(); return false; }
+
+                       // continue patches jump to loopStart
+                       foreach (var jp in ctx.ContinueJumps) c.PatchJump(jp, ctx.LoopStartIp);
+
+                       c.Emit(OpCode.Jump, ctx.LoopStartIp);
+                       int exitIp = c.Code.Count;
+                       c.PatchJump(jf, exitIp);
+
+                       // break patches jump to exit
+                       foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
+
+                       _loopStack.Pop();
+                       return true;
+                   }
+               case Stmt.Break _:
+                   {
+                       if (_loopStack.Count == 0) return false;
+                       var ctx = _loopStack.Peek();
+                       int j = c.Emit(OpCode.Jump, 0);
+                       ctx.BreakJumps.Add(j);
+                       return true;
+                   }
+               case Stmt.Continue _:
+                   {
+                       if (_loopStack.Count == 0) return false;
+                       var ctx = _loopStack.Peek();
+                       int j = c.Emit(OpCode.Jump, 0);
+                       ctx.ContinueJumps.Add(j);
+                       return true;
+                   }
 
                 default:
                     return false;
@@ -3923,6 +4025,105 @@ namespace MiniDynLang
                 case Expr.Literal lit:
                     c.Emit(OpCode.LoadConst, c.AddConst(lit.Value));
                     return true;
+
+               case Expr.Assign asg:
+                   {
+                       // Do not attempt nullish-assign here; let interpreter handle it.
+                       if (asg.Op.Type == TokenType.NullishAssign) return false;
+
+                       // Helper to map token -> opcode for compound
+                       OpCode BinOp(TokenType t)
+                       {
+                           switch (t)
+                           {
+                               case TokenType.PlusAssign: return OpCode.Add;
+                               case TokenType.MinusAssign: return OpCode.Sub;
+                               case TokenType.StarAssign: return OpCode.Mul;
+                               case TokenType.SlashAssign: return OpCode.Div;
+                               case TokenType.PercentAssign: return OpCode.Mod;
+                               default: return (OpCode)(-1);
+                           }
+                       }
+
+                       // variable target
+                       if (asg.Target is Expr.Variable v)
+                       {
+                           int slot;
+                           bool isCompiledVar = TryResolveVarSlot(v.Name, out slot);
+                           if (asg.Op.Type == TokenType.Assign)
+                           {
+                               if (!TryEmitExpr(asg.Value, c)) return false;
+                               if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                               else c.Emit(OpCode.StoreName, 0, v.Name);
+                               return true;
+                           }
+                           else
+                           {
+                               // cur [op] rhs -> new; store
+                               if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
+                               else c.Emit(OpCode.LoadName, 0, v.Name);
+                               if (!TryEmitExpr(asg.Value, c)) return false;
+                               var bop = BinOp(asg.Op.Type);
+                               if ((int)bop == -1) return false;
+                               c.Emit(bop);
+                               if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                               else c.Emit(OpCode.StoreName, 0, v.Name);
+                               return true;
+                           }
+                       }
+
+                       // property target
+                       if (asg.Target is Expr.Property p && !p.IsOptional)
+                       {
+                           if (asg.Op.Type == TokenType.Assign)
+                           {
+                               if (!TryEmitExpr(p.Target, c)) return false;    // T
+                               if (!TryEmitExpr(asg.Value, c)) return false;   // T, rhs
+                               c.Emit(OpCode.StoreProp, 0, p.Name);            // -> rhs
+                               return true;
+                           }
+                           else
+                           {
+                               if (!TryEmitExpr(p.Target, c)) return false;    // T
+                               c.Emit(OpCode.Dup);                              // T, T
+                               c.Emit(OpCode.GetProp, 0, p.Name);              // T, cur
+                               if (!TryEmitExpr(asg.Value, c)) return false;   // T, cur, rhs
+                               var bop = BinOp(asg.Op.Type);
+                               if ((int)bop == -1) return false;
+                               c.Emit(bop);                                     // T, new
+                               c.Emit(OpCode.StoreProp, 0, p.Name);            // new
+                               return true;
+                           }
+                       }
+                       // index target
+                       if (asg.Target is Expr.Index ix && !ix.IsOptional)
+                       {
+                           if (asg.Op.Type == TokenType.Assign)
+                           {
+                               if (!TryEmitExpr(ix.Target, c)) return false;       // T
+                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
+                               if (!TryEmitExpr(asg.Value, c)) return false;       // T, I, rhs
+                               c.Emit(OpCode.StoreIndex);                          // rhs
+                               return true;
+                           }
+                           else
+                           {
+                               if (!TryEmitExpr(ix.Target, c)) return false;       // T
+                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
+                               c.Emit(OpCode.Dup2);                                 // T, I, T, I
+                               c.Emit(OpCode.GetIndex);                             // T, I, cur
+                               if (!TryEmitExpr(asg.Value, c)) return false;        // T, I, cur, rhs
+                               var bop = BinOp(asg.Op.Type);
+                               if ((int)bop == -1) return false;
+                               c.Emit(bop);                                         // T, I, new
+                               c.Emit(OpCode.StoreIndex);                           // new
+                               return true;
+                           }
+                       }
+
+                       // optional-chained or unsupported assignment target -> fallback
+                       return false;
+                   }
 
                 case Expr.Variable v:
                     {
@@ -4167,6 +4368,21 @@ namespace MiniDynLang
                 default:
                     return false;
             }
+        }
+        private bool TryResolveVarSlot(string name, out int slotIndex)
+        {
+            if (_localsIndex != null && _localsIndex.TryGetValue(name, out var lidx))
+            {
+                slotIndex = ParamCount + lidx;
+                return true;
+            }
+            if (_paramIndex != null && _paramIndex.TryGetValue(name, out var pidx))
+            {
+                slotIndex = pidx;
+                return true;
+            }
+            slotIndex = -1;
+            return false;
         }
 
         private static bool TryExtractReturnExpr(Stmt.Block body, out Expr expr)
