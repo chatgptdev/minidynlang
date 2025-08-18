@@ -3972,13 +3972,59 @@ namespace MiniDynLang
                        c.Emit(OpCode.Jump, ctx.LoopStartIp);
                        int exitIp = c.Code.Count;
                        c.PatchJump(jf, exitIp);
-
                        // break patches jump to exit
                        foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
-
                        _loopStack.Pop();
                        return true;
                    }
+
+                case Stmt.ForClassic fc:
+                    {
+                        // Optional initializer
+                        if (fc.Initializer != null)
+                        {
+                            if (!TryEmitStmt(fc.Initializer, c)) return false;
+                        }
+
+                        var ctx = new LoopContext();
+                        ctx.LoopStartIp = c.Code.Count;
+                        _loopStack.Push(ctx);
+
+                        // Optional condition
+                        int jf = -1;
+                        if (fc.Condition != null)
+                        {
+                            if (!TryEmitExpr(fc.Condition, c)) { _loopStack.Pop(); return false; }
+                            jf = c.Emit(OpCode.JumpIfFalse, 0);
+                        }
+
+                        // Body
+                        if (!TryEmitStmt(fc.Body, c)) { _loopStack.Pop(); return false; }
+
+                        // Continue targets go to increment section
+                        int incStart = c.Code.Count;
+                        foreach (var jp in ctx.ContinueJumps) c.PatchJump(jp, incStart);
+
+                        // Optional increment expression; discard its value
+                        if (fc.Increment != null)
+                        {
+                            if (!TryEmitExpr(fc.Increment, c)) { _loopStack.Pop(); return false; }
+                            c.Emit(OpCode.Pop);
+                        }
+
+                        // Loop back
+                        c.Emit(OpCode.Jump, ctx.LoopStartIp);
+                        int exitIp = c.Code.Count;
+
+                        // Patch condition false -> exit
+                        if (jf >= 0) c.PatchJump(jf, exitIp);
+
+                        // Break -> exit
+                        foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
+
+                        _loopStack.Pop();
+                        return true;
+                    }
                case Stmt.Break _:
                    {
                        if (_loopStack.Count == 0) return false;
@@ -4010,6 +4056,9 @@ namespace MiniDynLang
             _localsIndex[name] = idx;
             return idx;
         }
+        
+        // Allocate an unnamed temporary local slot (for internal compiler use).
+        private int NewTempSlot() => _localCount++;
 
         private bool TryEmitExpr(Expr e, Chunk c)
         {
@@ -4022,15 +4071,19 @@ namespace MiniDynLang
 
             switch (e)
             {
+                case Expr.Comma cm:
+                    {
+                        if (!TryEmitExpr(cm.Left, c)) return false;
+                        c.Emit(OpCode.Pop);
+                        if (!TryEmitExpr(cm.Right, c)) return false;
+                        return true;
+                    }
                 case Expr.Literal lit:
                     c.Emit(OpCode.LoadConst, c.AddConst(lit.Value));
                     return true;
 
-               case Expr.Assign asg:
+                case Expr.Assign asg:
                    {
-                       // Do not attempt nullish-assign here; let interpreter handle it.
-                       if (asg.Op.Type == TokenType.NullishAssign) return false;
-
                        // Helper to map token -> opcode for compound
                        OpCode BinOp(TokenType t)
                        {
@@ -4057,19 +4110,35 @@ namespace MiniDynLang
                                else c.Emit(OpCode.StoreName, 0, v.Name);
                                return true;
                            }
-                           else
+
+                           if (asg.Op.Type == TokenType.NullishAssign)
                            {
-                               // cur [op] rhs -> new; store
+                               // cur ??= rhs
                                if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
                                else c.Emit(OpCode.LoadName, 0, v.Name);
+                               c.Emit(OpCode.Dup);
+                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0); // if not nil -> leave cur
+                               c.Emit(OpCode.Pop); // drop nil
                                if (!TryEmitExpr(asg.Value, c)) return false;
-                               var bop = BinOp(asg.Op.Type);
-                               if ((int)bop == -1) return false;
-                               c.Emit(bop);
                                if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
                                else c.Emit(OpCode.StoreName, 0, v.Name);
+                               int jEnd = c.Emit(OpCode.Jump, 0);
+                               c.PatchJump(jHave, c.Code.Count);
+                               // stack already has cur (non-nil)
+                               c.PatchJump(jEnd, c.Code.Count);
                                return true;
                            }
+
+                           // Compound op
+                           if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
+                           else c.Emit(OpCode.LoadName, 0, v.Name);
+                           if (!TryEmitExpr(asg.Value, c)) return false;
+                           var bop = BinOp(asg.Op.Type);
+                           if ((int)bop == -1) return false;
+                           c.Emit(bop);
+                           if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                           else c.Emit(OpCode.StoreName, 0, v.Name);
+                           return true;
                        }
 
                        // property target
@@ -4082,19 +4151,37 @@ namespace MiniDynLang
                                c.Emit(OpCode.StoreProp, 0, p.Name);            // -> rhs
                                return true;
                            }
-                           else
+
+                           if (asg.Op.Type == TokenType.NullishAssign)
                            {
+                               // T; dup; getprop -> T cur; dup; if not nil => pop T and keep cur
                                if (!TryEmitExpr(p.Target, c)) return false;    // T
-                               c.Emit(OpCode.Dup);                              // T, T
-                               c.Emit(OpCode.GetProp, 0, p.Name);              // T, cur
-                               if (!TryEmitExpr(asg.Value, c)) return false;   // T, cur, rhs
-                               var bop = BinOp(asg.Op.Type);
-                               if ((int)bop == -1) return false;
-                               c.Emit(bop);                                     // T, new
-                               c.Emit(OpCode.StoreProp, 0, p.Name);            // new
+                               c.Emit(OpCode.Dup);                              // T T
+                               c.Emit(OpCode.GetProp, 0, p.Name);              // T cur
+                               c.Emit(OpCode.Dup);                              // T cur cur
+                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0);     // if non-nil -> T cur
+                               c.Emit(OpCode.Pop);                              // drop nil -> T
+                               if (!TryEmitExpr(asg.Value, c)) return false;   // T rhs
+                               c.Emit(OpCode.StoreProp, 0, p.Name);            // rhs
+                               int jEnd = c.Emit(OpCode.Jump, 0);
+                               c.PatchJump(jHave, c.Code.Count);               // T cur
+                               c.Emit(OpCode.Pop);                              // cur
+                               c.PatchJump(jEnd, c.Code.Count);
                                return true;
                            }
+
+                           // Compound op
+                           if (!TryEmitExpr(p.Target, c)) return false;    // T
+                           c.Emit(OpCode.Dup);                              // T, T
+                           c.Emit(OpCode.GetProp, 0, p.Name);              // T, cur
+                           if (!TryEmitExpr(asg.Value, c)) return false;   // T, cur, rhs
+                           var bop2 = BinOp(asg.Op.Type);
+                           if ((int)bop2 == -1) return false;
+                           c.Emit(bop2);                                    // T, new
+                           c.Emit(OpCode.StoreProp, 0, p.Name);            // new
+                           return true;
                        }
+
                        // index target
                        if (asg.Target is Expr.Index ix && !ix.IsOptional)
                        {
@@ -4106,19 +4193,54 @@ namespace MiniDynLang
                                c.Emit(OpCode.StoreIndex);                          // rhs
                                return true;
                            }
-                           else
+
+                           if (asg.Op.Type == TokenType.NullishAssign)
                            {
+                               // Preserve T and I in temp locals, compute cur once, short-circuit if non-nil
+                               int tSlot = NewTempSlot();
+                               int iSlot = NewTempSlot();
+
                                if (!TryEmitExpr(ix.Target, c)) return false;       // T
-                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
-                               c.Emit(OpCode.Dup2);                                 // T, I, T, I
-                               c.Emit(OpCode.GetIndex);                             // T, I, cur
-                               if (!TryEmitExpr(asg.Value, c)) return false;        // T, I, cur, rhs
-                               var bop = BinOp(asg.Op.Type);
-                               if ((int)bop == -1) return false;
-                               c.Emit(bop);                                         // T, I, new
-                               c.Emit(OpCode.StoreIndex);                           // new
+                               c.Emit(OpCode.StoreLocal, ParamCount + tSlot);      // T
+                               c.Emit(OpCode.Pop);
+
+                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // I
+                               c.Emit(OpCode.StoreLocal, ParamCount + iSlot);      // I
+                               c.Emit(OpCode.Pop);
+
+                               // cur = t[i]
+                               c.Emit(OpCode.LoadLocal, ParamCount + tSlot);       // T
+                               c.Emit(OpCode.LoadLocal, ParamCount + iSlot);       // T, I
+                               c.Emit(OpCode.GetIndex);                            // cur
+                               c.Emit(OpCode.Dup);
+                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0);        // if non-nil -> cur
+                               c.Emit(OpCode.Pop);                                 // drop nil
+
+                               // nil path: T, I, rhs -> StoreIndex
+                               c.Emit(OpCode.LoadLocal, ParamCount + tSlot);       // T
+                               c.Emit(OpCode.LoadLocal, ParamCount + iSlot);       // T, I
+                               if (!TryEmitExpr(asg.Value, c)) return false;       // T, I, rhs
+                               c.Emit(OpCode.StoreIndex);                          // rhs
+                               int jEnd = c.Emit(OpCode.Jump, 0);
+
+                               // non-nil path: leave cur
+                               c.PatchJump(jHave, c.Code.Count);                   // cur
+
+                               c.PatchJump(jEnd, c.Code.Count);
                                return true;
                            }
+
+                           // Compound op
+                           if (!TryEmitExpr(ix.Target, c)) return false;       // T
+                           if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
+                           c.Emit(OpCode.Dup2);                                 // T, I, T, I
+                           c.Emit(OpCode.GetIndex);                             // T, I, cur
+                           if (!TryEmitExpr(asg.Value, c)) return false;        // T, I, cur, rhs
+                           var bop3 = BinOp(asg.Op.Type);
+                           if ((int)bop3 == -1) return false;
+                           c.Emit(bop3);                                        // T, I, new
+                           c.Emit(OpCode.StoreIndex);                           // new
+                           return true;
                        }
 
                        // optional-chained or unsupported assignment target -> fallback
