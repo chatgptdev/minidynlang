@@ -2817,10 +2817,10 @@ namespace MiniDynLang
         public Environment(Environment enclosing = null) { Enclosing = enclosing; }
 
         // helper – is name declared in this exact env (no parents)
-        public bool HasHere(string name) => _values.ContainsKey(name);
+        public virtual bool HasHere(string name) => _values.ContainsKey(name);
 
         // helper – get only from this env (throws if TDZ)
-        public bool TryGetHere(string name, out Value v)
+        public virtual bool TryGetHere(string name, out Value v)
         {
             if (_values.TryGetValue(name, out v))
             {
@@ -2851,9 +2851,9 @@ namespace MiniDynLang
             // Note: var can be redeclared; we don't track a separate _vars set.
         }
 
-        public void DefineVar(string name, Value value) => _values[name] = value;
+        public virtual void DefineVar(string name, Value value) => _values[name] = value;
 
-        public void DefineLet(string name, Value value)
+        public virtual void DefineLet(string name, Value value)
         {
             if (HasHere(name))
                 throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
@@ -2864,7 +2864,7 @@ namespace MiniDynLang
         }
 
         // let without initializer => TDZ sentinel
-        public void DefineLetUninitialized(string name)
+        public virtual void DefineLetUninitialized(string name)
         {
             if (HasHere(name))
                 throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
@@ -2873,7 +2873,7 @@ namespace MiniDynLang
             _uninitialized.Add(name);
         }
 
-        public void DefineConst(string name, Value value)
+        public virtual void DefineConst(string name, Value value)
         {
             if (HasHere(name))
                 throw new MiniDynRuntimeError($"Cannot redeclare '{name}' in the same block scope");
@@ -2882,7 +2882,7 @@ namespace MiniDynLang
             _consts.Add(name);
         }
 
-        public void Assign(string name, Value value)
+        public virtual void Assign(string name, Value value)
         {
             if (_values.ContainsKey(name))
             {
@@ -2897,7 +2897,7 @@ namespace MiniDynLang
             throw new MiniDynRuntimeError($"Undefined variable '{name}'");
         }
 
-        public Value Get(string name)
+        public virtual Value Get(string name)
         {
             if (_values.TryGetValue(name, out var v))
             {
@@ -2909,7 +2909,7 @@ namespace MiniDynLang
             throw new MiniDynRuntimeError($"Undefined variable '{name}'");
         }
 
-        public bool TryGet(string name, out Value v)
+        public virtual bool TryGet(string name, out Value v)
         {
             if (_values.TryGetValue(name, out var local))
             {
@@ -2925,6 +2925,53 @@ namespace MiniDynLang
 
 
         public bool IsDeclaredHere(string name) => _values.ContainsKey(name) && _lets.Contains(name);
+    }
+
+    // Environment that exposes current bytecode function's params/locals (backed by the VM slots array)
+    internal sealed class LocalsBackedEnvironment : Environment
+    {
+        private readonly Value[] _slots;
+        private readonly Dictionary<string, int> _slotOf;
+
+        public LocalsBackedEnvironment(Environment enclosing, Value[] slots, Dictionary<string, int> slotOf)
+            : base(enclosing)
+        {
+            _slots = slots ?? Array.Empty<Value>();
+            _slotOf = slotOf ?? new Dictionary<string, int>(StringComparer.Ordinal);
+        }
+
+        public override Value Get(string name)
+        {
+            if (name != null && _slotOf.TryGetValue(name, out var idx))
+            {
+                if (idx >= 0 && idx < _slots.Length) return _slots[idx];
+            }
+            return base.Get(name);
+        }
+
+        public override bool TryGet(string name, out Value v)
+        {
+            if (name != null && _slotOf.TryGetValue(name, out var idx))
+            {
+                if (idx >= 0 && idx < _slots.Length)
+                {
+                    v = _slots[idx]; return true;
+                }
+            }
+            return base.TryGet(name, out v);
+        }
+
+        public override void Assign(string name, Value value)
+        {
+            if (name != null && _slotOf.TryGetValue(name, out var idx))
+            {
+                if (idx >= 0 && idx < _slots.Length)
+                {
+                    _slots[idx] = value; return;
+                }
+            }
+            base.Assign(name, value);
+        }
     }
 
     // Marks function/global scopes (nearest target for 'var')
@@ -3260,7 +3307,10 @@ namespace MiniDynLang
         // literals
         NewArray,        // push Value.Array(new ArrayValue())
         ArrayAppend,     // stack: ..., array, value -> append; push array back
-        NewObject        // push Value.Object(new ObjectValue())
+        NewObject,       // push Value.Object(new ObjectValue())
+
+        // functions
+        MakeFunction     // O = FunctionProto; push Value.Function
     }
 
     internal sealed class Instruction
@@ -3279,6 +3329,10 @@ namespace MiniDynLang
     {
         public readonly List<Instruction> Code = new List<Instruction>(64);
         public readonly List<Value> Constants = new List<Value>(32);
+
+        // Metadata for closures: parameter and local names
+        public List<string> ParamNames = new List<string>();
+        public List<string> LocalNames = new List<string>();
 
         public int AddConst(Value v)
         {
@@ -3309,6 +3363,20 @@ namespace MiniDynLang
             }
             // No need to physically remove Noop; the VM will skip fast.
         }
+    }
+
+    // Descriptor for function literals/declarations emitted by the compiler.
+    internal sealed class FunctionProto
+    {
+        public string Name;                 // null for anonymous expressions
+        public List<Expr.Param> Params;     // parameter metadata (rest/defaults allowed for fallback)
+        public Stmt.Block Body;             // original body for fallback UserFunction
+        public bool IsArrow;
+        public SourceSpan DefSpan;
+
+        // Compiled form (if available); null => fallback to UserFunction at runtime
+        public Chunk CompiledChunk;
+        public int LocalCount;
     }
 
     internal sealed class BytecodeVM
@@ -3635,6 +3703,68 @@ namespace MiniDynLang
                     case OpCode.NewObject:
                         Push(Value.Object(new ObjectValue()));
                         break;
+
+                    case OpCode.MakeFunction:
+                        {
+                            var proto = (FunctionProto)ins.O;
+                            var kind = proto.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+                            Value? capturedThis = null;
+                            // Build a closure environment that exposes current params+locals to nested functions.
+                            // Map: param names [0..P-1], local names [P..P+L-1].
+                            var nameToSlot = new Dictionary<string, int>(StringComparer.Ordinal);
+                            int paramCount = chunk.ParamNames?.Count ?? 0;
+                            for (int i = 0; i < paramCount; i++)
+                            {
+                                var n = chunk.ParamNames[i];
+                                if (!string.IsNullOrEmpty(n)) nameToSlot[n] = i;
+                            }
+                            if (chunk.LocalNames != null)
+                            {
+                                for (int i = 0; i < chunk.LocalNames.Count; i++)
+                                {
+                                    var n = chunk.LocalNames[i];
+                                    if (!string.IsNullOrEmpty(n)) nameToSlot[n] = paramCount + i;
+                                }
+                            }
+                            var closureEnv = new LocalsBackedEnvironment(env, locals ?? Array.Empty<Value>(), nameToSlot);
+                            if (proto.IsArrow)
+                            {
+                                Value t;
+                                if (closureEnv.TryGet("this", out t)) capturedThis = t;
+                            }
+
+                            ICallable fn;
+                            if (proto.CompiledChunk != null)
+                            {
+                                // Instantiate bytecode function with current env as closure
+                                fn = new BytecodeFunction(
+                                    proto.Name,
+                                    proto.Params,
+                                    closureEnv,
+                                    proto.CompiledChunk,
+                                    _interp,
+                                    kind,
+                                    capturedThis,
+                                    null,
+                                    proto.LocalCount
+                                );
+                            }
+                            else
+                            {
+                                // Fallback to AST-based user function
+                                fn = new UserFunction(
+                                    proto.Name,
+                                    proto.Params,
+                                    proto.Body,
+                                    closureEnv,
+                                    kind,
+                                    capturedThis,
+                                    proto.DefSpan
+                                );
+                            }
+                            Push(Value.Function(fn));
+                            break;
+                        }
                     case OpCode.Return:
                         return Pop();
 
@@ -3836,6 +3966,9 @@ namespace MiniDynLang
                 var chunk = new Chunk();
                 if (!TryEmitExpr(expr, chunk)) return false;
                 chunk.Emit(OpCode.Return);
+                // Populate metadata for closures
+                chunk.ParamNames = fn.Parameters.Select(p => p.Name).ToList();
+                chunk.LocalNames = BuildLocalNamesList();
                 chunk.Peephole();
 
                 var kind = fn.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
@@ -3869,6 +4002,9 @@ namespace MiniDynLang
             int nilIdx = chunk2.AddConst(Value.Nil());
             chunk2.Emit(OpCode.LoadConst, nilIdx);
             chunk2.Emit(OpCode.Return);
+            // Populate metadata for closures
+            chunk2.ParamNames = fn.Parameters.Select(p => p.Name).ToList();
+            chunk2.LocalNames = BuildLocalNamesList();
             chunk2.Peephole();
 
             var kind2 = fn.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
@@ -3883,8 +4019,92 @@ namespace MiniDynLang
             bc = new BytecodeFunction(null, fn.Parameters, _interp.CurrentEnv, chunk2, _interp, kind2, capturedThis2, null, _localCount);
             return true;
         }
-        
-        // NEW: statement emitter for a supported subset
+
+        // Build a proto for a nested function: try to compile to chunk; otherwise keep AST for fallback.
+        private FunctionProto BuildFunctionProto(Expr.Function fn, string name)
+        {
+            var proto = new FunctionProto
+            {
+                Name = name,
+                Params = fn.Parameters,
+                Body = fn.Body,
+                IsArrow = fn.IsArrow,
+                DefSpan = fn.Span
+            };
+
+            // Use a fresh compiler to avoid clobbering current locals/params state
+            var childCompiler = new BytecodeCompiler(_interp);
+            if (childCompiler.TryCompileFunctionToChunk(fn, out var childChunk, out var localCount))
+            {
+                proto.CompiledChunk = childChunk;
+                proto.LocalCount = localCount;
+            }
+            // else leave compiled members null -> VM will fallback to UserFunction
+            return proto;
+        }
+
+        // Internal: try compiling a function into a chunk (no instantiation), for nested MakeFunction.
+        private bool TryCompileFunctionToChunk(Expr.Function fn, out Chunk chunk, out int localCount)
+        {
+            chunk = null;
+            localCount = 0;
+
+            // Do not support defaults/rest in bytecode subset
+            if (fn.Parameters.Any(p => p.Default != null || p.IsRest)) return false;
+
+            // Fast single-expression return
+            if (TryExtractReturnExpr(fn.Body, out var rexpr))
+            {
+                if (ContainsCallExpr(rexpr)) return false;
+                _paramIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+                for (int i = 0; i < fn.Parameters.Count; i++) _paramIndex[fn.Parameters[i].Name] = i;
+                _localsIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+                _localCount = 0;
+
+                var c = new Chunk();
+                if (!TryEmitExpr(rexpr, c)) return false;
+                c.Emit(OpCode.Return);
+                c.ParamNames = fn.Parameters.Select(p => p.Name).ToList();
+                c.LocalNames = BuildLocalNamesList();
+                c.Peephole();
+                chunk = c;
+                localCount = _localCount;
+                return true;
+            }
+
+            // Statement-bodied subset
+            _paramIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < fn.Parameters.Count; i++) _paramIndex[fn.Parameters[i].Name] = i;
+            _localsIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            _localCount = 0;
+
+            var c2 = new Chunk();
+            foreach (var st in fn.Body.Statements)
+            {
+                if (!TryEmitStmt(st, c2)) return false;
+            }
+            int nilIdx = c2.AddConst(Value.Nil());
+            c2.Emit(OpCode.LoadConst, nilIdx);
+            c2.Emit(OpCode.Return);
+            c2.ParamNames = fn.Parameters.Select(p => p.Name).ToList();
+            c2.LocalNames = BuildLocalNamesList();
+            c2.Peephole();
+
+            chunk = c2;
+            localCount = _localCount;
+            return true;
+        }
+
+        // Build local names list indexed by local slot (0.._localCount-1)
+        private List<string> BuildLocalNamesList()
+        {
+            var arr = new string[_localCount];
+            foreach (var kv in _localsIndex)
+                arr[kv.Value] = kv.Key;
+            return arr.ToList();
+        }
+
+        // statement emitter for a supported subset
         private bool TryEmitStmt(Stmt s, Chunk c)
         {
             switch (s)
@@ -3978,31 +4198,31 @@ namespace MiniDynLang
                         c.PatchJump(jend, c.Code.Count);
                         return true;
                     }
-               case Stmt.While w:
-                   {
-                       // loopStart:
-                       var ctx = new LoopContext();
-                       ctx.LoopStartIp = c.Code.Count;
-                       _loopStack.Push(ctx);
+                case Stmt.While w:
+                    {
+                        // loopStart:
+                        var ctx = new LoopContext();
+                        ctx.LoopStartIp = c.Code.Count;
+                        _loopStack.Push(ctx);
 
-                       // condition
-                       if (!TryEmitExpr(w.Condition, c)) { _loopStack.Pop(); return false; }
-                       int jf = c.Emit(OpCode.JumpIfFalse, 0);
+                        // condition
+                        if (!TryEmitExpr(w.Condition, c)) { _loopStack.Pop(); return false; }
+                        int jf = c.Emit(OpCode.JumpIfFalse, 0);
 
-                       // body
-                       if (!TryEmitStmt(w.Body, c)) { _loopStack.Pop(); return false; }
+                        // body
+                        if (!TryEmitStmt(w.Body, c)) { _loopStack.Pop(); return false; }
 
-                       // continue patches jump to loopStart
-                       foreach (var jp in ctx.ContinueJumps) c.PatchJump(jp, ctx.LoopStartIp);
+                        // continue patches jump to loopStart
+                        foreach (var jp in ctx.ContinueJumps) c.PatchJump(jp, ctx.LoopStartIp);
 
-                       c.Emit(OpCode.Jump, ctx.LoopStartIp);
-                       int exitIp = c.Code.Count;
-                       c.PatchJump(jf, exitIp);
-                       // break patches jump to exit
-                       foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
-                       _loopStack.Pop();
-                       return true;
-                   }
+                        c.Emit(OpCode.Jump, ctx.LoopStartIp);
+                        int exitIp = c.Code.Count;
+                        c.PatchJump(jf, exitIp);
+                        // break patches jump to exit
+                        foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
+                        _loopStack.Pop();
+                        return true;
+                    }
 
                 case Stmt.ForClassic fc:
                     {
@@ -4051,22 +4271,32 @@ namespace MiniDynLang
                         _loopStack.Pop();
                         return true;
                     }
-               case Stmt.Break _:
-                   {
-                       if (_loopStack.Count == 0) return false;
-                       var ctx = _loopStack.Peek();
-                       int j = c.Emit(OpCode.Jump, 0);
-                       ctx.BreakJumps.Add(j);
-                       return true;
-                   }
-               case Stmt.Continue _:
-                   {
-                       if (_loopStack.Count == 0) return false;
-                       var ctx = _loopStack.Peek();
-                       int j = c.Emit(OpCode.Jump, 0);
-                       ctx.ContinueJumps.Add(j);
-                       return true;
-                   }
+                case Stmt.Break _:
+                    {
+                        if (_loopStack.Count == 0) return false;
+                        var ctx = _loopStack.Peek();
+                        int j = c.Emit(OpCode.Jump, 0);
+                        ctx.BreakJumps.Add(j);
+                        return true;
+                    }
+                case Stmt.Continue _:
+                    {
+                        if (_loopStack.Count == 0) return false;
+                        var ctx = _loopStack.Peek();
+                        int j = c.Emit(OpCode.Jump, 0);
+                        ctx.ContinueJumps.Add(j);
+                        return true;
+                    }
+
+                case Stmt.Function fdecl:
+                    {
+                        // Treat like 'var name = <function>' within the compiled function's locals
+                        int slot = EnsureLocal(fdecl.Name);
+                        var proto = BuildFunctionProto(fdecl.FuncExpr, fdecl.Name);
+                        c.Emit(OpCode.MakeFunction, 0, proto);
+                        c.Emit(OpCode.StoreLocal, ParamCount + slot);
+                        return true;
+                    }
 
                 default:
                     return false;
@@ -4386,7 +4616,7 @@ namespace MiniDynLang
                         return true;
                     }
 
-                // NEW: property with optional chaining
+                // property with optional chaining
                 case Expr.Property prop:
                     {
                         if (prop.IsOptional)
@@ -4410,7 +4640,7 @@ namespace MiniDynLang
                         return true;
                     }
 
-                // NEW: index access (with optional chain)
+                // index access (with optional chain)
                 case Expr.Index idx:
                     {
                         if (!TryEmitExpr(idx.Target, c)) return false;
@@ -4551,6 +4781,14 @@ namespace MiniDynLang
                         }
                         return true;
                     }
+
+                case Expr.Function fnExpr:
+                    {
+                        var proto = BuildFunctionProto(fnExpr, null);
+                        c.Emit(OpCode.MakeFunction, 0, proto);
+                        return true;
+                    }
+
                 default:
                     return false;
             }
@@ -4582,7 +4820,7 @@ namespace MiniDynLang
             return false;
         }
 
-        // NEW: conservative detector for any call within an expression
+        // conservative detector for any call within an expression
         private static bool ContainsCallExpr(Expr e)
         {
             if (e == null) return false;
