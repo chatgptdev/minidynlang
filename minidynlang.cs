@@ -3303,14 +3303,20 @@ namespace MiniDynLang
         StoreLocal,      // A = local slot index (pop value, store, push back)
         GetIndex,        // stack: ..., target, index -> pops both, pushes value (nil if missing)
         StoreIndex,       // stack: ..., target, index, value -> store, push value
-       
+
         // literals
         NewArray,        // push Value.Array(new ArrayValue())
         ArrayAppend,     // stack: ..., array, value -> append; push array back
         NewObject,       // push Value.Object(new ObjectValue())
 
         // functions
-        MakeFunction     // O = FunctionProto; push Value.Function
+        MakeFunction,    // O = FunctionProto; push Value.Function
+
+        // === exceptions / try-catch-finally ===
+        TryEnter,        // A = catchIp (or -1), O = (int)finallyIp (or -1)
+        TryLeave,        // pop current try frame; if a completion is pending, resume unwinding
+        Throw,           // pop value and start unwinding through catch/finally
+        EndFinally       // marker inside finally; logic handled by TryLeave
     }
 
     internal sealed class Instruction
@@ -3334,6 +3340,16 @@ namespace MiniDynLang
         public List<string> ParamNames = new List<string>();
         public List<string> LocalNames = new List<string>();
 
+        // Exception table metadata (not required for VM execution, but useful for tooling)
+        public sealed class ExceptionRegion
+        {
+            public int TryStartIp;
+            public int TryEndIp;
+            public int CatchIp;   // -1 if none
+            public int FinallyIp; // -1 if none
+        }
+        public readonly List<ExceptionRegion> ExceptionTable = new List<ExceptionRegion>();
+
         public int AddConst(Value v)
         {
             int idx = Constants.Count;
@@ -3349,7 +3365,14 @@ namespace MiniDynLang
 
         public void PatchJump(int at, int targetIp)
         {
-                Code[at].A = targetIp;
+            Code[at].A = targetIp;
+        }
+
+        // Helper to patch TryEnter operands post-emit
+        public void PatchTryEnter(int at, int catchIp, int finallyIp)
+        {
+            Code[at].A = catchIp;
+            Code[at].O = finallyIp;
         }
 
         // trivial peephole: remove Jump to next, collapse Noop
@@ -3379,6 +3402,15 @@ namespace MiniDynLang
         public int LocalCount;
     }
 
+    // === exception/try state ===
+    enum RegionState { InTry, InCatch, InFinally }
+    struct TryFrame
+    {
+        public int CatchIp;
+        public int FinallyIp;
+        public RegionState State;
+    }
+    enum PendingKind { None, Throw, Return, ThrowRuntime }
     internal sealed class BytecodeVM
     {
         private readonly Interpreter _interp;
@@ -3388,6 +3420,11 @@ namespace MiniDynLang
         {
             var stack = new List<Value>(16);
             int ip = 0;
+
+            var tryStack = new Stack<TryFrame>();
+            PendingKind pending = PendingKind.None;
+            Value pendingValue = Value.Nil();
+            MiniDynRuntimeError pendingRuntime = null;
 
             Value Pop()
             {
@@ -3399,339 +3436,412 @@ namespace MiniDynLang
             void Push(Value v) => stack.Add(v);
             bool Truthy(Value v) => Value.IsTruthy(v);
 
-            while (ip < chunk.Code.Count)
+            // Core unwinding routine: returns true if a handler/finally was found and ip updated.
+            bool Unwind(bool acceptCatch)
             {
-                var ins = chunk.Code[ip++];
-                switch (ins.Op)
+                while (tryStack.Count > 0)
                 {
-                    case OpCode.Noop: break;
+                    var fr = tryStack.Pop(); // examine this frame
+                    // Re-push it if we’re going to run its handler/finally
+                    if (acceptCatch && fr.State == RegionState.InTry && fr.CatchIp >= 0)
+                    {
+                        fr.State = RegionState.InCatch;
+                        tryStack.Push(fr);
+                        // Deliver thrown value to catch landing via stack
+                        if (pending == PendingKind.ThrowRuntime)
+                        {
+                            var errVal = _interp.MakeError("RuntimeError", pendingRuntime.Message, pendingRuntime);
+                            Push(errVal);
+                            pendingRuntime = null;
+                            pending = PendingKind.None;
+                        }
+                        else
+                        {
+                            Push(pendingValue);
+                            // Pending Throw is considered handled by catch
+                            pending = PendingKind.None;
+                        }
+                        ip = fr.CatchIp;
+                        return true;
+                    }
 
-                    case OpCode.LoadConst:
-                        Push(chunk.Constants[ins.A]); break;
+                    if (fr.FinallyIp >= 0)
+                    {
+                        fr.State = RegionState.InFinally;
+                        tryStack.Push(fr);
+                        // For both throw and return we run finally; pending stays set
+                        ip = fr.FinallyIp;
+                        return true;
+                    }
 
-                    case OpCode.LoadName:
-                        Push(env.Get((string)ins.O)); break;
+                    // No handlers in this frame; continue to next outer frame
+                    // (frame already popped)
+                }
 
-                    case OpCode.StoreName:
-                        {
-                            var v = Pop();
-                            env.Assign((string)ins.O, v);
-                            Push(v);
-                            break;
-                        }
+                // Nothing left
+                return false;
+            }
 
-                    case OpCode.Pop:
-                        Pop(); break;
+            // On each iteration, if a pending completion should finish, do it now.
+            void MaybeComplete()
+            {
+                if (pending == PendingKind.Return && tryStack.Count == 0)
+                {
+                    // No more finally frames to run -> return the value
+                    throw new Interpreter.ReturnSignal(pendingValue);
+                }
+                if (pending == PendingKind.Throw && tryStack.Count == 0)
+                {
+                    // No handler -> bubble to interpreter
+                    throw new Interpreter.ThrowSignal(pendingValue);
+                }
+                if (pending == PendingKind.ThrowRuntime && tryStack.Count == 0)
+                {
+                    // No catch anywhere -> rethrow original runtime error
+                    throw pendingRuntime;
+                }
+            }
 
-                    case OpCode.LoadParam:
-                        {
-                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
-                                throw new MiniDynRuntimeError("Invalid parameter access");
-                           Push(locals[ins.A]);
-                           break;
-                       }
-                    // locals
-                    case OpCode.LoadLocal:
-                        {
-                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
-                                throw new MiniDynRuntimeError("Invalid local access");
-                            Push(locals[ins.A]);
-                            break;
-                        }
-                    case OpCode.StoreLocal:
-                        {
-                            if (locals == null || ins.A < 0 || ins.A >= locals.Length)
-                                throw new MiniDynRuntimeError("Invalid local access");
-                            var v = Pop();
-                            locals[ins.A] = v;
-                            Push(v);
-                            break;
-                        }
-                    case OpCode.Neg:
-                        {
-                            var r = Pop();
-                            Push(Value.Number(NumberValue.Neg(ToNum(r))));
-                            break;
-                        }
-                    case OpCode.Not:
-                        {
-                            var r = Pop();
-                            Push(Value.Boolean(!Truthy(r)));
-                            break;
-                        }
+            try
+            {
+                while (ip < chunk.Code.Count)
+                {
+                    // Pending completions finalize once we’ve unwound out of all frames
+                    MaybeComplete();
 
-                    case OpCode.Add:
+                    var ins = chunk.Code[ip++];
+                    try
+                    {
+                        switch (ins.Op)
                         {
-                            var b = Pop(); var a = Pop();
-                            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
-                                Push(Value.Number(NumberValue.Add(a.AsNumber(), b.AsNumber())));
-                            else if (a.Type == ValueType.String || b.Type == ValueType.String)
-                                Push(Value.String(_interp.ToStringValue(a) + _interp.ToStringValue(b)));
-                            else if (a.Type == ValueType.Array && b.Type == ValueType.Array)
-                            {
-                                var la = a.AsArray(); var rb = b.AsArray();
-                                var res = new ArrayValue();
-                                res.Items.AddRange(la.Items);
-                                res.Items.AddRange(rb.Items);
-                                Push(Value.Array(res));
-                            }
-                            else throw new MiniDynRuntimeError("Invalid '+' operands");
-                            break;
-                        }
-                    case OpCode.Sub:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Number(NumberValue.Sub(ToNum(a), ToNum(b))));
-                            break;
-                        }
-                    case OpCode.Mul:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Number(NumberValue.Mul(ToNum(a), ToNum(b))));
-                            break;
-                        }
-                    case OpCode.Div:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Number(NumberValue.Div(ToNum(a), ToNum(b))));
-                            break;
-                        }
-                    case OpCode.Mod:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Number(NumberValue.Mod(ToNum(a), ToNum(b))));
-                            break;
-                        }
+                            case OpCode.Noop: break;
 
-                    case OpCode.CmpEq:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Boolean(CompareEq(a, b)));
-                            break;
-                        }
-                    case OpCode.CmpNe:
-                        {
-                            var b = Pop(); var a = Pop();
-                            Push(Value.Boolean(!CompareEq(a, b)));
-                            break;
-                        }
-                    case OpCode.CmpLt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<"))); break; }
-                    case OpCode.CmpLe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<="))); break; }
-                    case OpCode.CmpGt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">"))); break; }
-                    case OpCode.CmpGe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">="))); break; }
+                            case OpCode.LoadConst:
+                                Push(chunk.Constants[ins.A]); break;
 
-                    case OpCode.Dup:
-                        {
-                            var v = stack[stack.Count - 1];
-                            Push(v); break;
-                        }
-                    case OpCode.Dup2:
-                        {
-                            if (stack.Count < 2) throw new MiniDynRuntimeError("VM stack underflow");
-                            var b = stack[stack.Count - 1];
-                            var a = stack[stack.Count - 2];
-                            Push(a);
-                            Push(b);
-                            break;
-                       }
-                    case OpCode.Jump:
-                        ip = ins.A; break;
+                            case OpCode.LoadName:
+                                Push(env.Get((string)ins.O)); break;
 
-                    case OpCode.JumpIfFalse:
-                        {
-                            var c = Pop();
-                            if (!Truthy(c)) ip = ins.A;
-                            break;
-                        }
+                            case OpCode.StoreName:
+                                {
+                                    var v = Pop();
+                                    env.Assign((string)ins.O, v);
+                                    Push(v);
+                                    break;
+                                }
 
-                    case OpCode.JumpIfTruthy:
-                        {
-                            var c = Pop();
-                            if (Truthy(c)) ip = ins.A;
-                            break;
-                        }
+                            case OpCode.Pop:
+                                Pop(); break;
 
-                    case OpCode.JumpIfNotNil:
-                        {
-                            var v = Pop();
-                            if (v.Type != ValueType.Nil) ip = ins.A;
-                            else Push(v); // keep nil for right-side consumer if needed
-                            break;
-                        }
+                            case OpCode.LoadParam:
+                                {
+                                    if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                        throw new MiniDynRuntimeError("Invalid parameter access");
+                                    Push(locals[ins.A]);
+                                    break;
+                                }
+                            // locals
+                            case OpCode.LoadLocal:
+                                {
+                                    if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                        throw new MiniDynRuntimeError("Invalid local access");
+                                    Push(locals[ins.A]);
+                                    break;
+                                }
+                            case OpCode.StoreLocal:
+                                {
+                                    if (locals == null || ins.A < 0 || ins.A >= locals.Length)
+                                        throw new MiniDynRuntimeError("Invalid local access");
+                                    var v = Pop();
+                                    locals[ins.A] = v;
+                                    Push(v);
+                                    break;
+                                }
+                            case OpCode.Neg:
+                                {
+                                    var r = Pop();
+                                    Push(Value.Number(NumberValue.Neg(ToNum(r))));
+                                    break;
+                                }
+                            case OpCode.Not:
+                                {
+                                    var r = Pop();
+                                    Push(Value.Boolean(!Truthy(r)));
+                                    break;
+                                }
 
-                    case OpCode.GetProp:
-                        {
-                            var target = Pop();
-                            if (target.Type != ValueType.Object)
-                                throw new MiniDynRuntimeError("Property access target must be object");
-                            var obj = target.AsObject();
-                            if (obj.TryGet((string)ins.O, out var vv)) Push(vv);
-                            else Push(Value.Nil());
-                            break;
-                       }
-                   case OpCode.StoreProp:
-                       {
-                           var value = Pop();
-                           var target = Pop();
-                           if (target.Type != ValueType.Object)
-                               throw new MiniDynRuntimeError("Property assignment target must be object");
-                           var obj = target.AsObject();
-                           obj.Set((string)ins.O, value);
-                           Push(value);
-                           break;
-                       }
+                            case OpCode.Add:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+                                        Push(Value.Number(NumberValue.Add(a.AsNumber(), b.AsNumber())));
+                                    else if (a.Type == ValueType.String || b.Type == ValueType.String)
+                                        Push(Value.String(_interp.ToStringValue(a) + _interp.ToStringValue(b)));
+                                    else if (a.Type == ValueType.Array && b.Type == ValueType.Array)
+                                    {
+                                        var la = a.AsArray(); var rb = b.AsArray();
+                                        var res = new ArrayValue();
+                                        res.Items.AddRange(la.Items);
+                                        res.Items.AddRange(rb.Items);
+                                        Push(Value.Array(res));
+                                    }
+                                    else throw new MiniDynRuntimeError("Invalid '+' operands");
+                                    break;
+                                }
+                            case OpCode.Sub:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Number(NumberValue.Sub(ToNum(a), ToNum(b))));
+                                    break;
+                                }
+                            case OpCode.Mul:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Number(NumberValue.Mul(ToNum(a), ToNum(b))));
+                                    break;
+                                }
+                            case OpCode.Div:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Number(NumberValue.Div(ToNum(a), ToNum(b))));
+                                    break;
+                                }
+                            case OpCode.Mod:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Number(NumberValue.Mod(ToNum(a), ToNum(b))));
+                                    break;
+                                }
+
+                            case OpCode.CmpEq:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Boolean(CompareEq(a, b)));
+                                    break;
+                                }
+                            case OpCode.CmpNe:
+                                {
+                                    var b = Pop(); var a = Pop();
+                                    Push(Value.Boolean(!CompareEq(a, b)));
+                                    break;
+                                }
+                            case OpCode.CmpLt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<"))); break; }
+                            case OpCode.CmpLe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<="))); break; }
+                            case OpCode.CmpGt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">"))); break; }
+                            case OpCode.CmpGe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">="))); break; }
+
+                            case OpCode.Dup:
+                                {
+                                    var v = stack[stack.Count - 1];
+                                    Push(v); break;
+                                }
+                            case OpCode.Dup2:
+                                {
+                                    if (stack.Count < 2) throw new MiniDynRuntimeError("VM stack underflow");
+                                    var b = stack[stack.Count - 1];
+                                    var a = stack[stack.Count - 2];
+                                    Push(a);
+                                    Push(b);
+                                    break;
+                                }
+                            case OpCode.Jump:
+                                ip = ins.A; break;
+
+                            case OpCode.JumpIfFalse:
+                                {
+                                    var cnd = Pop();
+                                    if (!Truthy(cnd)) ip = ins.A;
+                                    break;
+                                }
+
+                            case OpCode.JumpIfTruthy:
+                                {
+                                    var cnd = Pop();
+                                    if (Truthy(cnd)) ip = ins.A;
+                                    break;
+                                }
+
+                            case OpCode.JumpIfNotNil:
+                                {
+                                    var v = Pop();
+                                    if (v.Type != ValueType.Nil) ip = ins.A;
+                                    else Push(v);
+                                    break;
+                                }
+
+                            case OpCode.GetProp:
+                                {
+                                    var target = Pop();
+                                    if (target.Type != ValueType.Object)
+                                        throw new MiniDynRuntimeError("Property access target must be object");
+                                    var obj = target.AsObject();
+                                    if (obj.TryGet((string)ins.O, out var vv)) Push(vv);
+                                    else Push(Value.Nil());
+                                    break;
+                                }
+                            case OpCode.StoreProp:
+                                {
+                                    var value = Pop();
+                                    var target = Pop();
+                                    if (target.Type != ValueType.Object)
+                                        throw new MiniDynRuntimeError("Property assignment target must be object");
+                                    var obj = target.AsObject();
+                                    obj.Set((string)ins.O, value);
+                                    Push(value);
+                                    break;
+                                }
                     // index access
-                   case OpCode.GetIndex:
-                        {
-                            var index = Pop();
-                            var target = Pop();
-                            if (target.Type == ValueType.Array)
-                            {
-                                var arr = target.AsArray();
-                                int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                                idx = NormalizeIndex(idx, arr.Length);
-                                if (idx < 0 || idx >= arr.Length)
-                                    throw new MiniDynRuntimeError("Array index out of range");
-                                Push(arr[idx]);
-                            }
-                            else if (target.Type == ValueType.String)
-                            {
-                                var s = target.AsString();
-                                int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                                idx = NormalizeIndex(idx, s.Length);
-                                if (idx < 0 || idx >= s.Length)
-                                    throw new MiniDynRuntimeError("String index out of range");
-                                Push(Value.String(s[idx].ToString()));
-                            }
-                            else if (target.Type == ValueType.Object)
-                            {
-                                var key = _interp.ToStringValue(index);
-                                var obj = target.AsObject();
-                                if (obj.TryGet(key, out var vv)) Push(vv);
-                                else Push(Value.Nil());
-                            }
-                            else
-                            {
-                                throw new MiniDynRuntimeError("Indexing supported only on arrays, strings, or objects");
-                            }
-                            break;
-                        }
-                    case OpCode.StoreIndex:
-                       {
-                           var value = Pop();
-                           var index = Pop();
-                           var target = Pop();
-                           if (target.Type == ValueType.Array)
-                           {
-                               var arr = target.AsArray();
-                               int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                               idx = NormalizeIndex(idx, arr.Length);
-                               if (idx < 0 || idx >= arr.Length)
-                                   throw new MiniDynRuntimeError("Array index out of range");
-                               arr[idx] = value;
-                               Push(value);
-                               break;
-                           }
-                           else if (target.Type == ValueType.Object)
-                           {
-                               var key = _interp.ToStringValue(index);
-                               var obj = target.AsObject();
-                               obj.Set(key, value);
-                               Push(value);
-                               break;
-                           }
-                           else if (target.Type == ValueType.String)
-                           {
-                               throw new MiniDynRuntimeError("Cannot assign into string by index");
-                           }
-                           throw new MiniDynRuntimeError("Index assignment target must be array or object");
-                       }
+                            case OpCode.GetIndex:
+                                {
+                                    var index = Pop();
+                                    var target = Pop();
+                                    if (target.Type == ValueType.Array)
+                                    {
+                                        var arr = target.AsArray();
+                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                                        idx = NormalizeIndex(idx, arr.Length);
+                                        if (idx < 0 || idx >= arr.Length)
+                                            throw new MiniDynRuntimeError("Array index out of range");
+                                        Push(arr[idx]);
+                                    }
+                                    else if (target.Type == ValueType.String)
+                                    {
+                                        var s = target.AsString();
+                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                                        idx = NormalizeIndex(idx, s.Length);
+                                        if (idx < 0 || idx >= s.Length)
+                                            throw new MiniDynRuntimeError("String index out of range");
+                                        Push(Value.String(s[idx].ToString()));
+                                    }
+                                    else if (target.Type == ValueType.Object)
+                                    {
+                                        var key = _interp.ToStringValue(index);
+                                        var obj = target.AsObject();
+                                        if (obj.TryGet(key, out var vv)) Push(vv);
+                                        else Push(Value.Nil());
+                                    }
+                                    else
+                                    {
+                                        throw new MiniDynRuntimeError("Indexing supported only on arrays, strings, or objects");
+                                    }
+                                    break;
+                                }
+                            case OpCode.StoreIndex:
+                                {
+                                    var value = Pop();
+                                    var index = Pop();
+                                    var target = Pop();
+                                    if (target.Type == ValueType.Array)
+                                    {
+                                        var arr = target.AsArray();
+                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
+                                        idx = NormalizeIndex(idx, arr.Length);
+                                        if (idx < 0 || idx >= arr.Length)
+                                            throw new MiniDynRuntimeError("Array index out of range");
+                                        arr[idx] = value;
+                                        Push(value);
+                                        break;
+                                    }
+                                    else if (target.Type == ValueType.Object)
+                                    {
+                                        var key = _interp.ToStringValue(index);
+                                        var obj = target.AsObject();
+                                        obj.Set(key, value);
+                                        Push(value);
+                                        break;
+                                    }
+                                    else if (target.Type == ValueType.String)
+                                    {
+                                        throw new MiniDynRuntimeError("Cannot assign into string by index");
+                                    }
+                                    throw new MiniDynRuntimeError("Index assignment target must be array or object");
+                                }
 
-                   case OpCode.Call:
-                       {
-                           int argc = ins.A;
-                           var args = new List<Value>(argc);
-                           for (int k = 0; k < argc; k++) args.Add(Pop());
-                           args.Reverse();
-                           var callee = Pop();
-                           if (callee.Type != ValueType.Function)
-                               throw new MiniDynRuntimeError("Can only call functions");
-                           var fn = callee.AsFunction();
-                           var res = fn.Call(_interp, args);
-                          Push(res);
-                           break;
-                       }
+                            case OpCode.Call:
+                                {
+                                    int argc = ins.A;
+                                    var args = new List<Value>(argc);
+                                    for (int k = 0; k < argc; k++) args.Add(Pop());
+                                    args.Reverse();
+                                    var callee = Pop();
+                                    if (callee.Type != ValueType.Function)
+                                        throw new MiniDynRuntimeError("Can only call functions");
+                                    var fn = callee.AsFunction();
+                                    var res = fn.Call(_interp, args);
+                                    Push(res);
+                                    break;
+                                }
 
-                    case OpCode.CallMethod:
-                       {
-                           int argc = ins.A;
-                           var args = new List<Value>(argc);
-                          for (int k = 0; k < argc; k++) args.Add(Pop());
-                           args.Reverse();
-                           var callee = Pop();
-                           var receiver = Pop();
-                           if (callee.Type != ValueType.Function)
-                               throw new MiniDynRuntimeError("Can only call functions");
-                          var fn = callee.AsFunction();
-                           // Bind receiver for normal user functions
-                          if (fn is UserFunction uf && uf.FunctionKind == UserFunction.Kind.Normal)
-                               fn = uf.BindThis(receiver);
-                          else if (fn is BytecodeFunction bf && bf.FunctionKind == UserFunction.Kind.Normal)
-                               fn = bf.BindThis(receiver);
-                           var res = fn.Call(_interp, args);
-                           Push(res);
-                           break;
-                       }
+                            case OpCode.CallMethod:
+                                {
+                                    int argc = ins.A;
+                                    var args = new List<Value>(argc);
+                                    for (int k = 0; k < argc; k++) args.Add(Pop());
+                                    args.Reverse();
+                                    var callee = Pop();
+                                    var receiver = Pop();
+                                    if (callee.Type != ValueType.Function)
+                                        throw new MiniDynRuntimeError("Can only call functions");
+                                    var fn = callee.AsFunction();
+                                    // Bind receiver for normal user functions
+                                    if (fn is UserFunction uf && uf.FunctionKind == UserFunction.Kind.Normal)
+                                        fn = uf.BindThis(receiver);
+                                    else if (fn is BytecodeFunction bf && bf.FunctionKind == UserFunction.Kind.Normal)
+                                        fn = bf.BindThis(receiver);
+                                    var res = fn.Call(_interp, args);
+                                    Push(res);
+                                    break;
+                                }
 
-                    // literals
-                    case OpCode.NewArray:
-                        Push(Value.Array(new ArrayValue()));
-                        break;
+                            // literals
+                            case OpCode.NewArray:
+                                Push(Value.Array(new ArrayValue()));
+                                break;
 
-                    case OpCode.ArrayAppend:
-                        {
-                            var val = Pop();
-                            var arrVal = Pop();
-                            if (arrVal.Type != ValueType.Array)
-                                throw new MiniDynRuntimeError("Array append target must be array");
-                            arrVal.AsArray().Items.Add(val);
-                            // keep building: push array back
-                            Push(arrVal);
-                            break;
-                        }
+                            case OpCode.ArrayAppend:
+                                {
+                                    var val = Pop();
+                                    var arrVal = Pop();
+                                    if (arrVal.Type != ValueType.Array)
+                                        throw new MiniDynRuntimeError("Array append target must be array");
+                                    arrVal.AsArray().Items.Add(val);
+                                    // keep building: push array back
+                                    Push(arrVal);
+                                    break;
+                                }
 
-                    case OpCode.NewObject:
-                        Push(Value.Object(new ObjectValue()));
-                        break;
+                            case OpCode.NewObject:
+                                Push(Value.Object(new ObjectValue()));
+                                break;
 
-                    case OpCode.MakeFunction:
-                        {
-                            var proto = (FunctionProto)ins.O;
-                            var kind = proto.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
-                            Value? capturedThis = null;
+                            case OpCode.MakeFunction:
+                                {
+                                    var proto = (FunctionProto)ins.O;
+                                    var kind = proto.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+                                    Value? capturedThis = null;
                             // Build a closure environment that exposes current params+locals to nested functions.
                             // Map: param names [0..P-1], local names [P..P+L-1].
-                            var nameToSlot = new Dictionary<string, int>(StringComparer.Ordinal);
-                            int paramCount = chunk.ParamNames?.Count ?? 0;
-                            for (int i = 0; i < paramCount; i++)
-                            {
-                                var n = chunk.ParamNames[i];
-                                if (!string.IsNullOrEmpty(n)) nameToSlot[n] = i;
-                            }
-                            if (chunk.LocalNames != null)
-                            {
-                                for (int i = 0; i < chunk.LocalNames.Count; i++)
-                                {
-                                    var n = chunk.LocalNames[i];
-                                    if (!string.IsNullOrEmpty(n)) nameToSlot[n] = paramCount + i;
-                                }
-                            }
-                            var closureEnv = new LocalsBackedEnvironment(env, locals ?? Array.Empty<Value>(), nameToSlot);
-                            if (proto.IsArrow)
-                            {
-                                Value t;
-                                if (closureEnv.TryGet("this", out t)) capturedThis = t;
-                            }
+                                    var nameToSlot = new Dictionary<string, int>(StringComparer.Ordinal);
+                                    int paramCount = chunk.ParamNames?.Count ?? 0;
+                                    for (int i = 0; i < paramCount; i++)
+                                    {
+                                        var n = chunk.ParamNames[i];
+                                        if (!string.IsNullOrEmpty(n)) nameToSlot[n] = i;
+                                    }
+                                    if (chunk.LocalNames != null)
+                                    {
+                                        for (int i = 0; i < chunk.LocalNames.Count; i++)
+                                        {
+                                            var n = chunk.LocalNames[i];
+                                            if (!string.IsNullOrEmpty(n)) nameToSlot[n] = paramCount + i;
+                                        }
+                                    }
+                                    var closureEnv = new LocalsBackedEnvironment(env, locals ?? Array.Empty<Value>(), nameToSlot);
+                                    if (proto.IsArrow)
+                                    {
+                                        Value t;
+                                        if (closureEnv.TryGet("this", out t)) capturedThis = t;
+                                    }
 
                             ICallable fn;
                             if (proto.CompiledChunk != null)
@@ -3753,24 +3863,112 @@ namespace MiniDynLang
                             {
                                 // Fallback to AST-based user function
                                 fn = new UserFunction(
-                                    proto.Name,
-                                    proto.Params,
-                                    proto.Body,
-                                    closureEnv,
-                                    kind,
-                                    capturedThis,
-                                    proto.DefSpan
-                                );
-                            }
-                            Push(Value.Function(fn));
-                            break;
-                        }
-                    case OpCode.Return:
-                        return Pop();
+                                            proto.Name,
+                                            proto.Params,
+                                            proto.Body,
+                                            closureEnv,
+                                            kind,
+                                            capturedThis,
+                                            proto.DefSpan
+                                        );
+                                    }
+                                    Push(Value.Function(fn));
+                                    break;
+                                }
 
-                    default:
-                        throw new MiniDynRuntimeError("Unknown opcode");
+                            // === exceptions / try-catch-finally ===
+                            case OpCode.TryEnter:
+                                {
+                                    int catchIp = ins.A;
+                                    int finallyIp = (ins.O is int fi) ? fi : -1;
+                                    tryStack.Push(new TryFrame { CatchIp = catchIp, FinallyIp = finallyIp, State = RegionState.InTry });
+                                    break;
+                                }
+                            case OpCode.EndFinally:
+                                {
+                                    // Marker; actual action happens in TryLeave
+                                    break;
+                                }
+                            case OpCode.TryLeave:
+                                {
+                                    if (tryStack.Count == 0) throw new MiniDynRuntimeError("TryLeave with empty try stack");
+                                    tryStack.Pop();
+                                    if (pending != PendingKind.None)
+                                    {
+                                        bool acceptCatch = (pending == PendingKind.Throw) || (pending == PendingKind.ThrowRuntime);
+                                        if (!Unwind(acceptCatch))
+                                        {
+                                            // Complete now outside any frame
+                                            MaybeComplete();
+                                        }
+                                    }
+                                    break;
+                                }
+                            case OpCode.Throw:
+                                {
+                                    var exVal = Pop();
+                                    pending = PendingKind.Throw;
+                                    pendingValue = exVal;
+                                    if (!Unwind(acceptCatch: true))
+                                    {
+                                        // No handler in this compiled frame
+                                        throw new Interpreter.ThrowSignal(exVal);
+                                    }
+                                    break;
+                                }
+
+                            case OpCode.Return:
+                                {
+                                    var rv = Pop();
+                                    if (tryStack.Count == 0)
+                                        return rv;
+
+                                    // Ensure finally runs before returning
+                                    pending = PendingKind.Return;
+                                    pendingValue = rv;
+                                    if (!Unwind(acceptCatch: false))
+                                    {
+                                        // No finally frames? then return now
+                                        return rv;
+                                    }
+                                    break;
+                                }
+
+                            default:
+                                throw new MiniDynRuntimeError("Unknown opcode");
+                        }
+                    }
+                    catch (Interpreter.ThrowSignal ts)
+                    {
+                        // Convert host/interpreter throw into VM-level unwinding so bytecode try/catch can handle it
+                        pending = PendingKind.Throw;
+                        pendingValue = ts.Value;
+
+                        if (!Unwind(acceptCatch: true))
+                        {
+                            // No handler in this compiled function; bubble out to caller/interpreter
+                            throw;
+                        }
+                        // Handler or finally found; loop will continue at updated ip
+                    }
+                    catch (MiniDynRuntimeError ex)
+                    {
+                        // Start unwinding as a runtime throw; only convert to Error object if a catch is found.
+                        pending = PendingKind.ThrowRuntime;
+                        pendingRuntime = ex;
+                        if (!Unwind(acceptCatch: true))
+                        {
+                            // No handler in this compiled function; bubble original runtime error
+                            throw;
+                        }
+                        // Handler or finally found; loop will continue at updated ip
+                    }
                 }
+            }
+            catch (Interpreter.ReturnSignal r)
+            {
+                // Internal completion path from MaybeComplete()
+                return r.Value;
             }
             return Value.Nil();
 
@@ -4163,21 +4361,124 @@ namespace MiniDynLang
                     return true;
 
                 case Stmt.Return r:
-                    {
-                        // If the return value contains a call, bail to interpreter so TCO works.
-                        if (r.Value != null && ContainsCallExpr(r.Value)) return false;
+                {
+                    // If the return value contains a call, bail to interpreter so TCO works.
+                    if (r.Value != null && ContainsCallExpr(r.Value)) return false;
 
-                        if (r.Value != null)
+                    if (r.Value != null)
+                    {
+                        if (!TryEmitExpr(r.Value, c)) return false;
+                    }
+                    else
+                    {
+                        c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                    }
+                    c.Emit(OpCode.Return);
+                    return true;
+                }
+
+                // === throw ===
+                case Stmt.Throw thr:
+                {
+                    if (!TryEmitExpr(thr.Value, c)) return false; // push exception value
+                    c.Emit(OpCode.Throw);
+                    // Unreachable normally; allow following code for structure
+                    return true;
+                }
+
+                // === try/catch/finally ===
+                case Stmt.TryCatchFinally tcf:
+                {
+                    int tryEnterIdx = c.Emit(OpCode.TryEnter, 0, 0); // patch later
+                    int tryStart = c.Code.Count;
+
+                    // try block
+                    if (!TryEmitStmt(tcf.Try, c)) return false;
+
+                    // Normal exit from try:
+                    // - if finally exists -> jump to finally
+                    // - else if only catch exists -> jump after catch
+                    int jAfterTry = c.Emit(OpCode.Jump, 0);
+
+                    // Catch landing (optional)
+                    int catchIp = -1;
+                    int afterCatchIpLabel = -1;
+                    if (tcf.Catch != null)
+                    {
+                        catchIp = c.Code.Count;
+                        // At catch landing, VM pushed the thrown value on stack
+                        if (!string.IsNullOrEmpty(tcf.CatchName))
                         {
-                            if (!TryEmitExpr(r.Value, c)) return false;
+                            int catchSlot = EnsureLocal(tcf.CatchName);
+                            c.Emit(OpCode.StoreLocal, ParamCount + catchSlot); // stores and pushes back
+                            c.Emit(OpCode.Pop); // remove the duplicate
                         }
                         else
                         {
-                            c.Emit(OpCode.LoadConst, c.AddConst(Value.Nil()));
+                            c.Emit(OpCode.Pop); // discard the thrown value
                         }
-                        c.Emit(OpCode.Return);
-                        return true;
+
+                        if (!TryEmitStmt(tcf.Catch, c)) return false;
+                        // After catch, always proceed to finally (if present) or after-all
+                        afterCatchIpLabel = c.Emit(OpCode.Jump, 0);
                     }
+
+                    // Finally landing (optional)
+                    int finallyIp = -1;
+                    if (tcf.Finally != null)
+                    {
+                        finallyIp = c.Code.Count;
+                        if (!TryEmitStmt(tcf.Finally, c)) return false;
+                        // EndFinally marker, then TryLeave pops frame and continues/unwinds
+                        c.Emit(OpCode.EndFinally);
+                        c.Emit(OpCode.TryLeave);
+                    }
+                    else
+                    {
+                        // No finally: one TryLeave after try/catch
+                        // We’ll place TryLeave at the unified after-all location below
+                    }
+
+                    // After-all continuation
+                    int afterAll = c.Code.Count;
+
+                    // Patch normal try exit
+                    if (tcf.Finally != null)
+                        c.PatchJump(jAfterTry, finallyIp);
+                    else if (tcf.Catch != null)
+                        c.PatchJump(jAfterTry, afterAll); // skip catch region
+                    else
+                        c.PatchJump(jAfterTry, afterAll);
+
+                    // Patch after-catch to go to finally or after-all
+                    if (tcf.Catch != null)
+                    {
+                        if (tcf.Finally != null)
+                            c.PatchJump(afterCatchIpLabel, finallyIp);
+                        else
+                            c.PatchJump(afterCatchIpLabel, afterAll);
+                    }
+
+                    // If there was no finally, put TryLeave at after-all
+                    if (tcf.Finally == null)
+                    {
+                        c.Emit(OpCode.TryLeave);
+                    }
+
+                    // Patch TryEnter with handler IPs
+                    c.PatchTryEnter(tryEnterIdx, catchIp, finallyIp);
+
+                    // Exception metadata for tooling
+                    c.ExceptionTable.Add(new Chunk.ExceptionRegion
+                    {
+                        TryStartIp = tryStart,
+                        TryEndIp   = (tcf.Catch != null ? catchIp : (tcf.Finally != null ? finallyIp : afterAll)),
+                        CatchIp    = catchIp,
+                        FinallyIp  = finallyIp
+                    });
+
+                    return true;
+                }
 
                 case Stmt.ExprStmt es:
                     {
@@ -4566,6 +4867,23 @@ namespace MiniDynLang
                             endJumps.Add(j);
                         }
                         c.PatchJump(jNotNil, c.Code.Count);
+
+                        // For other types: raise a runtime error to match interpreter behavior.
+                        {
+                            // Build message based on for-of vs for-in
+                            int msgIdx = c.AddConst(
+                                Value.String(fe.IsOf
+                                    ? "Value is not iterable for 'for ... of'"
+                                    : "Value is not indexable for 'for ... in'"));
+
+                            // error("...") -> Error object on stack
+                            c.Emit(OpCode.LoadName, 0, "error");
+                            c.Emit(OpCode.LoadConst, msgIdx);
+                            c.Emit(OpCode.Call, 1);
+
+                            // Throw the error value so VM try/catch can handle it
+                            c.Emit(OpCode.Throw);
+                        }
 
                         // For other types: fallback to interpreter by failing compilation
                         // (keeps behavior consistent with runtime errors on unsupported types)
@@ -5182,11 +5500,39 @@ namespace MiniDynLang
                                 return false;
                             case TokenType.Slash:
                                 if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                { v = Value.Number(NumberValue.Div(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                {
+                                    // Avoid compile-time exceptions (e.g., division by zero) so runtime try/catch can handle them.
+                                    var div = rv2.AsNumber();
+                                    if (NumberValue.Compare(div, NumberValue.FromLong(0)) == 0) return false;
+                                    try
+                                    {
+                                        v = Value.Number(NumberValue.Div(lv.AsNumber(), div));
+                                        return true;
+                                    }
+                                    catch (MiniDynRuntimeError)
+                                    {
+                                        // Defer to runtime
+                                        return false;
+                                    }
+                                }
                                 return false;
                             case TokenType.Percent:
                                 if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                { v = Value.Number(NumberValue.Mod(lv.AsNumber(), rv2.AsNumber())); return true; }
+                                {
+                                    // Avoid compile-time exceptions (e.g., modulo by zero).
+                                    var mod = rv2.AsNumber();
+                                    if (NumberValue.Compare(mod, NumberValue.FromLong(0)) == 0) return false;
+                                    try
+                                    {
+                                        v = Value.Number(NumberValue.Mod(lv.AsNumber(), mod));
+                                        return true;
+                                    }
+                                    catch (MiniDynRuntimeError)
+                                    {
+                                        // Defer to runtime
+                                        return false;
+                                    }
+                                }
                                 return false;
                             case TokenType.Equal:
                                 v = Value.Boolean(lv.Equals(rv2)); return true;
@@ -7241,7 +7587,7 @@ namespace MiniDynLang
         }
 
         // Build a simple Error object from name/message and optional runtime error details
-        private Value MakeError(string name, string message, MiniDynRuntimeError ex = null)
+        internal Value MakeError(string name, string message, MiniDynRuntimeError ex = null)
         {
             var ov = new ObjectValue();
             ov.Set("name", Value.String(name ?? "Error"));
