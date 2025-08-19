@@ -3882,13 +3882,16 @@ namespace MiniDynLang
         }
 
        public UserFunction.Kind FunctionKind => _kind;
+       
+       // Expose parameter metadata so the interpreter can map named/default args.
+       public IReadOnlyList<Expr.Param> Params => _params;
 
        public BytecodeFunction BindThis(Value thisValue)
-       {
-           // Arrow ignores rebinding
-           if (_kind == UserFunction.Kind.Arrow) return this;
+        {
+            // Arrow ignores rebinding
+            if (_kind == UserFunction.Kind.Arrow) return this;
             return new BytecodeFunction(_name, _params, _closure, _chunk, _interp, _kind, _capturedThis, thisValue, _localCount);
-       }
+        }
         public Value Call(Interpreter interp, List<Value> args)
         {
             // same env handling as user fn but simpler; no defaults/rest in this first step
@@ -6040,13 +6043,19 @@ namespace MiniDynLang
                 }
                 else if (fn is BytecodeFunction byteFn2)
                 {
-                    if (callExpr.Args.Any(a => a.IsNamed))
-                        throw new MiniDynRuntimeError("Bytecode-compiled functions do not support named arguments");
-                    processedArgs = new List<Value>();
-                   foreach (var arg in callExpr.Args)
-                       processedArgs.Add(Evaluate(arg.Value));
-                   if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
-                       fn = byteFn2.BindThis(receiver);
+                    if (callExpr.Args.Any(a => a.IsNamed) || (byteFn2.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
+                    {
+                        processedArgs = ProcessNamedArguments(byteFn2.Params, callExpr.Args);
+                    }
+                    else
+                    {
+                        processedArgs = new List<Value>();
+                        foreach (var arg in callExpr.Args)
+                            processedArgs.Add(Evaluate(arg.Value));
+                    }
+
+                    if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
+                        fn = byteFn2.BindThis(receiver);
                }
                 else
                 {
@@ -6463,14 +6472,21 @@ namespace MiniDynLang
             }
             else if (fn is BytecodeFunction byteFn)
             {
-                if (e.Args.Any(a => a.IsNamed))
-                    throw new MiniDynRuntimeError("Bytecode-compiled functions do not support named arguments");
-                processedArgs = new List<Value>();
-                foreach (var arg in e.Args)
-                    processedArgs.Add(Evaluate(arg.Value));
+                if (e.Args.Any(a => a.IsNamed) || (byteFn.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
+                {
+                    // Unified slow-path mapping for named/default args for compiled functions
+                    processedArgs = ProcessNamedArguments(byteFn.Params, e.Args);
+                }
+                else
+                {
+                    processedArgs = new List<Value>();
+                    foreach (var arg in e.Args)
+                        processedArgs.Add(Evaluate(arg.Value));
+                }
+
                 if (receiver.Type != ValueType.Nil && byteFn.FunctionKind == UserFunction.Kind.Normal)
                 {
-                   fn = byteFn.BindThis(receiver);
+                    fn = byteFn.BindThis(receiver);
                 }
             }
             else
@@ -6551,100 +6567,136 @@ namespace MiniDynLang
             }
         }
 
-        private List<Value> ProcessNamedArguments(UserFunction fn, List<Expr.Call.Argument> args)
+        // Unified parameter view over UserFunction.ParamSpec and Expr.Param
+        private struct ParamView
         {
-            var result = new List<Value>(new Value[fn.Params.Count]);
-            var filled = new bool[fn.Params.Count];
-            var namedArgs = new Dictionary<string, Value>(StringComparer.Ordinal);
-            var positionalArgs = new List<Value>();
-            var restArgs = new List<Value>();
+            public string Name;
+            public Expr Default;
+            public bool IsRest;
+        }
 
-            // Evaluate all arguments first
+        private static List<ParamView> ToParamViews(IReadOnlyList<UserFunction.ParamSpec> ps)
+        {
+            var list = new List<ParamView>(ps.Count);
+            for (int i = 0; i < ps.Count; i++)
+                list.Add(new ParamView { Name = ps[i].Name, Default = ps[i].Default, IsRest = ps[i].IsRest });
+            return list;
+        }
+
+        private static List<ParamView> ToParamViews(IReadOnlyList<Expr.Param> ps)
+        {
+            var list = new List<ParamView>(ps.Count);
+            for (int i = 0; i < ps.Count; i++)
+                list.Add(new ParamView { Name = ps[i].Name, Default = ps[i].Default, IsRest = ps[i].IsRest });
+            return list;
+        }
+
+        // Core generic mapper: evaluates args, applies named/positional/default/rest into a positional list.
+        private List<Value> ProcessCallArguments(IReadOnlyList<ParamView> parameters, List<Expr.Call.Argument> args)
+        {
+            int paramCount = parameters?.Count ?? 0;
+            var result = new List<Value>(new Value[paramCount]);
+            var filled = new bool[paramCount];
+
+            // Build name->index for non-rest params only
+            var nameToIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            int restIndex = -1;
+            for (int i = 0; i < paramCount; i++)
+            {
+                if (parameters[i].IsRest) { restIndex = i; continue; }
+                nameToIndex[parameters[i].Name] = i;
+            }
+
+            // Evaluate all arguments
+            var namedValues = new Dictionary<string, Value>(StringComparer.Ordinal);
+            var positionalValues = new List<Value>();
             foreach (var arg in args)
             {
-                if (arg.IsNamed)
-                    namedArgs[arg.Name] = Evaluate(arg.Value);
-                else
-                    positionalArgs.Add(Evaluate(arg.Value));
+                if (arg.IsNamed) namedValues[arg.Name] = Evaluate(arg.Value);
+                else positionalValues.Add(Evaluate(arg.Value));
             }
 
-            // Index of rest param, if present
-            int restParamIndex = -1;
-            for (int i = 0; i < fn.Params.Count; i++)
+            // Apply named arguments to matching non-rest parameters
+            foreach (var kv in namedValues)
             {
-                if (fn.Params[i].IsRest) { restParamIndex = i; break; }
-            }
-
-            // Apply named arguments to matching parameters (non-rest only)
-            foreach (var kv in namedArgs)
-            {
-                bool found = false;
-                for (int i = 0; i < fn.Params.Count; i++)
-                {
-                    if (!fn.Params[i].IsRest && fn.Params[i].Name == kv.Key)
-                    {
-                        if (filled[i])
-                            throw new MiniDynRuntimeError($"Argument '{kv.Key}' specified multiple times");
-                        result[i] = kv.Value;
-                        filled[i] = true;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    // Do NOT push unknown named args into rest; this is an error.
+                if (!nameToIndex.TryGetValue(kv.Key, out int idx))
                     throw new MiniDynRuntimeError($"Unknown parameter '{kv.Key}'");
-                }
+                if (filled[idx])
+                    throw new MiniDynRuntimeError($"Argument '{kv.Key}' specified multiple times");
+                result[idx] = kv.Value;
+                filled[idx] = true;
             }
 
-            // Fill remaining non-rest parameters with positional args, left to right
-            int posIndex = 0;
-            for (int i = 0; i < fn.Params.Count && posIndex < positionalArgs.Count; i++)
+            // Fill remaining non-rest parameters with positional left-to-right
+            int p = 0;
+            for (int i = 0; i < paramCount && p < positionalValues.Count; i++)
             {
-                if (!filled[i] && !fn.Params[i].IsRest)
+                if (!filled[i] && !parameters[i].IsRest)
                 {
-                    result[i] = positionalArgs[posIndex++];
+                    result[i] = positionalValues[p++];
                     filled[i] = true;
                 }
             }
 
-            // Remaining positional args go to rest (if present)
-            while (posIndex < positionalArgs.Count)
-                restArgs.Add(positionalArgs[posIndex++]);
-
-            // Apply defaults for any still-unfilled non-rest parameters
-            for (int i = 0; i < fn.Params.Count; i++)
+            // Remaining positional go into rest (if present), otherwise error
+            var restArgs = new List<Value>();
+            if (p < positionalValues.Count)
             {
-                if (!filled[i] && !fn.Params[i].IsRest)
+                if (restIndex >= 0)
                 {
-                    if (fn.Params[i].Default != null)
+                    for (; p < positionalValues.Count; p++) restArgs.Add(positionalValues[p]);
+                }
+                else
+                {
+                    int totalProvided = namedValues.Count + positionalValues.Count;
+                    throw new MiniDynRuntimeError($"Function expected at most {paramCount} args, got {totalProvided}");
+                }
+            }
+
+            // Apply defaults for unfilled non-rest parameters
+            for (int i = 0; i < paramCount; i++)
+            {
+                if (!filled[i] && !parameters[i].IsRest)
+                {
+                    if (parameters[i].Default != null)
                     {
-                        result[i] = EvaluateWithEnv(fn.Params[i].Default, CurrentEnv);
+                        result[i] = EvaluateWithEnv(parameters[i].Default, CurrentEnv);
                         filled[i] = true;
                     }
                     else
                     {
-                        throw new MiniDynRuntimeError($"Missing required argument '{fn.Params[i].Name}'");
+                        throw new MiniDynRuntimeError($"Missing required argument '{parameters[i].Name}'");
                     }
                 }
             }
 
-            // Build the final positional list to call into UserFunction.Call
-            // Place rest args exactly at the rest param position (and rest MUST be last after parser patch).
+            // Build final positional list; insert rest payload at rest position (parser enforces rest last)
             var finalArgs = new List<Value>();
-            for (int i = 0; i < fn.Params.Count; i++)
+            for (int i = 0; i < paramCount; i++)
             {
-                if (fn.Params[i].IsRest)
+                if (parameters[i].IsRest)
                 {
                     finalArgs.AddRange(restArgs);
-                    continue;
                 }
-                finalArgs.Add(result[i]);
+                else
+                {
+                    finalArgs.Add(result[i]);
+                }
             }
             return finalArgs;
         }
 
+        // Wrapper for UserFunction
+        private List<Value> ProcessNamedArguments(UserFunction fn, List<Expr.Call.Argument> args)
+        {
+            return ProcessCallArguments(ToParamViews(fn.Params), args);
+        }
+
+        // Wrapper for BytecodeFunction (uses Expr.Param metadata)
+        private List<Value> ProcessNamedArguments(IReadOnlyList<Expr.Param> parameters, List<Expr.Call.Argument> args)
+        {
+            return ProcessCallArguments(ToParamViews(parameters), args);
+        }
 
         public Value VisitGrouping(Expr.Grouping e) => Evaluate(e.Inner);
 
