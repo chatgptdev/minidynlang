@@ -3244,18 +3244,23 @@ namespace MiniDynLang
 
         // property/method and calls
         GetProp,         // O = string name; pop target, push value (nil if missing)
-       StoreProp,       // O = string name; pop value, pop target, set, push value
+        StoreProp,       // O = string name; pop value, pop target, set, push value
         Call,            // A = argCount; stack: ..., callee, arg1..argN -> pushes result
         CallMethod,      // A = argCount; stack: ..., receiver, callee, arg1..argN -> pushes result (binds receiver for normal UserFunction)
 
         Return,          // return top-of-stack
         Noop,
-        
+
         // locals + index access
         LoadLocal,       // A = local slot index (params+locals array)
         StoreLocal,      // A = local slot index (pop value, store, push back)
-       GetIndex,        // stack: ..., target, index -> pops both, pushes value (nil if missing)
-       StoreIndex       // stack: ..., target, index, value -> store, push value
+        GetIndex,        // stack: ..., target, index -> pops both, pushes value (nil if missing)
+        StoreIndex,       // stack: ..., target, index, value -> store, push value
+       
+        // literals
+        NewArray,        // push Value.Array(new ArrayValue())
+        ArrayAppend,     // stack: ..., array, value -> append; push array back
+        NewObject        // push Value.Object(new ObjectValue())
     }
 
     internal sealed class Instruction
@@ -3543,7 +3548,7 @@ namespace MiniDynLang
                             }
                             break;
                         }
-                   case OpCode.StoreIndex:
+                    case OpCode.StoreIndex:
                        {
                            var value = Pop();
                            var index = Pop();
@@ -3589,7 +3594,7 @@ namespace MiniDynLang
                            break;
                        }
 
-                   case OpCode.CallMethod:
+                    case OpCode.CallMethod:
                        {
                            int argc = ins.A;
                            var args = new List<Value>(argc);
@@ -3609,6 +3614,27 @@ namespace MiniDynLang
                            Push(res);
                            break;
                        }
+
+                    // literals
+                    case OpCode.NewArray:
+                        Push(Value.Array(new ArrayValue()));
+                        break;
+
+                    case OpCode.ArrayAppend:
+                        {
+                            var val = Pop();
+                            var arrVal = Pop();
+                            if (arrVal.Type != ValueType.Array)
+                                throw new MiniDynRuntimeError("Array append target must be array");
+                            arrVal.AsArray().Items.Add(val);
+                            // keep building: push array back
+                            Push(arrVal);
+                            break;
+                        }
+
+                    case OpCode.NewObject:
+                        Push(Value.Object(new ObjectValue()));
+                        break;
                     case OpCode.Return:
                         return Pop();
 
@@ -4486,7 +4512,45 @@ namespace MiniDynLang
                         c.Emit(OpCode.Call, call.Args.Count);
                         return true;
                     }
+                // array literal
+                case Expr.ArrayLiteral arrLit:
+                    {
+                        c.Emit(OpCode.NewArray);                  // [array]
+                        foreach (var el in arrLit.Elements)
+                        {
+                            c.Emit(OpCode.Dup);                    // [array, array]
+                            if (!TryEmitExpr(el, c)) return false; // [array, array, value]
+                            c.Emit(OpCode.ArrayAppend);            // [array]
+                        }
+                        return true;
+                    }
 
+                // object literal
+                case Expr.ObjectLiteral objLit:
+                    {
+                        c.Emit(OpCode.NewObject); // [obj]
+                        foreach (var entry in objLit.Entries)
+                        {
+                            if (entry.KeyName != null)
+                            {
+                                // obj.key = value
+                                c.Emit(OpCode.Dup);                                // [obj, obj]
+                                if (!TryEmitExpr(entry.ValueExpr, c)) return false;// [obj, obj, value]
+                                c.Emit(OpCode.StoreProp, 0, entry.KeyName);        // [obj, value]
+                                c.Emit(OpCode.Pop);                                 // [obj]
+                            }
+                            else
+                            {
+                                // obj[keyExpr] = valueExpr
+                                c.Emit(OpCode.Dup);                                // [obj, obj]
+                                if (!TryEmitExpr(entry.KeyExpr, c)) return false;  // [obj, obj, key]
+                                if (!TryEmitExpr(entry.ValueExpr, c)) return false;// [obj, obj, key, value]
+                                c.Emit(OpCode.StoreIndex);                          // [obj, value]
+                                c.Emit(OpCode.Pop);                                 // [obj]
+                            }
+                        }
+                        return true;
+                    }
                 default:
                     return false;
             }
