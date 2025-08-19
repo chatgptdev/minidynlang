@@ -692,6 +692,114 @@ let ran_once = 0;
 for (;;) { ran_once = 1; break; }
 test_eq("classic for with no parts and break", ran_once, 1);
 
+// --- Try/Finally with break/continue ----------------------------------------
+section("Try/Finally with break/continue");
+
+// finally runs on break (while)
+test_eq("finally runs on break in while", (fn(){
+    let f = 0;
+    while (true) {
+        try { break; }
+        finally { f = f + 1; }
+    }
+    return f;
+})(), 1);
+
+// finally runs on continue (while), executes each iteration that exits try
+test_eq("finally runs on continue in while", (fn(){
+    let i = 0, f = 0;
+    while (i < 3) {
+        try {
+            i = i + 1;
+            if (i < 3) continue; // will hit finally
+        } finally {
+            f = f + 1;
+        }
+    }
+    return [i, f];
+})(), [3, 3]);
+
+// catch must not trigger on break
+test_eq("catch not executed on break", (fn(){
+    let c = 0, f = 0;
+    while (true) {
+        try { break; }
+        catch (e) { c = c + 1; }
+        finally { f = f + 1; }
+    }
+    return [c, f];
+})(), [0, 1]);
+
+// catch must not trigger on continue
+test_eq("catch not executed on continue", (fn(){
+    let c = 0, f = 0, i = 0;
+    while (i < 1) {
+        try { i = i + 1; continue; }
+        catch (e) { c = c + 1; }
+        finally { f = f + 1; }
+    }
+    return [c, f];
+})(), [0, 1]);
+
+// nested finallys: both must run on break (inner then outer)
+test_eq("nested finally order on break", (fn(){
+    let log = [];
+    while (true) {
+        try {
+            try { break; }
+            finally { push(log, "inner"); }
+        } finally {
+            push(log, "outer");
+        }
+    }
+    return log;
+})(), ["inner", "outer"]);
+
+// classic for: finally runs on continue (order check, finally before increment)
+test_eq("finally runs on continue in classic for (order)", (fn(){
+    let order = [];
+    for (let i = 0; i < 3; i = i + 1) {
+        try {
+            push(order, "B" + to_string(i));
+            if (i < 2) continue; // will hit finally, then increment
+            push(order, "X");
+        } finally {
+            push(order, "F" + to_string(i));
+        }
+    }
+    return order;
+})(), ["B0","F0","B1","F1","B2","X","F2"]);
+
+// for-of: finally runs on continue and break; catch not entered
+test_eq("for-of finally on continue and break (order)", (fn(){
+    let order = [];
+    for (let x of [1, 2, 3]) {
+        try {
+            if (x == 2) continue;                 // skip body, but finally runs
+            push(order, to_string(x));
+            if (x == 3) break;                    // break, finally still runs
+        } finally {
+            push(order, "F" + to_string(x));
+        }
+    }
+    return order;
+})(), ["1","F1","F2","3","F3"]);
+
+// nested finallys with continue: both finalizers must run
+test_eq("nested finally order on continue", (fn(){
+    let log = [];
+    let i = 0;
+    while (i < 1) {
+        try {
+            try { i = i + 1; continue; }
+            finally { push(log, "inner"); }
+        } finally {
+            push(log, "outer");
+        }
+    }
+    return log;
+})(), ["inner", "outer"]);
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");

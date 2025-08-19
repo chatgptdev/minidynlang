@@ -3440,7 +3440,11 @@ namespace MiniDynLang
         TryEnter,        // A = catchIp (or -1), O = (int)finallyIp (or -1)
         TryLeave,        // pop current try frame; if a completion is pending, resume unwinding
         Throw,           // pop value and start unwinding through catch/finally
-        EndFinally       // marker inside finally; logic handled by TryLeave
+        EndFinally,      // marker inside finally; logic handled by TryLeave
+
+        // === loop control with finally-unwinding ===
+        BreakPending,    // A = target ip to jump to after unwinding finally blocks
+        ContinuePending  // A = target ip to jump to after unwinding finally blocks
     }
 
     internal sealed class Instruction
@@ -3534,7 +3538,7 @@ namespace MiniDynLang
         public int FinallyIp;
         public RegionState State;
     }
-    enum PendingKind { None, Throw, Return, ThrowRuntime }
+    enum PendingKind { None, Throw, Return, ThrowRuntime, Break, Continue }
     internal sealed class BytecodeVM
     {
         private readonly Interpreter _interp;
@@ -3549,6 +3553,7 @@ namespace MiniDynLang
             PendingKind pending = PendingKind.None;
             Value pendingValue = Value.Nil();
             MiniDynRuntimeError pendingRuntime = null;
+            int pendingTargetIp = -1;
 
             Value Pop()
             {
@@ -3623,6 +3628,14 @@ namespace MiniDynLang
                 {
                     // No catch anywhere -> rethrow original runtime error
                     throw pendingRuntime;
+                }
+                if ((pending == PendingKind.Break || pending == PendingKind.Continue) && tryStack.Count == 0)
+                {
+                    // Transfer control to the target ip after all finally frames have run.
+                    if (pendingTargetIp < 0) throw new MiniDynRuntimeError("Invalid pending break/continue target");
+                    ip = pendingTargetIp;
+                    pending = PendingKind.None;
+                    pendingTargetIp = -1;
                 }
             }
 
@@ -4019,7 +4032,8 @@ namespace MiniDynLang
                                     tryStack.Pop();
                                     if (pending != PendingKind.None)
                                     {
-                                        bool acceptCatch = (pending == PendingKind.Throw) || (pending == PendingKind.ThrowRuntime);
+                                        bool acceptCatch =
+                                            (pending == PendingKind.Throw) || (pending == PendingKind.ThrowRuntime);
                                         if (!Unwind(acceptCatch))
                                         {
                                             // Complete now outside any frame
@@ -4054,6 +4068,31 @@ namespace MiniDynLang
                                     {
                                         // No finally frames? then return now
                                         return rv;
+                                    }
+                                    break;
+                                }
+
+                            case OpCode.BreakPending:
+                                {
+                                    pending = PendingKind.Break;
+                                    pendingTargetIp = ins.A;
+                                    // Run through finally frames but do not enter catches
+                                    if (!Unwind(acceptCatch: false))
+                                    {
+                                        // No frames; immediately transfer control
+                                        MaybeComplete();
+                                    }
+                                    break;
+                                }
+                            case OpCode.ContinuePending:
+                                {
+                                    pending = PendingKind.Continue;
+                                    pendingTargetIp = ins.A;
+                                    // Run through finally frames but do not enter catches
+                                    if (!Unwind(acceptCatch: false))
+                                    {
+                                        // No frames; immediately transfer control
+                                        MaybeComplete();
                                     }
                                     break;
                                 }
@@ -4267,6 +4306,10 @@ namespace MiniDynLang
             public int LoopStartIp;
         }
         private readonly Stack<LoopContext> _loopStack = new Stack<LoopContext>();
+
+        // Track nesting inside any try/catch/finally region for emitting break/continue as pending completions.
+        private int _tryDepth = 0;
+
         public BytecodeCompiler(Interpreter interp) { _interp = interp; }
 
         public bool TryCompileFunction(Expr.Function fn, out BytecodeFunction bc)
@@ -4516,8 +4559,10 @@ namespace MiniDynLang
                     int tryEnterIdx = c.Emit(OpCode.TryEnter, 0, 0); // patch later
                     int tryStart = c.Code.Count;
 
+                    // Mark: emitting inside try/catch/finally region
+                    _tryDepth++;
                     // try block
-                    if (!TryEmitStmt(tcf.Try, c)) return false;
+                    if (!TryEmitStmt(tcf.Try, c)) { _tryDepth--; return false; }
 
                     // Normal exit from try:
                     // - if finally exists -> jump to finally
@@ -4542,7 +4587,7 @@ namespace MiniDynLang
                             c.Emit(OpCode.Pop); // discard the thrown value
                         }
 
-                        if (!TryEmitStmt(tcf.Catch, c)) return false;
+                        if (!TryEmitStmt(tcf.Catch, c)) { _tryDepth--; return false; }
                         // After catch, always proceed to finally (if present) or after-all
                         afterCatchIpLabel = c.Emit(OpCode.Jump, 0);
                     }
@@ -4552,7 +4597,7 @@ namespace MiniDynLang
                     if (tcf.Finally != null)
                     {
                         finallyIp = c.Code.Count;
-                        if (!TryEmitStmt(tcf.Finally, c)) return false;
+                        if (!TryEmitStmt(tcf.Finally, c)) { _tryDepth--; return false; }
                         // EndFinally marker, then TryLeave pops frame and continues/unwinds
                         c.Emit(OpCode.EndFinally);
                         c.Emit(OpCode.TryLeave);
@@ -4588,6 +4633,9 @@ namespace MiniDynLang
                     {
                         c.Emit(OpCode.TryLeave);
                     }
+
+                    // Leave try/catch/finally region
+                    _tryDepth--;
 
                     // Patch TryEnter with handler IPs
                     c.PatchTryEnter(tryEnterIdx, catchIp, finallyIp);
@@ -4748,7 +4796,16 @@ namespace MiniDynLang
                     {
                         if (_loopStack.Count == 0) return false;
                         var ctx = _loopStack.Peek();
-                        int j = c.Emit(OpCode.Jump, 0);
+                        int j;
+                        if (_tryDepth > 0)
+                        {
+                            // Ensure finally blocks execute when breaking out of try regions
+                            j = c.Emit(OpCode.BreakPending, 0);
+                        }
+                        else
+                        {
+                            j = c.Emit(OpCode.Jump, 0);
+                        }
                         ctx.BreakJumps.Add(j);
                         return true;
                     }
@@ -4756,7 +4813,16 @@ namespace MiniDynLang
                     {
                         if (_loopStack.Count == 0) return false;
                         var ctx = _loopStack.Peek();
-                        int j = c.Emit(OpCode.Jump, 0);
+                        int j;
+                        if (_tryDepth > 0)
+                        {
+                            // Ensure finally blocks execute when continuing out of try regions
+                            j = c.Emit(OpCode.ContinuePending, 0);
+                        }
+                        else
+                        {
+                            j = c.Emit(OpCode.Jump, 0);
+                        }
                         ctx.ContinueJumps.Add(j);
                         return true;
                     }
@@ -6789,145 +6855,114 @@ namespace MiniDynLang
             }
         }
 
-        public object VisitFunction(Stmt.Function s)
+        // Evaluate an expression that is in tail position of a return.
+        // If it is (or reduces to) a direct self tail-call, this will throw TailCallSignal to trampoline.
+        // Otherwise it evaluates and returns the value.
+        private Value EvaluateTailPosition(Expr e)
         {
-            var kind = s.FuncExpr.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
-            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null, s.FuncExpr.Span);
-            // function statements bind like 'var' in the nearest function/global env
-            _env.DeclareVarInFunctionOrGlobal(s.Name, Value.Function(fn));
-            return null;
+            // Unwrap groupings
+            if (e is Expr.Grouping g)
+                return EvaluateTailPosition(g.Inner);
+
+            // Comma: evaluate left for side-effects, then tail-eval right
+            if (e is Expr.Comma cm)
+            {
+                Evaluate(cm.Left);
+                return EvaluateTailPosition(cm.Right);
+            }
+
+            // Ternary: short-circuit which branch to evaluate in tail position
+            if (e is Expr.Ternary t)
+            {
+                var cond = Evaluate(t.Cond);
+                if (Value.IsTruthy(cond)) return EvaluateTailPosition(t.Then);
+                return EvaluateTailPosition(t.Else);
+            }
+
+            // Logical AND/OR: short-circuit and tail-eval the right side if needed
+            if (e is Expr.Logical l)
+            {
+                var left = Evaluate(l.Left);
+                if (l.Op.Type == TokenType.Or)
+                {
+                    if (Value.IsTruthy(left)) return left;
+                    return EvaluateTailPosition(l.Right);
+                }
+                else
+                {
+                    if (!Value.IsTruthy(left)) return left;
+                    return EvaluateTailPosition(l.Right);
+                }
+            }
+
+            // Nullish coalescing in AST as Binary with NullishCoalesce
+            if (e is Expr.Binary b && b.Op.Type == TokenType.NullishCoalesce)
+            {
+                var left = Evaluate(b.Left);
+                if (left.Type != ValueType.Nil) return left;
+                return EvaluateTailPosition(b.Right);
+            }
+
+            // Direct call in tail position -> use TCO path (including method/optional call cases)
+            if (e is Expr.Call callExpr)
+            {
+                return EvaluateTailCallOrInvoke(callExpr);
+            }
+
+            // Fallback: just evaluate normally
+            return Evaluate(e);
         }
 
-        public object VisitReturn(Stmt.Return s)
+        // Execute a call in tail position:
+        // - If it's a self tail-call to the current UserFunction, throw TailCallSignal (positional or mapping).
+        // - Otherwise, perform the call and return its result.
+        private Value EvaluateTailCallOrInvoke(Expr.Call callExpr)
         {
-            // Tail-call optimization without double-evaluating the callee:
-            // - Evaluate callee once (preserving side effects).
-            // - If it's a self-tail call, trampoline.
-            // - Otherwise, perform the call using the already-evaluated callee to avoid re-evaluating it.
-            if (s.Value is Expr.Call callExpr)
+            var currentFn = CurrentFunction;
+
+            // Evaluate callee once, capture receiver for method-call binding (and optional chaining short-circuit)
+            Value calleeVal; Value receiver; bool shortCircuitToNil;
+            TryPrepareCalleeForCall(callExpr.Callee, out calleeVal, out receiver, out shortCircuitToNil);
+
+            if (shortCircuitToNil)
+                return Value.Nil();
+
+            if (calleeVal.Type != ValueType.Function)
+                throw new MiniDynRuntimeError("Can only call functions");
+
+            var fn = calleeVal.AsFunction();
+
+            // Self tail-call to same UserFunction -> trampoline
+            if (currentFn != null && fn is UserFunction targetFn && targetFn.FunctionId == currentFn.FunctionId)
             {
-                var currentFn = CurrentFunction;
-
-                // Evaluate callee once, capturing receiver and optional short-circuit
-                Value calleeVal; Value receiver; bool shortCircuitToNil;
-                TryPrepareCalleeForCall(callExpr.Callee, out calleeVal, out receiver, out shortCircuitToNil);
-
-                if (shortCircuitToNil)
+                if (callExpr.Args.Any(a => a.IsNamed))
                 {
-                    // Optional chain produced nil callee -> call short-circuits to nil (no args eval)
-                    throw new ReturnSignal(Value.Nil());
+                    var mapping = BuildArgMapping(ToParamViews(currentFn.Params), callExpr.Args);
+                    throw new TailCallSignal(currentFn, mapping);
                 }
-
-                if (calleeVal.Type != ValueType.Function)
-                    throw new MiniDynRuntimeError("Can only call functions");
-
-                // Self tail-call to same UserFunction: pass mapping for named-arg correctness
-                if (currentFn != null && calleeVal.AsFunction() is UserFunction targetFn
-                    && targetFn.FunctionId == currentFn.FunctionId)
+                else
                 {
-                    if (callExpr.Args.Any(a => a.IsNamed))
-                    {
-                        var mapping = BuildArgMapping(ToParamViews(currentFn.Params), callExpr.Args);
-                        throw new TailCallSignal(currentFn, mapping);
-                    }
-                    else
-                    {
-                        var finalArgs = new List<Value>();
-                        foreach (var a in callExpr.Args) finalArgs.Add(Evaluate(a.Value));
-                        throw new TailCallSignal(currentFn, finalArgs);
-                    }
+                    var finalArgs = new List<Value>();
+                    foreach (var a in callExpr.Args) finalArgs.Add(Evaluate(a.Value));
+                    throw new TailCallSignal(currentFn, finalArgs);
                 }
+            }
 
-                // Not a self tail call: complete the call using evaluated callee/receiver
-                var fn = calleeVal.AsFunction();
-
-                if (fn is UserFunction userFn2)
+            // Not a self tail-call: perform the call and return its result, preserving receiver binding
+            if (fn is UserFunction userFn2)
+            {
+                if (callExpr.Args.Any(a => a.IsNamed))
                 {
-                    // Named-arg path -> mapping
-                    if (callExpr.Args.Any(a => a.IsNamed))
-                    {
-                        var mapping = BuildArgMapping(ToParamViews(userFn2.Params), callExpr.Args);
+                    var mapping = BuildArgMapping(ToParamViews(userFn2.Params), callExpr.Args);
+                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                        fn = userFn2.BindThis(receiver);
 
-                        if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
-                            fn = userFn2.BindThis(receiver);
-
-                        string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
-                        var callSite = callExpr?.Span ?? default(SourceSpan);
-                        _callStack.Push(new CallFrame(fnName, callSite));
-                        try
-                        {
-                            var res = ((UserFunction)fn).CallWithMapping(this, mapping);
-                            throw new ReturnSignal(res);
-                        }
-                        catch (MiniDynRuntimeError ex)
-                        {
-                            AttachErrorContext(ex);
-                            throw;
-                        }
-                        finally
-                        {
-                            _callStack.Pop();
-                        }
-                    }
-                    else
-                    {
-                        // positional
-                        var processedArgs = new List<Value>();
-                        foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
-
-                        if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
-                            fn = userFn2.BindThis(receiver);
-
-                        if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                            throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                        string fnName =
-                            !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
-                        var callSite = callExpr?.Span ?? default(SourceSpan);
-                        _callStack.Push(new CallFrame(fnName, callSite));
-                        try
-                        {
-                            var res = fn.Call(this, processedArgs);
-                            throw new ReturnSignal(res);
-                        }
-                        catch (MiniDynRuntimeError ex)
-                        {
-                            AttachErrorContext(ex);
-                            throw;
-                        }
-                        finally
-                        {
-                            _callStack.Pop();
-                        }
-                    }
-                }
-                else if (fn is BytecodeFunction byteFn2)
-                {
-                    List<Value> processedArgs;
-                    if (callExpr.Args.Any(a => a.IsNamed) || (byteFn2.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
-                    {
-                        processedArgs = BuildPositionalArgsForBytecode(byteFn2.Params, callExpr.Args);
-                    }
-                    else
-                    {
-                        processedArgs = new List<Value>();
-                        foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
-                    }
-
-                    if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
-                        fn = byteFn2.BindThis(receiver);
-
-                    if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                    string fnName =
-                        "<anonymous>";
+                    string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
                     var callSite = callExpr?.Span ?? default(SourceSpan);
                     _callStack.Push(new CallFrame(fnName, callSite));
                     try
                     {
-                        var res = fn.Call(this, processedArgs);
-                        throw new ReturnSignal(res);
+                        return ((UserFunction)fn).CallWithMapping(this, mapping);
                     }
                     catch (MiniDynRuntimeError ex)
                     {
@@ -6941,23 +6976,21 @@ namespace MiniDynLang
                 }
                 else
                 {
-                    if (callExpr.Args.Any(a => a.IsNamed))
-                        throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-
                     var processedArgs = new List<Value>();
                     foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
+
+                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                        fn = userFn2.BindThis(receiver);
 
                     if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
                         throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
 
-                    string fnName =
-                        fn is BuiltinFunction bf ? bf.Name : "<anonymous>";
+                    string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
                     var callSite = callExpr?.Span ?? default(SourceSpan);
                     _callStack.Push(new CallFrame(fnName, callSite));
                     try
                     {
-                        var res = fn.Call(this, processedArgs);
-                        throw new ReturnSignal(res);
+                        return fn.Call(this, processedArgs);
                     }
                     catch (MiniDynRuntimeError ex)
                     {
@@ -6970,9 +7003,87 @@ namespace MiniDynLang
                     }
                 }
             }
+            else if (fn is BytecodeFunction byteFn2)
+            {
+                List<Value> processedArgs;
+                if (callExpr.Args.Any(a => a.IsNamed) || (byteFn2.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
+                    processedArgs = BuildPositionalArgsForBytecode(byteFn2.Params, callExpr.Args);
+                else
+                {
+                    processedArgs = new List<Value>();
+                    foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
+                }
 
-            Value v = s.Value != null ? Evaluate(s.Value) : Value.Nil();
-            throw new ReturnSignal(v);
+                if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
+                    fn = byteFn2.BindThis(receiver);
+
+                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                string fnName = "<anonymous>";
+                var callSite = callExpr?.Span ?? default(SourceSpan);
+                _callStack.Push(new CallFrame(fnName, callSite));
+                try
+                {
+                    return fn.Call(this, processedArgs);
+                }
+                catch (MiniDynRuntimeError ex)
+                {
+                    AttachErrorContext(ex);
+                    throw;
+                }
+                finally
+                {
+                    _callStack.Pop();
+                }
+            }
+            else
+            {
+                if (callExpr.Args.Any(a => a.IsNamed))
+                    throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
+
+                var processedArgs = new List<Value>();
+                foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
+
+                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                string fnName = fn is BuiltinFunction bf ? bf.Name : "<anonymous>";
+                var callSite = callExpr?.Span ?? default(SourceSpan);
+                _callStack.Push(new CallFrame(fnName, callSite));
+                try
+                {
+                    return fn.Call(this, processedArgs);
+                }
+                catch (MiniDynRuntimeError ex)
+                {
+                    AttachErrorContext(ex);
+                    throw;
+                }
+                finally
+                {
+                    _callStack.Pop();
+                }
+            }
+        }
+
+        public object VisitFunction(Stmt.Function s)
+        {
+            var kind = s.FuncExpr.IsArrow ? UserFunction.Kind.Arrow : UserFunction.Kind.Normal;
+            var fn = new UserFunction(s.Name, s.FuncExpr.Parameters, s.FuncExpr.Body, _env, kind, null, s.FuncExpr.Span);
+            // function statements bind like 'var' in the nearest function/global env
+            _env.DeclareVarInFunctionOrGlobal(s.Name, Value.Function(fn));
+            return null;
+        }
+
+        public object VisitReturn(Stmt.Return s)
+        {
+            // Tail-position evaluation supporting calls nested in ternary/logical/nullish/comma/grouping.
+            if (s.Value == null)
+                throw new ReturnSignal(Value.Nil());
+
+            var result = EvaluateTailPosition(s.Value);
+            throw new ReturnSignal(result);
         }
         public object VisitThrow(Stmt.Throw s)
         {
