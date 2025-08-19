@@ -3436,6 +3436,14 @@ namespace MiniDynLang
         // functions
         MakeFunction,    // O = FunctionProto; push Value.Function
 
+        // === intrinsics for compiled semantics ===
+        TypeOf,          // pop v -> push string type name (lowercase)
+        Length,          // pop v -> push number length (semantics like builtin 'length')
+        Keys,            // pop object -> push array of string keys
+        Values,          // pop object -> push array of values
+        ToStringOp,      // pop v -> push string conversion (Interpreter.ToStringValue)
+        MakeError,       // pop message(string) -> push Error object via Interpreter.MakeError("Error", msg)
+
         // === exceptions / try-catch-finally ===
         TryEnter,        // A = catchIp (or -1), O = (int)finallyIp (or -1)
         TryLeave,        // pop current try frame; if a completion is pending, resume unwinding
@@ -4012,7 +4020,78 @@ namespace MiniDynLang
                                     Push(Value.Function(fn));
                                     break;
                                 }
-
+                            // === intrinsics for compiled semantics ===
+                            case OpCode.TypeOf:
+                                {
+                                    var v = Pop();
+                                    // Mirror builtin 'type' behavior (lower-invariant names)
+                                    Push(Value.String(v.Type.ToString().ToLowerInvariant()));
+                                    break;
+                                }
+                            case OpCode.Length:
+                                {
+                                    var v = Pop();
+                                    switch (v.Type)
+                                    {
+                                        case ValueType.String:
+                                            Push(Value.Number(NumberValue.FromLong(v.AsString().Length)));
+                                            break;
+                                        case ValueType.Array:
+                                            Push(Value.Number(NumberValue.FromLong(v.AsArray().Length)));
+                                            break;
+                                        case ValueType.Object:
+                                            Push(Value.Number(NumberValue.FromLong(v.AsObject().Count)));
+                                            break;
+                                        case ValueType.Nil:
+                                            Push(Value.Number(NumberValue.FromLong(0)));
+                                            break;
+                                        case ValueType.Boolean:
+                                        case ValueType.Number:
+                                        case ValueType.Function:
+                                            Push(Value.Number(NumberValue.FromLong(1)));
+                                            break;
+                                        default:
+                                            Push(Value.Number(NumberValue.FromLong(0)));
+                                            break;
+                                    }
+                                    break;
+                                }
+                            case OpCode.Keys:
+                                {
+                                    var v = Pop();
+                                    if (v.Type != ValueType.Object)
+                                        throw new MiniDynRuntimeError("keys expects object");
+                                    var o = v.AsObject();
+                                    var arr = new ArrayValue();
+                                    foreach (var k in o.Keys) arr.Items.Add(Value.String(k));
+                                    Push(Value.Array(arr));
+                                    break;
+                                }
+                            case OpCode.Values:
+                                {
+                                    var v = Pop();
+                                    if (v.Type != ValueType.Object)
+                                        throw new MiniDynRuntimeError("values expects object");
+                                    var o = v.AsObject();
+                                    var arr = new ArrayValue();
+                                    foreach (var kv in o.Entries) arr.Items.Add(kv.Value);
+                                    Push(Value.Array(arr));
+                                    break;
+                                }
+                            case OpCode.ToStringOp:
+                                {
+                                    var v = Pop();
+                                    Push(Value.String(_interp.ToStringValue(v)));
+                                    break;
+                                }
+                            case OpCode.MakeError:
+                                {
+                                    var msgVal = Pop();
+                                    var msg = _interp.ToStringValue(msgVal);
+                                    var err = _interp.MakeError("Error", msg);
+                                    Push(err);
+                                    break;
+                                }
                             // === exceptions / try-catch-finally ===
                             case OpCode.TryEnter:
                                 {
@@ -4851,11 +4930,10 @@ namespace MiniDynLang
                         c.Emit(OpCode.StoreLocal, ParamCount + itSlot);
                         c.Emit(OpCode.Pop);
 
-                        // t = type(it)
+                        // t = type(it) via intrinsic
                         int typeSlot = NewTempSlot();
-                        c.Emit(OpCode.LoadName, 0, "type");
                         c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
-                        c.Emit(OpCode.Call, 1);
+                        c.Emit(OpCode.TypeOf);
                         c.Emit(OpCode.StoreLocal, ParamCount + typeSlot);
                         c.Emit(OpCode.Pop);
 
@@ -4933,11 +5011,10 @@ namespace MiniDynLang
                         c.Emit(OpCode.CmpEq);
                         int jNotArray = c.Emit(OpCode.JumpIfFalse, 0);
                         {
-                            // len = length(it)
+                            // len = length(it) via intrinsic
                             int lenSlot = NewTempSlot();
-                            c.Emit(OpCode.LoadName, 0, "length");
                             c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
-                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.Length);
                             c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
                             c.Emit(OpCode.Pop);
 
@@ -4955,10 +5032,9 @@ namespace MiniDynLang
                                     }
                                     else
                                     {
-                                        // key = to_string(idx)
-                                        cc.Emit(OpCode.LoadName, 0, "to_string");
+                                        // key = to_string(idx) via intrinsic
                                         cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
-                                        cc.Emit(OpCode.Call, 1);
+                                        cc.Emit(OpCode.ToStringOp);
                                     }
                                     return true;
                                 },
@@ -4974,11 +5050,10 @@ namespace MiniDynLang
                         c.Emit(OpCode.CmpEq);
                         int jNotString = c.Emit(OpCode.JumpIfFalse, 0);
                         {
-                            // len = length(it)
+                            // len = length(it) via intrinsic
                             int lenSlot = NewTempSlot();
-                            c.Emit(OpCode.LoadName, 0, "length");
                             c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
-                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.Length);
                             c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
                             c.Emit(OpCode.Pop);
 
@@ -4995,10 +5070,9 @@ namespace MiniDynLang
                                     }
                                     else
                                     {
-                                        // key = to_string(idx)
-                                        cc.Emit(OpCode.LoadName, 0, "to_string");
+                                        // key = to_string(idx) via intrinsic
                                         cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
-                                        cc.Emit(OpCode.Call, 1);
+                                        cc.Emit(OpCode.ToStringOp);
                                     }
                                     return true;
                                 },
@@ -5014,19 +5088,17 @@ namespace MiniDynLang
                         c.Emit(OpCode.CmpEq);
                         int jNotObject = c.Emit(OpCode.JumpIfFalse, 0);
                         {
-                            // arr = (fe.IsOf) ? values(it) : keys(it)
+                            // arr = (fe.IsOf) ? values(it) : keys(it) via intrinsics
                             int arrSlot = NewTempSlot();
-                            c.Emit(OpCode.LoadName, 0, fe.IsOf ? "values" : "keys");
                             c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
-                            c.Emit(OpCode.Call, 1);
+                            c.Emit(fe.IsOf ? OpCode.Values : OpCode.Keys);
                             c.Emit(OpCode.StoreLocal, ParamCount + arrSlot);
                             c.Emit(OpCode.Pop);
 
                             // len = length(arr)
                             int lenSlot = NewTempSlot();
-                            c.Emit(OpCode.LoadName, 0, "length");
                             c.Emit(OpCode.LoadLocal, ParamCount + arrSlot);
-                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.Length);
                             c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
                             c.Emit(OpCode.Pop);
 
@@ -5058,18 +5130,16 @@ namespace MiniDynLang
                         }
                         c.PatchJump(jNotNil, c.Code.Count);
 
-                        // For other types: raise a runtime error to match interpreter behavior.
+                        // For other types: raise a runtime error to match interpreter behavior using intrinsics.
                         {
-                            // Build message based on for-of vs for-in
                             int msgIdx = c.AddConst(
                                 Value.String(fe.IsOf
                                     ? "Value is not iterable for 'for ... of'"
                                     : "Value is not indexable for 'for ... in'"));
 
-                            // error("...") -> Error object on stack
-                            c.Emit(OpCode.LoadName, 0, "error");
+                            // MakeError + Throw
                             c.Emit(OpCode.LoadConst, msgIdx);
-                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.MakeError);
 
                             // Throw the error value so VM try/catch can handle it
                             c.Emit(OpCode.Throw);

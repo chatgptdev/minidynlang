@@ -800,6 +800,59 @@ test_eq("nested finally order on continue", (fn(){
     return log;
 })(), ["inner", "outer"]);
 
+// --- Intrinsics used by compiled foreach must not be shadowed --------------
+section("Iteration intrinsics are not shadowed by user code");
+
+// for-of over arrays should not use shadowed 'type'
+test_eq("for-of array unaffected by shadowed 'type'", (fn(){
+    fn type(_) { return "object"; } // would mislead if used
+    let acc = [];
+    for (let x of [1, 2]) { push(acc, x); }
+    return acc;
+})(), [1, 2]);
+
+// for-in over arrays should not use shadowed 'length' or 'to_string'
+test_eq("for-in array unaffected by shadowed 'length'/'to_string'", (fn(){
+    fn length(_) { return 0; }      // would cause 0 iterations if used
+    fn to_string(_) { return "ZZ"; } // would corrupt indices if used
+    let idxs = [];
+    for (let i in [10, 20]) { push(idxs, i); }
+    return idxs;
+})(), ["0", "1"]);
+
+// for-of over objects should not use shadowed 'values'
+test_eq("for-of object values unaffected by shadowed 'values'", (fn(){
+    fn values(_) { return ["hack"]; } // would change iteration result if used
+    let got = [];
+    for (let v of { a: 1, b: 2 }) { push(got, v); }
+    return got;
+})(), [1, 2]);
+
+// for-in over objects should not use shadowed 'keys'
+test_eq("for-in object keys unaffected by shadowed 'keys'", (fn(){
+    fn keys(_) { return ["hack"]; } // would change iteration result if used
+    let got = [];
+    for (let k in { a: 1, b: 2 }) { push(got, k); }
+    return got;
+})(), ["a", "b"]);
+
+// Non-iterable/Non-indexable errors should not use shadowed 'error'
+test_true("for-of non-iterable still raises when 'error' is shadowed", (fn(){
+    fn error(msg) { return { name: "Nope", message: "no" }; } // should be ignored by compiler
+    let ok = false;
+    try { for (let x of 123) { } }
+    catch (e) { ok = contains(e.message, "not iterable"); }
+    return ok;
+})());
+
+test_true("for-in non-indexable still raises when 'error' is shadowed", (fn(){
+    fn error(msg) { return { name: "Nope", message: "no" }; } // should be ignored by compiler
+    let ok = false;
+    try { for (let k in 123) { } }
+    catch (e) { ok = contains(e.message, "indexable"); }
+    return ok;
+})());
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
