@@ -3442,7 +3442,7 @@ namespace MiniDynLang
                 while (tryStack.Count > 0)
                 {
                     var fr = tryStack.Pop(); // examine this frame
-                    // Re-push it if we’re going to run its handler/finally
+                    // Re-push it if we're going to run its handler/finally
                     if (acceptCatch && fr.State == RegionState.InTry && fr.CatchIp >= 0)
                     {
                         fr.State = RegionState.InCatch;
@@ -3506,7 +3506,7 @@ namespace MiniDynLang
             {
                 while (ip < chunk.Code.Count)
                 {
-                    // Pending completions finalize once we’ve unwound out of all frames
+                    // Pending completions finalize once we've unwound out of all frames
                     MaybeComplete();
 
                     var ins = chunk.Code[ip++];
@@ -4436,7 +4436,7 @@ namespace MiniDynLang
                     else
                     {
                         // No finally: one TryLeave after try/catch
-                        // We’ll place TryLeave at the unified after-all location below
+                        // We'll place TryLeave at the unified after-all location below
                     }
 
                     // After-all continuation
@@ -5627,6 +5627,9 @@ namespace MiniDynLang
         private Environment _env;
         public Environment CurrentEnv => _env;
 
+        // Track whether we're inside a loop to validate break/continue usage
+        private int _loopDepth = 0;
+
         private readonly Dictionary<string, ICallable> _builtins = new Dictionary<string, ICallable>();
         private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
@@ -6388,130 +6391,163 @@ namespace MiniDynLang
 
         public object VisitWhile(Stmt.While s)
         {
-            while (Value.IsTruthy(Evaluate(s.Condition)))
+            _loopDepth++;
+            try
             {
-                try
+                while (Value.IsTruthy(Evaluate(s.Condition)))
                 {
-                    Execute(s.Body);
+                    try
+                    {
+                        Execute(s.Body);
+                    }
+                    catch (ContinueSignal)
+                    {
+                        continue;
+                    }
+                    catch (BreakSignal)
+                    {
+                        break;
+                    }
                 }
-                catch (ContinueSignal)
-                {
-                    continue;
-                }
-                catch (BreakSignal)
-                {
-                    break;
-                }
+                return null;
             }
-            return null;
+            finally
+            {
+                _loopDepth--;
+            }
         }
 
         public object VisitForClassic(Stmt.ForClassic s)
         {
-            // Create a loop-local lexical environment when the initializer declares let/const.
-            // This matches JS-like semantics where "let" in the for-head is scoped to that for statement.
-            bool hasBlockScopedInit =
-                s.Initializer is Stmt.Let ||
-                s.Initializer is Stmt.Const ||
-                (s.Initializer is Stmt.DestructuringDecl dd &&
-                 (dd.DeclKind == Stmt.DestructuringDecl.Kind.Let || dd.DeclKind == Stmt.DestructuringDecl.Kind.Const));
-
-            var loopEnv = hasBlockScopedInit ? new Environment(_env) : _env;
-
-            // Run initializer in loopEnv (if any)
-            if (s.Initializer != null)
+            _loopDepth++;
+            try
             {
-                var prev = _env;
-                try { _env = loopEnv; Execute(s.Initializer); }
-                finally { _env = prev; }
-            }
+                // Create a loop-local lexical environment when the initializer declares let/const.
+                bool hasBlockScopedInit =
+                    s.Initializer is Stmt.Let ||
+                    s.Initializer is Stmt.Const ||
+                    (s.Initializer is Stmt.DestructuringDecl dd &&
+                    (dd.DeclKind == Stmt.DestructuringDecl.Kind.Let || dd.DeclKind == Stmt.DestructuringDecl.Kind.Const));
 
-            while (true)
-            {
-                // Condition evaluates in loopEnv
-                if (s.Condition != null)
+                var loopEnv = hasBlockScopedInit ? new Environment(_env) : _env;
+
+                if (s.Initializer != null)
                 {
                     var prev = _env;
+                    try { _env = loopEnv; Execute(s.Initializer); }
+                    finally { _env = prev; }
+                }
+
+                while (true)
+                {
+                    if (s.Condition != null)
+                    {
+                        var prev = _env;
+                        try
+                        {
+                            _env = loopEnv;
+                            var c = Evaluate(s.Condition);
+                            if (!Value.IsTruthy(c)) break;
+                        }
+                        finally { _env = prev; }
+                    }
+
                     try
                     {
-                        _env = loopEnv;
-                        var c = Evaluate(s.Condition);
-                        if (!Value.IsTruthy(c)) break;
+                        var prev = _env;
+                        try { _env = loopEnv; Execute(s.Body); }
+                        finally { _env = prev; }
                     }
-                    finally { _env = prev; }
-                }
+                    catch (ContinueSignal)
+                    {
+                        // fallthrough to increment
+                    }
+                    catch (BreakSignal)
+                    {
+                        break;
+                    }
 
-                try
-                {
-                    // Execute body with loopEnv as the outer scope of the body
-                    var prev = _env;
-                    try { _env = loopEnv; Execute(s.Body); }
-                    finally { _env = prev; }
+                    if (s.Increment != null)
+                    {
+                        var prev = _env;
+                        try { _env = loopEnv; Evaluate(s.Increment); }
+                        finally { _env = prev; }
+                    }
                 }
-                catch (ContinueSignal)
-                {
-                    // fallthrough to increment
-                }
-                catch (BreakSignal)
-                {
-                    break;
-                }
-
-                // Increment in loopEnv
-                if (s.Increment != null)
-                {
-                    var prev = _env;
-                    try { _env = loopEnv; Evaluate(s.Increment); }
-                    finally { _env = prev; }
-                }
+                return null;
             }
-            return null;
+            finally
+            {
+                _loopDepth--;
+            }
         }
 
         // foreach (for-in/of)
         public object VisitForEach(Stmt.ForEach s)
         {
-            var iterable = Evaluate(s.Iterable);
+            _loopDepth++;
+            try
+            {
+                var iterable = Evaluate(s.Iterable);
 
-            if (s.IsOf)
-            {
-                var values = MaterializeForOf(iterable);
-                foreach (var item in values)
+                if (s.IsOf)
                 {
-                    try
+                    var values = MaterializeForOf(iterable);
+                    foreach (var item in values)
                     {
-                        ExecuteForEachIteration(s, item);
-                    }
-                    catch (ContinueSignal)
-                    {
-                        continue;
-                    }
-                    catch (BreakSignal)
-                    {
-                        break;
+                        try
+                        {
+                            ExecuteForEachIteration(s, item);
+                        }
+                        catch (ContinueSignal)
+                        {
+                            continue;
+                        }
+                        catch (BreakSignal)
+                        {
+                            break;
+                        }
                     }
                 }
-            }
-            else
-            {
-                var keys = MaterializeForIn(iterable);
-                foreach (var key in keys)
+                else
                 {
-                    try
+                    var keys = MaterializeForIn(iterable);
+                    foreach (var key in keys)
                     {
-                        ExecuteForEachIteration(s, Value.String(key));
-                    }
-                    catch (ContinueSignal)
-                    {
-                        continue;
-                    }
-                    catch (BreakSignal)
-                    {
-                        break;
+                        try
+                        {
+                            ExecuteForEachIteration(s, Value.String(key));
+                        }
+                        catch (ContinueSignal)
+                        {
+                            continue;
+                        }
+                        catch (BreakSignal)
+                        {
+                            break;
+                        }
                     }
                 }
+                return null;
             }
-            return null;
+            finally
+            {
+                _loopDepth--;
+            }
+        }
+
+        public object VisitBreak(Stmt.Break s)
+        {
+            if (_loopDepth == 0)
+                throw new MiniDynRuntimeError("break used outside of a loop");
+            throw new BreakSignal();
+        }
+
+        public object VisitContinue(Stmt.Continue s)
+        {
+            if (_loopDepth == 0)
+                throw new MiniDynRuntimeError("continue used outside of a loop");
+            throw new ContinueSignal();
         }
 
         private void ExecuteForEachIteration(Stmt.ForEach s, Value iterValue)
@@ -6716,9 +6752,6 @@ namespace MiniDynLang
             Value v = s.Value != null ? Evaluate(s.Value) : Value.Nil();
             throw new ReturnSignal(v);
         }
-
-        public object VisitBreak(Stmt.Break s) { throw new BreakSignal(); }
-        public object VisitContinue(Stmt.Continue s) { throw new ContinueSignal(); }
         public object VisitThrow(Stmt.Throw s)
         {
             var v = Evaluate(s.Value);
