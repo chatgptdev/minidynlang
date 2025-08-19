@@ -4107,6 +4107,51 @@ namespace MiniDynLang
             return arr.ToList();
         }
 
+        // === Helpers for lowering foreach ===
+
+        // Support only simple identifier pattern targets in the bytecode subset.
+        private bool TryPreparePatternTarget(Expr.Pattern pat, bool isDeclaration, Stmt.DestructuringDecl.Kind declKind,
+                                             out string name, out int? targetLocalSlot)
+        {
+            name = null; targetLocalSlot = null;
+            if (pat is Expr.PatternIdentifier id)
+            {
+                name = id.Name;
+                if (isDeclaration)
+                {
+                    // declare as a local slot
+                    int slot = EnsureLocal(name);
+                    targetLocalSlot = ParamCount + slot;
+                    return true;
+                }
+                else
+                {
+                    // assigning into an existing binding
+                    if (TryResolveVarSlot(name, out var slotIdx))
+                    {
+                        targetLocalSlot = slotIdx;
+                        return true;
+                    }
+                    // will fall back to StoreName at runtime
+                    targetLocalSlot = null;
+                    return true;
+                }
+            }
+            // destructuring or lvalue patterns are not supported in this bytecode path
+            return false;
+        }
+
+        // Store the value currently on TOS into the prepared pattern target, then pop the result.
+        private void EmitStoreIntoPatternFromStack(Chunk c, string name, int? targetLocalSlot)
+        {
+            if (targetLocalSlot.HasValue)
+                c.Emit(OpCode.StoreLocal, targetLocalSlot.Value);
+            else
+                c.Emit(OpCode.StoreName, 0, name);
+            // Store* leaves the value on stack; pop it
+            c.Emit(OpCode.Pop);
+        }
+
         // statement emitter for a supported subset
         private bool TryEmitStmt(Stmt s, Chunk c)
         {
@@ -4301,6 +4346,236 @@ namespace MiniDynLang
                         return true;
                     }
 
+                // === Lowered foreach ===
+                case Stmt.ForEach fe:
+                    {
+                        // Only simple identifier pattern in the compiled path
+                        if (!TryPreparePatternTarget(fe.Pattern, fe.IsDeclaration, fe.DeclKind,
+                                                     out var bindName, out var bindLocalSlot))
+                            return false;
+
+                        // it = <iterable>
+                        int itSlot = NewTempSlot();
+                        if (!TryEmitExpr(fe.Iterable, c)) return false;
+                        c.Emit(OpCode.StoreLocal, ParamCount + itSlot);
+                        c.Emit(OpCode.Pop);
+
+                        // t = type(it)
+                        int typeSlot = NewTempSlot();
+                        c.Emit(OpCode.LoadName, 0, "type");
+                        c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                        c.Emit(OpCode.Call, 1);
+                        c.Emit(OpCode.StoreLocal, ParamCount + typeSlot);
+                        c.Emit(OpCode.Pop);
+
+                        // Constants
+                        int kArray = c.AddConst(Value.String("array"));
+                        int kString = c.AddConst(Value.String("string"));
+                        int kObject = c.AddConst(Value.String("object"));
+                        int kNil = c.AddConst(Value.String("nil"));
+                        int kZero = c.AddConst(Value.Number(NumberValue.FromLong(0)));
+                        int kOne = c.AddConst(Value.Number(NumberValue.FromLong(1)));
+
+                        var endJumps = new List<int>();
+
+                        // Utility to emit i=0..len-1 loop.
+                        int EmitIndexLoop(int lenSlot, Func<Chunk, int, bool> emitElementOrKey, out int endJumpOut)
+                        {
+                            endJumpOut = -1;
+
+                            // idx local
+                            int idxSlot = NewTempSlot();
+
+                            // idx = 0
+                            c.Emit(OpCode.LoadConst, kZero);
+                            c.Emit(OpCode.StoreLocal, ParamCount + idxSlot);
+                            c.Emit(OpCode.Pop);
+
+                            // Loop context
+                            var ctx = new LoopContext();
+                            ctx.LoopStartIp = c.Code.Count;
+                            _loopStack.Push(ctx);
+
+                            // condition: idx < len
+                            c.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                            c.Emit(OpCode.LoadLocal, ParamCount + lenSlot);
+                            c.Emit(OpCode.CmpLt);
+                            int jf = c.Emit(OpCode.JumpIfFalse, 0);
+
+                            // Body: push current element/key onto stack
+                            if (!emitElementOrKey(c, idxSlot)) { _loopStack.Pop(); return -1; }
+
+                            // Bind into target pattern
+                            EmitStoreIntoPatternFromStack(c, bindName, bindLocalSlot);
+
+                            // Emit body
+                            if (!TryEmitStmt(fe.Body, c)) { _loopStack.Pop(); return -1; }
+
+                            // continue -> inc
+                            int incStart = c.Code.Count;
+                            foreach (var jp in ctx.ContinueJumps) c.PatchJump(jp, incStart);
+
+                            // idx = idx + 1
+                            c.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                            c.Emit(OpCode.LoadConst, kOne);
+                            c.Emit(OpCode.Add);
+                            c.Emit(OpCode.StoreLocal, ParamCount + idxSlot);
+                            c.Emit(OpCode.Pop);
+
+                            // backedge
+                            c.Emit(OpCode.Jump, ctx.LoopStartIp);
+
+                            // exit, patch breaks
+                            int exitIp = c.Code.Count;
+                            c.PatchJump(jf, exitIp);
+                            foreach (var jp in ctx.BreakJumps) c.PatchJump(jp, exitIp);
+                            _loopStack.Pop();
+
+                            // jump to end of foreach after finishing matched branch
+                            endJumpOut = c.Emit(OpCode.Jump, 0);
+                            return idxSlot;
+                        }
+
+                        // Branch: array (type == "array")
+                        c.Emit(OpCode.LoadLocal, ParamCount + typeSlot);
+                        c.Emit(OpCode.LoadConst, kArray);
+                        c.Emit(OpCode.CmpEq);
+                        int jNotArray = c.Emit(OpCode.JumpIfFalse, 0);
+                        {
+                            // len = length(it)
+                            int lenSlot = NewTempSlot();
+                            c.Emit(OpCode.LoadName, 0, "length");
+                            c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
+                            c.Emit(OpCode.Pop);
+
+                            // for (i=0; i<len; i++) ...
+                            int endJump;
+                            int dummy = EmitIndexLoop(lenSlot,
+                                emitElementOrKey: (cc, idxSlot) =>
+                                {
+                                    if (fe.IsOf)
+                                    {
+                                        // value = it[idx]
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                                        cc.Emit(OpCode.GetIndex);
+                                    }
+                                    else
+                                    {
+                                        // key = to_string(idx)
+                                        cc.Emit(OpCode.LoadName, 0, "to_string");
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                                        cc.Emit(OpCode.Call, 1);
+                                    }
+                                    return true;
+                                },
+                                out endJump);
+                            if (dummy < 0) return false;
+                            endJumps.Add(endJump);
+                        }
+                        c.PatchJump(jNotArray, c.Code.Count);
+
+                        // Branch: string (type == "string")
+                        c.Emit(OpCode.LoadLocal, ParamCount + typeSlot);
+                        c.Emit(OpCode.LoadConst, kString);
+                        c.Emit(OpCode.CmpEq);
+                        int jNotString = c.Emit(OpCode.JumpIfFalse, 0);
+                        {
+                            // len = length(it)
+                            int lenSlot = NewTempSlot();
+                            c.Emit(OpCode.LoadName, 0, "length");
+                            c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
+                            c.Emit(OpCode.Pop);
+
+                            int endJump;
+                            int dummy = EmitIndexLoop(lenSlot,
+                                emitElementOrKey: (cc, idxSlot) =>
+                                {
+                                    if (fe.IsOf)
+                                    {
+                                        // ch = it[idx]
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                                        cc.Emit(OpCode.GetIndex);
+                                    }
+                                    else
+                                    {
+                                        // key = to_string(idx)
+                                        cc.Emit(OpCode.LoadName, 0, "to_string");
+                                        cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                                        cc.Emit(OpCode.Call, 1);
+                                    }
+                                    return true;
+                                },
+                                out endJump);
+                            if (dummy < 0) return false;
+                            endJumps.Add(endJump);
+                        }
+                        c.PatchJump(jNotString, c.Code.Count);
+
+                        // Branch: object (type == "object")
+                        c.Emit(OpCode.LoadLocal, ParamCount + typeSlot);
+                        c.Emit(OpCode.LoadConst, kObject);
+                        c.Emit(OpCode.CmpEq);
+                        int jNotObject = c.Emit(OpCode.JumpIfFalse, 0);
+                        {
+                            // arr = (fe.IsOf) ? values(it) : keys(it)
+                            int arrSlot = NewTempSlot();
+                            c.Emit(OpCode.LoadName, 0, fe.IsOf ? "values" : "keys");
+                            c.Emit(OpCode.LoadLocal, ParamCount + itSlot);
+                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.StoreLocal, ParamCount + arrSlot);
+                            c.Emit(OpCode.Pop);
+
+                            // len = length(arr)
+                            int lenSlot = NewTempSlot();
+                            c.Emit(OpCode.LoadName, 0, "length");
+                            c.Emit(OpCode.LoadLocal, ParamCount + arrSlot);
+                            c.Emit(OpCode.Call, 1);
+                            c.Emit(OpCode.StoreLocal, ParamCount + lenSlot);
+                            c.Emit(OpCode.Pop);
+
+                            int endJump;
+                            int dummy = EmitIndexLoop(lenSlot,
+                                emitElementOrKey: (cc, idxSlot) =>
+                                {
+                                    // elem = arr[idx]
+                                    cc.Emit(OpCode.LoadLocal, ParamCount + arrSlot);
+                                    cc.Emit(OpCode.LoadLocal, ParamCount + idxSlot);
+                                    cc.Emit(OpCode.GetIndex);
+                                    return true;
+                                },
+                                out endJump);
+                            if (dummy < 0) return false;
+                            endJumps.Add(endJump);
+                        }
+                        c.PatchJump(jNotObject, c.Code.Count);
+
+                        // Branch: nil (type == "nil") -> empty loop (do nothing)
+                        c.Emit(OpCode.LoadLocal, ParamCount + typeSlot);
+                        c.Emit(OpCode.LoadConst, kNil);
+                        c.Emit(OpCode.CmpEq);
+                        int jNotNil = c.Emit(OpCode.JumpIfFalse, 0);
+                        {
+                            // nothing; just jump to end
+                            int j = c.Emit(OpCode.Jump, 0);
+                            endJumps.Add(j);
+                        }
+                        c.PatchJump(jNotNil, c.Code.Count);
+
+                        // For other types: fallback to interpreter by failing compilation
+                        // (keeps behavior consistent with runtime errors on unsupported types)
+                        if (endJumps.Count == 0) return false;
+
+                        // Patch all end jumps to here
+                        int endIp = c.Code.Count;
+                        foreach (var jp in endJumps) c.PatchJump(jp, endIp);
+                        return true;
+                    }
                 default:
                     return false;
             }
