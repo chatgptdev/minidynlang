@@ -622,14 +622,55 @@ namespace MiniDynLang
         public int Column { get; }
         public string FileName { get; }
 
+        // Indicates this token represents a raw triple-quoted string ("""...""")
+        public bool IsRawString { get; }
+
+        // The starting line/column of the string's content (i.e., after the opening quote(s))
+        public int StringContentStartLine { get; }
+        public int StringContentStartColumn { get; }
+
         public Token(TokenType type, string lexeme, object literal, int pos, int line, int column)
         {
-            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column; FileName = "<script>";
+            Type = type;
+            Lexeme = lexeme;
+            Literal = literal;
+            Position = pos;
+            Line = line;
+            Column = column;
+            FileName = "<script>";
+            IsRawString = false;
+            StringContentStartLine = -1;
+            StringContentStartColumn = -1;
         }
 
         public Token(TokenType type, string lexeme, object literal, int pos, int line, int column, string fileName)
         {
-            Type = type; Lexeme = lexeme; Literal = literal; Position = pos; Line = line; Column = column; FileName = fileName ?? "<script>";
+            Type = type;
+            Lexeme = lexeme;
+            Literal = literal;
+            Position = pos;
+            Line = line;
+            Column = column;
+            FileName = fileName ?? "<script>";
+            IsRawString = false;
+            StringContentStartLine = -1;
+            StringContentStartColumn = -1;
+        }
+
+        // Constructor specialized for string tokens with raw flag and content start position
+        public Token(TokenType type, string lexeme, object literal, int pos, int line, int column, string fileName,
+                     bool isRawString, int contentStartLine, int contentStartColumn)
+        {
+            Type = type;
+            Lexeme = lexeme;
+            Literal = literal;
+            Position = pos;
+            Line = line;
+            Column = column;
+            FileName = fileName ?? "<script>";
+            IsRawString = isRawString;
+            StringContentStartLine = contentStartLine;
+            StringContentStartColumn = contentStartColumn;
         }
 
         public override string ToString() => $"{Type} '{Lexeme}' @ {Line}:{Column}";
@@ -841,7 +882,8 @@ namespace MiniDynLang
 
         private Token StringToken(int start, int startLine, int startCol)
         {
-            StringBuilder sb = new StringBuilder();
+            // Parse a standard quoted string with escapes, and record content start pos (after opening ")
+            var sb = new StringBuilder();
             while (!IsAtEnd && Peek() != '"')
             {
                 char c = Advance();
@@ -871,33 +913,43 @@ namespace MiniDynLang
                                 int h3 = HexDigit(Peek()); Advance();
                                 int h4 = HexDigit(Peek()); Advance();
                                 if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) throw new MiniDynLexError("Invalid \\uNNNN escape", _line, _col);
-                                c = (char)((((h1 << 4) | h2) << 8) | ((h3 << 4) | h4));
+                                c = (char)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
                                 break;
                             }
-                        default: c = e; break;
+                        default:
+                            // Unknown escape: treat as literal of escaped char
+                            c = e;
+                            break;
                     }
-                    ;
                 }
                 sb.Append(c);
             }
             if (IsAtEnd) throw new MiniDynLexError("Unterminated string", startLine, startCol);
-            Advance(); // closing "
-            string text = sb.ToString();
-            return MakeToken(TokenType.String, text, text, start, startLine, startCol);
+            Advance(); // consume closing "
+            var text = sb.ToString();
+            // content starts right after the opening "
+            return new Token(TokenType.String, text, text, start, startLine, startCol, _fileName,
+                             isRawString: false,
+                             contentStartLine: startLine,
+                             contentStartColumn: startCol + 1);
         }
 
 
         private Token RawStringToken(int start, int startLine, int startCol)
         {
-            // Already consumed the leading """ in NextToken
-            StringBuilder sb = new StringBuilder();
+            // We are positioned right after consuming the opening """
+            var sb = new StringBuilder();
             while (!IsAtEnd)
             {
                 if (Peek() == '"' && PeekNext() == '"' && PeekNext2() == '"')
                 {
                     Advance(); Advance(); Advance(); // consume closing """
-                    string text = sb.ToString();
-                    return MakeToken(TokenType.String, text, text, start, startLine, startCol);
+                    var text = sb.ToString();
+                    // content starts after the opening """
+                    return new Token(TokenType.String, text, text, start, startLine, startCol, _fileName,
+                                     isRawString: true,
+                                     contentStartLine: startLine,
+                                     contentStartColumn: startCol + 3);
                 }
                 sb.Append(Advance());
             }
@@ -2657,12 +2709,35 @@ namespace MiniDynLang
         {
             var span = SourceSpan.FromToken(tok);
             var text = (string)tok.Literal ?? "";
+
+            // Raw triple-quoted strings: no ${...} interpolation.
+            if (tok != null && tok.IsRawString)
+            {
+                var lit = new Expr.Literal(Value.String(text));
+                lit.Span = span;
+                return lit;
+            }
+
             const string marker = "${";
             if (text.IndexOf(marker, StringComparison.Ordinal) < 0)
             {
                 var lit = new Expr.Literal(Value.String(text));
                 lit.Span = span;
                 return lit;
+            }
+
+            // Compute absolute source position within the string content
+            (int line, int col) ComputePosInStringContent(int offsetInContent)
+            {
+                int line = tok.StringContentStartLine > 0 ? tok.StringContentStartLine : tok.Line;
+                int col = tok.StringContentStartColumn > 0 ? tok.StringContentStartColumn : (tok.Column + 1);
+                for (int k = 0; k < offsetInContent; k++)
+                {
+                    char ch = text[k];
+                    if (ch == '\n') { line++; col = 1; }
+                    else { col++; }
+                }
+                return (line, col);
             }
 
             // Split into parts: text and embedded expressions delimited by ${ ... }
@@ -2679,13 +2754,38 @@ namespace MiniDynLang
                 }
                 // literal chunk before ${
                 if (j > i) parts.Add(text.Substring(i, j - i));
+
+                // Find matching }
                 int endExpr = FindMatchingBrace(text, j + 1); // returns index of closing '}'
-                if (endExpr < 0) throw new MiniDynParseError("Unterminated interpolation '${...}' in string", tok.Line, tok.Column);
-                int exprStart = j + 2;
+                if (endExpr < 0)
+                {
+                    // Unterminated interpolation: report at the start of '${'
+                    var pos = ComputePosInStringContent(j);
+                    throw new MiniDynParseError("Unterminated interpolation '${...}' in string", pos.line, pos.col);
+                }
+
+                int exprStart = j + 2; // after ${
                 int exprLen = endExpr - exprStart;
                 string exprSrc = exprLen > 0 ? text.Substring(exprStart, exprLen) : "";
-                var exprNode = ParseExpressionFromString(exprSrc, tok.FileName);
-                parts.Add(exprNode);
+
+                // Base position (absolute) of the interpolation expression start, for error mapping
+                var basePos = ComputePosInStringContent(exprStart);
+
+                try
+                {
+                    var exprNode = ParseExpressionFromString(exprSrc, tok.FileName);
+                    parts.Add(exprNode);
+                }
+                catch (MiniDynParseError ex)
+                {
+                    // Map the error location inside exprSrc to the original file coordinates
+                    int absLine = basePos.line + (ex.Line > 0 ? (ex.Line - 1) : 0);
+                    int absCol = (ex.Line <= 1)
+                        ? (basePos.col + Math.Max(0, ex.Column - 1))
+                        : ex.Column;
+                    throw new MiniDynParseError($"In string interpolation: {ex.Message}", absLine, absCol);
+                }
+
                 i = endExpr + 1; // continue after '}'
             }
 
@@ -2705,7 +2805,6 @@ namespace MiniDynLang
                 if (result == null) result = partExpr;
                 else result = new Expr.Binary(result, new Token(TokenType.Plus, "+", null, 0, 0, 0, tok.FileName), partExpr) { Span = span };
             }
-            // If string started with interpolation, result may be null if parts empty; ensure empty string
             if (result == null) result = new Expr.Literal(Value.String("")) { Span = span };
             return result;
         }
