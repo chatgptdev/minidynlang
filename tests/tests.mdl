@@ -332,6 +332,31 @@ test_eq("restLastDemo(1)", restLastDemo(1), { a: 1, b: 2, rest: [] });
 test_eq("restLastDemo(1,3,4,5)", restLastDemo(1, 3, 4, 5), { a: 1, b: 3, rest: [4, 5] });
 test_eq("restLastDemo(b:10,a:7,8,9)", restLastDemo(b: 10, a: 7, 8, 9), { a: 7, b: 10, rest: [8, 9] });
 
+// Named args + default evaluation in callee env
+section("Named args: default evaluation in callee env");
+
+// The global 'a' exists from earlier tests; ensure it would interfere if looked up from caller.
+// Defaults must see the callee's parameter 'a', not this global.
+a = 100;
+
+fn def_scope(a, b = a) { return [a, b]; }
+test_eq("default sees earlier param (positional)", def_scope(3), [3, 3]);
+test_eq("default sees earlier param (named)", def_scope(a: 1), [1, 1]);
+test_eq("explicit named overrides default", def_scope(b: 5, a: 2), [2, 5]);
+
+fn def_with_rest(a, b = a, ...r) { return { a: a, b: b, r: r }; }
+test_eq("default + rest with named a", def_with_rest(a: 7, 8, 9), { a: 7, b: 7, r: [8, 9] });
+test_eq("default + rest with named b and a", def_with_rest(b: 10, a: 7, 8), { a: 7, b: 10, r: [8] });
+
+// Chained defaults must evaluate left-to-right in the callee env
+fn chain(a = 1, b = a + 1, c = b + 1) { return [a, b, c]; }
+test_eq("chained defaults: none provided", chain(), [1, 2, 3]);
+test_eq("chained defaults: only b provided", chain(b: 5), [1, 5, 6]);
+test_eq("chained defaults: a provided", chain(a: 10), [10, 11, 12]);
+test_eq("chained defaults: c provided", chain(c: 100), [1, 2, 100]);
+test_eq("chained defaults: b,a provided (reverse order allowed)", chain(b: 5, a: 10), [10, 5, 6]);
+test_eq("chained defaults: c,a provided", chain(c: 20, a: 2), [2, 3, 20]);
+
 // JSON roundtrip
 section("JSON");
 let objJ = { msg: "ok", data: [1, 2, 3], nested: { a: 1 } };

@@ -3088,6 +3088,7 @@ namespace MiniDynLang
             try
             {
                 var currentArgs = args;
+                Interpreter.ArgMapping? currentMap = null; // support mapping from tail-calls
                 while (true)
                 {
                     var env = new Environment(Closure);
@@ -3102,43 +3103,72 @@ namespace MiniDynLang
                         env.DefineConst("this", _boundThis.Value);
                     }
 
-                    // Bind parameters with defaults and rest
-                    int i = 0;
-                    int argsCount = currentArgs.Count;
-                    bool hasRest = false;
-                    for (int pi = 0; pi < Params.Count; pi++)
+                    // Bind parameters:
+                    if (currentMap.HasValue)
                     {
-                        var p = Params[pi];
-                        if (p.IsRest)
+                        // Mapping-based binding (named args): evaluate defaults in callee env
+                        var m = currentMap.Value;
+                        int restIndex = -1;
+                        for (int pi = 0; pi < Params.Count; pi++)
                         {
-                            hasRest = true;
+                            var p = Params[pi];
+                            if (p.IsRest) { restIndex = pi; continue; }
+                            if (m.Filled.Length <= pi) throw new MiniDynRuntimeError("Invalid argument mapping");
+                            if (m.Filled[pi]) env.DefineVar(p.Name, m.Values[pi]);
+                            else if (p.Default != null) env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                            else throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                        }
+                        if (restIndex >= 0)
+                        {
                             var rest = new ArrayValue();
-                            for (int ai = i; ai < argsCount; ai++)
+                            foreach (var v in m.Rest) rest.Items.Add(v);
+                            env.DefineVar(Params[restIndex].Name, Value.Array(rest));
+                        }
+                        else if (m.Rest != null && m.Rest.Count > 0)
+                        {
+                            throw new MiniDynRuntimeError($"Function {ToString()} expected at most {Params.Count} args, got more");
+                        }
+                    }
+                    else
+                    {
+                        // Positional-only binding (existing logic)
+                        int i = 0;
+                        int argsCount = currentArgs.Count;
+                        bool hasRest = false;
+                        for (int pi = 0; pi < Params.Count; pi++)
+                        {
+                            var p = Params[pi];
+                            if (p.IsRest)
                             {
-                                rest.Items.Add(currentArgs[ai]);
+                                hasRest = true;
+                                var rest = new ArrayValue();
+                                for (int ai = i; ai < argsCount; ai++)
+                                {
+                                    rest.Items.Add(currentArgs[ai]);
+                                }
+                                env.DefineVar(p.Name, Value.Array(rest));
+                                i = argsCount;
+                                continue;
                             }
-                            env.DefineVar(p.Name, Value.Array(rest));
-                            i = argsCount;
-                            continue;
-                        }
-                        if (i < argsCount)
-                        {
-                            env.DefineVar(p.Name, currentArgs[i++]);
-                        }
-                        else
-                        {
-                            if (p.Default != null)
+                            if (i < argsCount)
                             {
-                                env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                                env.DefineVar(p.Name, currentArgs[i++]);
                             }
                             else
                             {
-                                throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                                if (p.Default != null)
+                                {
+                                    env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                                }
+                                else
+                                {
+                                    throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                                }
                             }
                         }
+                        if (!hasRest && i < argsCount)
+                            throw new MiniDynRuntimeError($"Function {ToString()} expected at most {ArityMax} args, got {argsCount}");
                     }
-                    if (!hasRest && i < argsCount)
-                        throw new MiniDynRuntimeError($"Function {ToString()} expected at most {ArityMax} args, got {argsCount}");
 
                     try
                     {
@@ -3150,8 +3180,102 @@ namespace MiniDynLang
                         var uf = tcs.Function;
                         if (uf != null && uf.FunctionId == this.FunctionId)
                         {
-                            currentArgs = tcs.Args ?? new List<Value>();
+                            if (tcs.Mapping.HasValue)
+                            {
+                                currentMap = tcs.Mapping.Value;
+                                currentArgs = null;
+                            }
+                            else
+                            {
+                                currentArgs = tcs.Args ?? new List<Value>();
+                                currentMap = null;
+                            }
                             // loop again with new args; do not grow C# stack
+                            continue;
+                        }
+                        throw;
+                    }
+                    catch (Interpreter.ReturnSignal ret)
+                    {
+                        return ret.Value;
+                    }
+
+                    return Value.Nil();
+                }
+            }
+            finally
+            {
+                interp.PopFunction();
+            }
+        }
+
+        // Call variant that takes a mapping (used for named-arg calls)
+        public Value CallWithMapping(Interpreter interp, Interpreter.ArgMapping mapping)
+        {
+            interp.PushFunction(this);
+            try
+            {
+                var currentMap = (Interpreter.ArgMapping?)mapping;
+                List<Value> currentArgs = null;
+
+                while (true)
+                {
+                    var env = new Environment(Closure);
+
+                    if (FunctionKind == Kind.Arrow)
+                    {
+                        if (_capturedThis.HasValue) env.DefineConst("this", _capturedThis.Value);
+                    }
+                    else if (_boundThis.HasValue)
+                    {
+                        env.DefineConst("this", _boundThis.Value);
+                    }
+
+                    // Bind from mapping
+                    var m = currentMap.Value;
+                    int restIndex = -1;
+                    for (int pi = 0; pi < Params.Count; pi++)
+                    {
+                        var p = Params[pi];
+                        if (p.IsRest) { restIndex = pi; continue; }
+                        if (m.Filled.Length <= pi) throw new MiniDynRuntimeError("Invalid argument mapping");
+                        if (m.Filled[pi]) env.DefineVar(p.Name, m.Values[pi]);
+                        else if (p.Default != null) env.DefineVar(p.Name, interp.EvaluateWithEnv(p.Default, env));
+                        else throw new MiniDynRuntimeError($"Missing required argument '{p.Name}' for function {ToString()}");
+                    }
+                    if (restIndex >= 0)
+                    {
+                        var rest = new ArrayValue();
+                        foreach (var v in m.Rest) rest.Items.Add(v);
+                        env.DefineVar(Params[restIndex].Name, Value.Array(rest));
+                    }
+                    else if (m.Rest != null && m.Rest.Count > 0)
+                    {
+                        throw new MiniDynRuntimeError($"Function {ToString()} expected at most {Params.Count} args, got more");
+                    }
+
+                    try
+                    {
+                        interp.ExecuteBlock(Body.Statements, env);
+                    }
+                    catch (Interpreter.TailCallSignal tcs)
+                    {
+                        var uf = tcs.Function;
+                        if (uf != null && uf.FunctionId == this.FunctionId)
+                        {
+                            if (tcs.Mapping.HasValue)
+                            {
+                                currentMap = tcs.Mapping.Value;
+                                currentArgs = null;
+                            }
+                            else
+                            {
+                                currentArgs = tcs.Args ?? new List<Value>();
+                                currentMap = null;
+                            }
+                            // If we got positional-only args, switch to the positional Call path
+                            if (currentMap == null)
+                                return this.Call(interp, currentArgs);
                             continue;
                         }
                         throw;
@@ -5616,11 +5740,30 @@ namespace MiniDynLang
         {
             public UserFunction Function { get; }
             public List<Value> Args { get; }
+            // carry an argument mapping for named-args/defaults
+            public ArgMapping? Mapping { get; }
+
             public TailCallSignal(UserFunction fn, List<Value> args)
             {
                 Function = fn;
                 Args = args;
+                Mapping = null;
             }
+
+            public TailCallSignal(UserFunction fn, ArgMapping mapping)
+            {
+                Function = fn;
+                Mapping = mapping;
+                Args = null;
+            }
+        }
+
+        // mapping used for named arguments (no default evaluation here)
+        public struct ArgMapping
+        {
+            public Value[] Values; // length == parameter count; slots for non-rest params
+            public bool[] Filled;  // which non-rest param slots are provided
+            public List<Value> Rest; // extra positional args for rest param (if any)
         }
 
         public readonly Environment Globals;
@@ -6675,77 +6818,156 @@ namespace MiniDynLang
                     throw new ReturnSignal(Value.Nil());
                 }
 
-                if (currentFn != null && calleeVal.Type == ValueType.Function && calleeVal.AsFunction() is UserFunction targetFn
-                    && targetFn.FunctionId == currentFn.FunctionId)
-                {
-                    // Self tail-call: evaluate args and trampoline
-                    var finalArgs = ProcessNamedArguments(currentFn, callExpr.Args);
-                    throw new TailCallSignal(currentFn, finalArgs);
-                }
-
-                // Not a self tail call: complete the call using the evaluated callee (no second callee evaluation)
                 if (calleeVal.Type != ValueType.Function)
                     throw new MiniDynRuntimeError("Can only call functions");
 
+                // Self tail-call to same UserFunction: pass mapping for named-arg correctness
+                if (currentFn != null && calleeVal.AsFunction() is UserFunction targetFn
+                    && targetFn.FunctionId == currentFn.FunctionId)
+                {
+                    if (callExpr.Args.Any(a => a.IsNamed))
+                    {
+                        var mapping = BuildArgMapping(ToParamViews(currentFn.Params), callExpr.Args);
+                        throw new TailCallSignal(currentFn, mapping);
+                    }
+                    else
+                    {
+                        var finalArgs = new List<Value>();
+                        foreach (var a in callExpr.Args) finalArgs.Add(Evaluate(a.Value));
+                        throw new TailCallSignal(currentFn, finalArgs);
+                    }
+                }
+
+                // Not a self tail call: complete the call using evaluated callee/receiver
                 var fn = calleeVal.AsFunction();
-                List<Value> processedArgs;
 
                 if (fn is UserFunction userFn2)
                 {
-                    processedArgs = ProcessNamedArguments(userFn2, callExpr.Args);
+                    // Named-arg path -> mapping
+                    if (callExpr.Args.Any(a => a.IsNamed))
+                    {
+                        var mapping = BuildArgMapping(ToParamViews(userFn2.Params), callExpr.Args);
 
-                    // Bind 'this' if we had a receiver and the function is a normal function
-                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
-                        fn = userFn2.BindThis(receiver);
+                        if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                            fn = userFn2.BindThis(receiver);
+
+                        string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
+                        var callSite = callExpr?.Span ?? default(SourceSpan);
+                        _callStack.Push(new CallFrame(fnName, callSite));
+                        try
+                        {
+                            var res = ((UserFunction)fn).CallWithMapping(this, mapping);
+                            throw new ReturnSignal(res);
+                        }
+                        catch (MiniDynRuntimeError ex)
+                        {
+                            AttachErrorContext(ex);
+                            throw;
+                        }
+                        finally
+                        {
+                            _callStack.Pop();
+                        }
+                    }
+                    else
+                    {
+                        // positional
+                        var processedArgs = new List<Value>();
+                        foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
+
+                        if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
+                            fn = userFn2.BindThis(receiver);
+
+                        if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                            throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                        string fnName =
+                            !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
+                        var callSite = callExpr?.Span ?? default(SourceSpan);
+                        _callStack.Push(new CallFrame(fnName, callSite));
+                        try
+                        {
+                            var res = fn.Call(this, processedArgs);
+                            throw new ReturnSignal(res);
+                        }
+                        catch (MiniDynRuntimeError ex)
+                        {
+                            AttachErrorContext(ex);
+                            throw;
+                        }
+                        finally
+                        {
+                            _callStack.Pop();
+                        }
+                    }
                 }
                 else if (fn is BytecodeFunction byteFn2)
                 {
+                    List<Value> processedArgs;
                     if (callExpr.Args.Any(a => a.IsNamed) || (byteFn2.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
                     {
-                        processedArgs = ProcessNamedArguments(byteFn2.Params, callExpr.Args);
+                        processedArgs = BuildPositionalArgsForBytecode(byteFn2.Params, callExpr.Args);
                     }
                     else
                     {
                         processedArgs = new List<Value>();
-                        foreach (var arg in callExpr.Args)
-                            processedArgs.Add(Evaluate(arg.Value));
+                        foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
                     }
 
                     if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
                         fn = byteFn2.BindThis(receiver);
-               }
+
+                    if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                    string fnName =
+                        "<anonymous>";
+                    var callSite = callExpr?.Span ?? default(SourceSpan);
+                    _callStack.Push(new CallFrame(fnName, callSite));
+                    try
+                    {
+                        var res = fn.Call(this, processedArgs);
+                        throw new ReturnSignal(res);
+                    }
+                    catch (MiniDynRuntimeError ex)
+                    {
+                        AttachErrorContext(ex);
+                        throw;
+                    }
+                    finally
+                    {
+                        _callStack.Pop();
+                    }
+                }
                 else
                 {
-                    // Builtins: no named args
                     if (callExpr.Args.Any(a => a.IsNamed))
                         throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-                    processedArgs = new List<Value>();
-                    foreach (var arg in callExpr.Args)
-                        processedArgs.Add(Evaluate(arg.Value));
-                }
 
-                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+                    var processedArgs = new List<Value>();
+                    foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
 
-                string fnName =
-                    fn is BuiltinFunction bf ? bf.Name :
-                    fn is UserFunction uf && !string.IsNullOrEmpty(uf.Name) ? uf.Name :
-                    "<anonymous>";
-                var callSite = callExpr?.Span ?? default(SourceSpan);
-                _callStack.Push(new CallFrame(fnName, callSite));
-                try
-                {
-                    var res = fn.Call(this, processedArgs);
-                    throw new ReturnSignal(res);
-                }
-                catch (MiniDynRuntimeError ex)
-                {
-                    AttachErrorContext(ex);
-                    throw;
-                }
-                finally
-                {
-                    _callStack.Pop();
+                    if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                    string fnName =
+                        fn is BuiltinFunction bf ? bf.Name : "<anonymous>";
+                    var callSite = callExpr?.Span ?? default(SourceSpan);
+                    _callStack.Push(new CallFrame(fnName, callSite));
+                    try
+                    {
+                        var res = fn.Call(this, processedArgs);
+                        throw new ReturnSignal(res);
+                    }
+                    catch (MiniDynRuntimeError ex)
+                    {
+                        AttachErrorContext(ex);
+                        throw;
+                    }
+                    finally
+                    {
+                        _callStack.Pop();
+                    }
                 }
             }
 
@@ -7112,58 +7334,123 @@ namespace MiniDynLang
 
             var fn = calleeVal.AsFunction();
 
-            // Process arguments (defer evaluation until after we know we're calling)
-            List<Value> processedArgs;
-
+            // UserFunction: use mapping for named-arg calls (defaults evaluated in callee env)
             if (fn is UserFunction userFn)
             {
-                processedArgs = ProcessNamedArguments(userFn, e.Args);
-
-                if (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
+                if (e.Args.Any(a => a.IsNamed))
                 {
-                    fn = userFn.BindThis(receiver);
+                    var mapping = BuildArgMapping(ToParamViews(userFn.Params), e.Args);
+
+                    // Bind 'this' if receiver provided and normal function
+                    var callTarget = (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
+                        ? userFn.BindThis(receiver)
+                        : userFn;
+
+                    string fnName = !string.IsNullOrEmpty(userFn.Name) ? userFn.Name : "<anonymous>";
+                    var callSite = e?.Span ?? default(SourceSpan);
+                    _callStack.Push(new CallFrame(fnName, callSite));
+                    try
+                    {
+                        return callTarget.CallWithMapping(this, mapping);
+                    }
+                    catch (MiniDynRuntimeError ex)
+                    {
+                        AttachErrorContext(ex);
+                        throw;
+                    }
+                    finally
+                    {
+                        _callStack.Pop();
+                    }
+                }
+                else
+                {
+                    // positional-only path unchanged
+                    var argsList = new List<Value>();
+                    foreach (var arg in e.Args) argsList.Add(Evaluate(arg.Value));
+
+                    // Bind 'this' if needed
+                    if (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
+                        fn = userFn.BindThis(receiver);
+
+                    if (argsList.Count < fn.ArityMin || argsList.Count > fn.ArityMax)
+                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {argsList.Count}");
+
+                    string fnName =
+                        !string.IsNullOrEmpty(userFn.Name) ? userFn.Name : "<anonymous>";
+                    var callSite = e?.Span ?? default(SourceSpan);
+                    _callStack.Push(new CallFrame(fnName, callSite));
+                    try
+                    {
+                        return fn.Call(this, argsList);
+                    }
+                    catch (MiniDynRuntimeError ex)
+                    {
+                        AttachErrorContext(ex);
+                        throw;
+                    }
+                    finally
+                    {
+                        _callStack.Pop();
+                    }
                 }
             }
-            else if (fn is BytecodeFunction byteFn)
+
+            // BytecodeFunction: keep named-arg support by mapping to positional (no defaults/rest)
+            if (fn is BytecodeFunction byteFn)
             {
+                List<Value> processedArgs;
                 if (e.Args.Any(a => a.IsNamed) || (byteFn.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
                 {
-                    // Unified slow-path mapping for named/default args for compiled functions
-                    processedArgs = ProcessNamedArguments(byteFn.Params, e.Args);
+                    processedArgs = BuildPositionalArgsForBytecode(byteFn.Params, e.Args);
                 }
                 else
                 {
                     processedArgs = new List<Value>();
-                    foreach (var arg in e.Args)
-                        processedArgs.Add(Evaluate(arg.Value));
+                    foreach (var arg in e.Args) processedArgs.Add(Evaluate(arg.Value));
                 }
 
                 if (receiver.Type != ValueType.Nil && byteFn.FunctionKind == UserFunction.Kind.Normal)
-                {
                     fn = byteFn.BindThis(receiver);
+
+                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+
+                string fnName =
+                    fn is BuiltinFunction bf ? bf.Name :
+                    "<anonymous>";
+                var callSite = e?.Span ?? default(SourceSpan);
+                _callStack.Push(new CallFrame(fnName, callSite));
+                try
+                {
+                    return fn.Call(this, processedArgs);
+                }
+                catch (MiniDynRuntimeError ex)
+                {
+                    AttachErrorContext(ex);
+                    throw;
+                }
+                finally
+                {
+                    _callStack.Pop();
                 }
             }
-            else
-            {
-                if (e.Args.Any(a => a.IsNamed))
-                    throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-                processedArgs = new List<Value>();
-                foreach (var arg in e.Args)
-                    processedArgs.Add(Evaluate(arg.Value));
-            }
 
-            if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
+            // Builtins: do not support named args
+            if (e.Args.Any(a => a.IsNamed))
+                throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
 
-            string fnName =
-                fn is BuiltinFunction bf ? bf.Name :
-                fn is UserFunction uf && !string.IsNullOrEmpty(uf.Name) ? uf.Name :
+            var processedArgs2 = new List<Value>();
+            foreach (var arg in e.Args) processedArgs2.Add(Evaluate(arg.Value));
+
+            string fnName2 =
+                fn is BuiltinFunction bf2 ? bf2.Name :
                 "<anonymous>";
-            var callSite = e?.Span ?? default(SourceSpan);
-            _callStack.Push(new CallFrame(fnName, callSite));
+            var callSite2 = e?.Span ?? default(SourceSpan);
+            _callStack.Push(new CallFrame(fnName2, callSite2));
             try
             {
-                return fn.Call(this, processedArgs);
+                return fn.Call(this, processedArgs2);
             }
             catch (MiniDynRuntimeError ex)
             {
@@ -7242,6 +7529,125 @@ namespace MiniDynLang
             var list = new List<ParamView>(ps.Count);
             for (int i = 0; i < ps.Count; i++)
                 list.Add(new ParamView { Name = ps[i].Name, Default = ps[i].Default, IsRest = ps[i].IsRest });
+            return list;
+        }
+
+        // Build mapping for named/positional args WITHOUT evaluating defaults.
+        private ArgMapping BuildArgMapping(IReadOnlyList<ParamView> parameters, List<Expr.Call.Argument> args)
+        {
+            int paramCount = parameters?.Count ?? 0;
+            var map = new ArgMapping
+            {
+                Values = new Value[paramCount],
+                Filled = new bool[paramCount],
+                Rest = new List<Value>()
+            };
+
+            // name->index only for non-rest params
+            var nameToIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            int restIndex = -1;
+            string restName = null;
+            for (int i = 0; i < paramCount; i++)
+            {
+                if (parameters[i].IsRest) { restIndex = i; restName = parameters[i].Name; continue; }
+                nameToIndex[parameters[i].Name] = i;
+            }
+
+            // helper: find next non-rest, unfilled parameter slot starting at cursor
+            int cursor = 0;
+            int NextNonRestUnfilled()
+            {
+                for (int i = cursor; i < paramCount; i++)
+                {
+                    if (!parameters[i].IsRest && !map.Filled[i]) { cursor = i + 1; return i; }
+                }
+                // also scan earlier ones in case cursor skipped something (e.g., named filled ahead)
+                for (int i = 0; i < cursor; i++)
+                {
+                    if (!parameters[i].IsRest && !map.Filled[i]) { cursor = i + 1; return i; }
+                }
+                return -1;
+            }
+
+            bool seenNamed = false;
+
+            // Evaluate and assign in left-to-right order
+            foreach (var arg in args)
+            {
+                if (arg.IsNamed)
+                {
+                    seenNamed = true;
+
+                    // Disallow binding rest parameter by name
+                    if (restIndex >= 0 && string.Equals(arg.Name, restName, StringComparison.Ordinal))
+                        throw new MiniDynRuntimeError($"Cannot bind rest parameter '{arg.Name}' by name");
+
+                    if (!nameToIndex.TryGetValue(arg.Name, out int idx))
+                        throw new MiniDynRuntimeError($"Unknown parameter '{arg.Name}'");
+
+                    if (map.Filled[idx])
+                        throw new MiniDynRuntimeError($"Argument '{arg.Name}' specified multiple times");
+
+                    map.Values[idx] = Evaluate(arg.Value);
+                    map.Filled[idx] = true;
+                }
+                else
+                {
+                    var val = Evaluate(arg.Value);
+
+                    if (seenNamed)
+                    {
+                        if (restIndex >= 0)
+                        {
+                            map.Rest.Add(val);
+                        }
+                        else
+                        {
+                            throw new MiniDynRuntimeError("Positional arguments after named are not allowed");
+                        }
+                    }
+                    else
+                    {
+                        int idx = NextNonRestUnfilled();
+                        if (idx >= 0)
+                        {
+                            map.Values[idx] = val;
+                            map.Filled[idx] = true;
+                        }
+                        else if (restIndex >= 0)
+                        {
+                            map.Rest.Add(val);
+                        }
+                        else
+                        {
+                            // too many positional args and no rest
+                            int totalProvided = args.Count;
+                            throw new MiniDynRuntimeError($"Function expected at most {paramCount} args, got {totalProvided}");
+                        }
+                    }
+                }
+            }
+
+            return map;
+        }
+
+        // Build a positional list for bytecode fns (no defaults/rest supported).
+        private List<Value> BuildPositionalArgsForBytecode(IReadOnlyList<Expr.Param> parameters, List<Expr.Call.Argument> args)
+        {
+            var map = BuildArgMapping(ToParamViews(parameters), args);
+            // Ensure no rest and all non-rest filled
+            if (parameters.Any(p => p.IsRest))
+                throw new MiniDynRuntimeError("Bytecode function: rest params are not supported");
+            for (int i = 0; i < parameters.Count; i++)
+            {
+                if (!map.Filled[i])
+                    throw new MiniDynRuntimeError($"Missing required argument '{parameters[i].Name}'");
+            }
+            if (map.Rest.Count != 0)
+                throw new MiniDynRuntimeError($"Function expected at most {parameters.Count} args, got more");
+
+            var list = new List<Value>(parameters.Count);
+            for (int i = 0; i < parameters.Count; i++) list.Add(map.Values[i]);
             return list;
         }
 
