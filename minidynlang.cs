@@ -7,6 +7,7 @@ using System.Linq;
 using System.Numerics;
 using System.Text;
 using System.Runtime.CompilerServices;
+using System.Collections.Concurrent;
 
 namespace MiniDynLang
 {
@@ -425,17 +426,13 @@ namespace MiniDynLang
     // Add a small, process-local string interner for object property names.
     internal static class StringInterner
     {
-        private static readonly Dictionary<string, string> _pool = new Dictionary<string, string>(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, string> _pool =
+            new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
         public static string Intern(string s)
         {
             if (s == null) return null;
-            lock (_pool)
-            {
-                if (_pool.TryGetValue(s, out var existing)) return existing;
-                _pool[s] = s;
-                return s;
-            }
+            return _pool.GetOrAdd(s, k => k);
         }
     }
 
@@ -946,23 +943,34 @@ namespace MiniDynLang
                         case '\\': c = '\\'; break;
                         case '0': c = '\0'; break;
                         case 'x':
-                            {
-                                int h1 = HexDigit(Peek()); Advance();
-                                int h2 = HexDigit(Peek()); Advance();
-                                if (h1 < 0 || h2 < 0) throw new MiniDynLexError("Invalid \\xNN escape", _line, _col);
-                                c = (char)((h1 << 4) | h2);
-                                break;
-                            }
+                        {
+                            // require two hex digits; do not advance unless both are valid
+                            if (_pos + 1 >= _src.Length)
+                                throw new MiniDynLexError("Invalid \\xNN escape", _line, _col);
+                            int h1 = HexDigit(_src[_pos]);
+                            int h2 = HexDigit(_src[_pos + 1]);
+                            if (h1 < 0 || h2 < 0)
+                                throw new MiniDynLexError("Invalid \\xNN escape", _line, _col);
+                            Advance(); // first hex
+                            Advance(); // second hex
+                            c = (char)((h1 << 4) | h2);
+                            break;
+                        }
                         case 'u':
-                            {
-                                int h1 = HexDigit(Peek()); Advance();
-                                int h2 = HexDigit(Peek()); Advance();
-                                int h3 = HexDigit(Peek()); Advance();
-                                int h4 = HexDigit(Peek()); Advance();
-                                if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) throw new MiniDynLexError("Invalid \\uNNNN escape", _line, _col);
-                                c = (char)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
-                                break;
-                            }
+                        {
+                            // require four hex digits; do not advance unless all four are valid
+                            if (_pos + 3 >= _src.Length)
+                                throw new MiniDynLexError("Invalid \\uNNNN escape", _line, _col);
+                            int h1 = HexDigit(_src[_pos]);
+                            int h2 = HexDigit(_src[_pos + 1]);
+                            int h3 = HexDigit(_src[_pos + 2]);
+                            int h4 = HexDigit(_src[_pos + 3]);
+                            if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0)
+                                throw new MiniDynLexError("Invalid \\uNNNN escape", _line, _col);
+                            Advance(); Advance(); Advance(); Advance();
+                            c = (char)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
+                            break;
+                        }
                         default:
                             // Unknown escape: treat as literal of escaped char
                             c = e;
