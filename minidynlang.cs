@@ -38,6 +38,35 @@ namespace MiniDynLang
     }
     internal static class RuntimeOps
     {
+        public static Value Add(in Value a, in Value b)
+        {
+            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+                return Value.Number(NumberValue.Add(a.AsNumber(), b.AsNumber()));
+            if (a.Type == ValueType.String || b.Type == ValueType.String)
+                return Value.String(RuntimeOps.ToStringValue(a) + RuntimeOps.ToStringValue(b));
+            if (a.Type == ValueType.Array && b.Type == ValueType.Array)
+            {
+                var la = a.AsArray(); var rb = b.AsArray();
+                var res = new ArrayValue();
+                res.Items.AddRange(la.Items);
+                res.Items.AddRange(rb.Items);
+                return Value.Array(res);
+            }
+            throw new MiniDynRuntimeError("Invalid '+' operands");
+        }
+
+        public static Value Sub(in Value a, in Value b)
+            => Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b)));
+
+        public static Value Mul(in Value a, in Value b)
+            => Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b)));
+
+        public static Value Div(in Value a, in Value b)
+            => Value.Number(NumberValue.Div(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b)));
+
+        public static Value Mod(in Value a, in Value b)
+            => Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b)));
+
         // Conversion/coercion semantics used across interpreter and VM
         public static NumberValue ToNumber(Value v)
         {
@@ -1930,11 +1959,31 @@ namespace MiniDynLang
             }
             throw new MiniDynParseError("Invalid pattern: expected identifier, array pattern, or object pattern", Peek().Line, Peek().Column);
         }
+        
+        // Parse a comma-separated list of simple declarators: name [= Ternary()]
+        private List<(Token nameTok, Expr init)> ParseDeclaratorList(bool requireInitForEach)
+        {
+            var list = new List<(Token, Expr)>();
+            do
+            {
+                var nameTok = Consume(TokenType.Identifier, "Expected variable name");
+                Expr init = null;
+                if (Match(TokenType.Assign))
+                {
+                    init = Ternary(); // prevent comma from bleeding into initializer
+                }
+                else if (requireInitForEach)
+                {
+                    throw new MiniDynParseError("Expected '=' after const name", Peek().Line, Peek().Column);
+                }
+                list.Add((nameTok, init));
+            } while (Match(TokenType.Comma));
+            return list;
+        }
 
         private Stmt VarDeclOrDestructuring()
         {
             var kwTok = Previous(); // 'var'
-            // var <pattern or name> [= initializer] ;
             if (Check(TokenType.LBracket) || Check(TokenType.LBrace))
             {
                 var pat = ParsePattern();
@@ -1942,23 +1991,15 @@ namespace MiniDynLang
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
-                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var);
-                d.Span = SourceSpan.FromToken(kwTok);
+                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Var) { Span = SourceSpan.FromToken(kwTok) };
                 return d;
             }
-           // Multiple declarators: var a = ..., b = ... ;
-           var decls = new List<Stmt>();
-           do
-           {
-               var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-               Expr init2 = null;
-               if (Match(TokenType.Assign))
-                   init2 = Ternary(); // prevent comma from bleeding into initializer
-               var s = new Stmt.Var((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
-               decls.Add(s);
-           } while (Match(TokenType.Comma));
-           Consume(TokenType.Semicolon, "Expected ';'");
-           return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
+            var decls = new List<Stmt>();
+            var parsed = ParseDeclaratorList(requireInitForEach: false);
+            Consume(TokenType.Semicolon, "Expected ';'");
+            foreach (var (nameTok, init) in parsed)
+                decls.Add(new Stmt.Var((string)nameTok.Literal, init) { Span = SourceSpan.FromToken(kwTok) });
+            return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
         }
 
         private Stmt LetDeclOrDestructuring()
@@ -1971,24 +2012,14 @@ namespace MiniDynLang
                 if (Match(TokenType.Assign)) init = Expression();
                 else throw new MiniDynParseError("Destructuring declaration requires initializer", Peek().Line, Peek().Column);
                 Consume(TokenType.Semicolon, "Expected ';'");
-                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let);
-                d.Span = SourceSpan.FromToken(kwTok);
-                return d;
+                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Let) { Span = SourceSpan.FromToken(kwTok) };
             }
-            // Multiple declarators: let a = ..., b = ... ;
             var decls = new List<Stmt>();
-            do
-            {
-                var nameTok = Consume(TokenType.Identifier, "Expected variable name");
-                Expr init2 = null;
-                if (Match(TokenType.Assign))
-                   init2 = Ternary(); // prevent comma from bleeding into initializer
-               var s = new Stmt.Let((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
-               decls.Add(s);
-           } while (Match(TokenType.Comma));
-           Consume(TokenType.Semicolon, "Expected ';'");
-           return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
-
+            var parsed = ParseDeclaratorList(requireInitForEach: false);
+            Consume(TokenType.Semicolon, "Expected ';'");
+            foreach (var (nameTok, init) in parsed)
+                decls.Add(new Stmt.Let((string)nameTok.Literal, init) { Span = SourceSpan.FromToken(kwTok) });
+            return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
         }
 
         private Stmt ConstDeclOrDestructuring()
@@ -1999,21 +2030,13 @@ namespace MiniDynLang
                 var pat = ParsePattern();
                 var init = ParseInitializerRequired();
                 Consume(TokenType.Semicolon, "Expected ';'");
-                var d = new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Const);
-                d.Span = SourceSpan.FromToken(kwTok);
-                return d;
+                return new Stmt.DestructuringDecl(pat, init, Stmt.DestructuringDecl.Kind.Const) { Span = SourceSpan.FromToken(kwTok) };
             }
-            // Multiple declarators: const a = ..., b = ... ; (each requires initializer)
             var decls = new List<Stmt>();
-            do
-            {
-                var nameTok = Consume(TokenType.Identifier, "Expected constant name");
-                Consume(TokenType.Assign, "Expected '=' after const name");
-                var init2 = Ternary(); // prevent comma from bleeding into initializer
-                var s = new Stmt.Const((string)nameTok.Literal, init2) { Span = SourceSpan.FromToken(kwTok) };
-                decls.Add(s);
-            } while (Match(TokenType.Comma));
+            var parsed = ParseDeclaratorList(requireInitForEach: true);
             Consume(TokenType.Semicolon, "Expected ';'");
+            foreach (var (nameTok, init) in parsed)
+                decls.Add(new Stmt.Const((string)nameTok.Literal, init) { Span = SourceSpan.FromToken(kwTok) });
             return (decls.Count == 1) ? decls[0] : new Stmt.DeclList(decls) { Span = SourceSpan.FromToken(kwTok) };
         }
 
@@ -3964,43 +3987,31 @@ namespace MiniDynLang
                             case OpCode.Add:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    if (a.Type == ValueType.Number && b.Type == ValueType.Number)
-                                        Push(Value.Number(NumberValue.Add(a.AsNumber(), b.AsNumber())));
-                                    else if (a.Type == ValueType.String || b.Type == ValueType.String)
-                                        Push(Value.String(_interp.ToStringValue(a) + _interp.ToStringValue(b)));
-                                    else if (a.Type == ValueType.Array && b.Type == ValueType.Array)
-                                    {
-                                        var la = a.AsArray(); var rb = b.AsArray();
-                                        var res = new ArrayValue();
-                                        res.Items.AddRange(la.Items);
-                                        res.Items.AddRange(rb.Items);
-                                        Push(Value.Array(res));
-                                    }
-                                    else throw new MiniDynRuntimeError("Invalid '+' operands");
+                                    Push(RuntimeOps.Add(a, b));
                                     break;
                                 }
                             case OpCode.Sub:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
+                                    Push(RuntimeOps.Sub(a, b));
                                     break;
                                 }
                             case OpCode.Mul:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
+                                    Push(RuntimeOps.Mul(a, b));
                                     break;
                                 }
                             case OpCode.Div:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Div(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
+                                    Push(RuntimeOps.Div(a, b));
                                     break;
                                 }
                             case OpCode.Mod:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
+                                    Push(RuntimeOps.Mod(a, b));
                                     break;
                                 }
 
@@ -7445,29 +7456,11 @@ namespace MiniDynLang
                 switch (op)
                 {
                     case TokenType.Assign: return rhsVal;
-                    case TokenType.PlusAssign:
-                        if (cur.Type == ValueType.Number && rhsVal.Type == ValueType.Number)
-                            return Value.Number(NumberValue.Add(cur.AsNumber(), rhsVal.AsNumber()));
-                        if (cur.Type == ValueType.String || rhsVal.Type == ValueType.String)
-                            return Value.String(ToStringValue(cur) + ToStringValue(rhsVal));
-                        if (cur.Type == ValueType.Array && rhsVal.Type == ValueType.Array)
-                        {
-                            var la = cur.AsArray();
-                            var ra = rhsVal.AsArray();
-                            var res = new ArrayValue();
-                            res.Items.AddRange(la.Items);
-                            res.Items.AddRange(ra.Items);
-                            return Value.Array(res);
-                        }
-                        throw new MiniDynRuntimeError("Invalid '+=' operands");
-                    case TokenType.MinusAssign:
-                        return Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
-                    case TokenType.StarAssign:
-                        return Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
-                    case TokenType.SlashAssign:
-                        return Value.Number(NumberValue.Div(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
-                    case TokenType.PercentAssign:
-                        return Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
+                    case TokenType.PlusAssign:    return RuntimeOps.Add(cur, rhsVal);
+                    case TokenType.MinusAssign:   return RuntimeOps.Sub(cur, rhsVal);
+                    case TokenType.StarAssign:    return RuntimeOps.Mul(cur, rhsVal);
+                    case TokenType.SlashAssign:   return RuntimeOps.Div(cur, rhsVal);
+                    case TokenType.PercentAssign: return RuntimeOps.Mod(cur, rhsVal);
                     default:
                         throw new MiniDynRuntimeError("Unknown compound assignment");
                 }
@@ -7658,31 +7651,17 @@ namespace MiniDynLang
                         var r = Evaluate(e.Right);
                         switch (e.Op.Type)
                         {
-                            case TokenType.Plus:
-                                if (l.Type == ValueType.Number && r.Type == ValueType.Number)
-                                    return Value.Number(NumberValue.Add(l.AsNumber(), r.AsNumber()));
-                                if (l.Type == ValueType.String || r.Type == ValueType.String)
-                                    return Value.String(ToStringValue(l) + ToStringValue(r));
-                                if (l.Type == ValueType.Array && r.Type == ValueType.Array)
-                                {
-                                    var la = l.AsArray();
-                                    var ra = r.AsArray();
-                                    var res = new ArrayValue();
-                                    res.Items.AddRange(la.Items);
-                                    res.Items.AddRange(ra.Items);
-                                    return Value.Array(res);
-                                }
-                                throw new MiniDynRuntimeError("Invalid '+' operands");
-                            case TokenType.Minus: return Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
-                            case TokenType.Star: return Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
-                            case TokenType.Slash: return Value.Number(NumberValue.Div(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
-                            case TokenType.Percent: return Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
-                            case TokenType.Equal: return Value.Boolean(RuntimeOps.CompareEq(l, r));
-                            case TokenType.NotEqual: return Value.Boolean(!RuntimeOps.CompareEq(l, r));
-                            case TokenType.Less: return Value.Boolean(RuntimeOps.CompareRel(l, r, "<"));
-                            case TokenType.LessEq: return Value.Boolean(RuntimeOps.CompareRel(l, r, "<="));
-                            case TokenType.Greater: return Value.Boolean(RuntimeOps.CompareRel(l, r, ">"));
-                            case TokenType.GreaterEq: return Value.Boolean(RuntimeOps.CompareRel(l, r, ">="));
+                            case TokenType.Plus:    return RuntimeOps.Add(l, r);
+                            case TokenType.Minus:   return RuntimeOps.Sub(l, r);
+                            case TokenType.Star:    return RuntimeOps.Mul(l, r);
+                            case TokenType.Slash:   return RuntimeOps.Div(l, r);
+                            case TokenType.Percent: return RuntimeOps.Mod(l, r);
+                            case TokenType.Equal:      return Value.Boolean(RuntimeOps.CompareEq(l, r));
+                            case TokenType.NotEqual:   return Value.Boolean(!RuntimeOps.CompareEq(l, r));
+                            case TokenType.Less:       return Value.Boolean(RuntimeOps.CompareRel(l, r, "<"));
+                            case TokenType.LessEq:     return Value.Boolean(RuntimeOps.CompareRel(l, r, "<="));
+                            case TokenType.Greater:    return Value.Boolean(RuntimeOps.CompareRel(l, r, ">"));
+                            case TokenType.GreaterEq:  return Value.Boolean(RuntimeOps.CompareRel(l, r, ">="));
                         }
                         break;
                     }
@@ -7715,165 +7694,80 @@ namespace MiniDynLang
 
         public Value VisitCall(Expr.Call e)
         {
-            Value receiver = Value.Nil();
-            Value calleeVal;
+            // Prepare callee once (handles property/index, optional chaining, receiver)
+            if (!TryPrepareCalleeForCall(e.Callee, out var calleeVal, out var receiver, out var shortCircuitToNil))
+                throw new MiniDynRuntimeError("Invalid callee");
 
-            // Detect optional-chain short-circuit on callee (property/index)
-            if (e.Callee is Expr.Property prop)
-            {
-                var objVal = Evaluate(prop.Target);
-                if (prop.IsOptional && objVal.Type == ValueType.Nil) return Value.Nil(); // skip args, return nil
-                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property access target must be object");
-                var obj = objVal.AsObject();
-                obj.TryGet(prop.Name, out calleeVal);
-                receiver = objVal;
-            }
-            else if (e.Callee is Expr.Index idx)
-            {
-                var objVal = Evaluate(idx.Target);
-                if (idx.IsOptional && objVal.Type == ValueType.Nil) return Value.Nil(); // skip args, return nil
-                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Index access target must be object for method call");
-                var key = ToStringValue(Evaluate(idx.IndexExpr));
-                var obj = objVal.AsObject();
-                obj.TryGet(key, out calleeVal);
-                receiver = objVal;
-            }
-            else
-            {
-                calleeVal = Evaluate(e.Callee);
-            }
-
+            if (shortCircuitToNil) return Value.Nil();
             if (calleeVal.Type != ValueType.Function)
                 throw new MiniDynRuntimeError("Can only call functions");
 
             var fn = calleeVal.AsFunction();
 
-            // UserFunction: use mapping for named-arg calls (defaults evaluated in callee env)
-            if (fn is UserFunction userFn)
+            // UserFunction: support named args via mapping
+            if (fn is UserFunction uf)
             {
                 if (e.Args.Any(a => a.IsNamed))
                 {
-                    var mapping = BuildArgMapping(ToParamViews(userFn.Params), e.Args);
-
-                    // Bind 'this' if receiver provided and normal function
-                    var callTarget = (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
-                        ? userFn.BindThis(receiver)
-                        : userFn;
-
-                    string fnName = !string.IsNullOrEmpty(userFn.Name) ? userFn.Name : "<anonymous>";
+                    var mapping = BuildArgMapping(ToParamViews(uf.Params), e.Args);
+                    if (receiver.Type != ValueType.Nil && uf.FunctionKind == UserFunction.Kind.Normal)
+                        uf = uf.BindThis(receiver);
                     var callSite = e?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(fnName, callSite));
-                    try
-                    {
-                        return callTarget.CallWithMapping(this, mapping);
-                    }
-                    catch (MiniDynRuntimeError ex)
-                    {
-                        AttachErrorContext(ex);
-                        throw;
-                    }
-                    finally
-                    {
-                        _callStack.Pop();
-                    }
+                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
+                    try { return uf.CallWithMapping(this, mapping); }
+                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                    finally { _callStack.Pop(); }
                 }
                 else
                 {
-                    // positional-only path unchanged
-                    var argsList = new List<Value>();
-                    foreach (var arg in e.Args) argsList.Add(Evaluate(arg.Value));
-
-                    // Bind 'this' if needed
-                    if (receiver.Type != ValueType.Nil && userFn.FunctionKind == UserFunction.Kind.Normal)
-                        fn = userFn.BindThis(receiver);
-
-                    if (argsList.Count < fn.ArityMin || argsList.Count > fn.ArityMax)
-                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {argsList.Count}");
-
-                    string fnName =
-                        !string.IsNullOrEmpty(userFn.Name) ? userFn.Name : "<anonymous>";
+                    var args = new List<Value>(e.Args.Count);
+                    foreach (var a in e.Args) args.Add(Evaluate(a.Value));
+                    if (receiver.Type != ValueType.Nil && uf.FunctionKind == UserFunction.Kind.Normal)
+                        fn = uf.BindThis(receiver);
+                    if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
+                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
                     var callSite = e?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(fnName, callSite));
-                    try
-                    {
-                        return fn.Call(this, argsList);
-                    }
-                    catch (MiniDynRuntimeError ex)
-                    {
-                        AttachErrorContext(ex);
-                        throw;
-                    }
-                    finally
-                    {
-                        _callStack.Pop();
-                    }
+                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
+                    try { return fn.Call(this, args); }
+                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                    finally { _callStack.Pop(); }
                 }
             }
 
-            // BytecodeFunction: keep named-arg support by mapping to positional (no defaults/rest)
-            if (fn is BytecodeFunction byteFn)
+            // BytecodeFunction: map named args to positional if needed
+            if (fn is BytecodeFunction bf)
             {
-                List<Value> processedArgs;
-                if (e.Args.Any(a => a.IsNamed) || (byteFn.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
-                {
-                    processedArgs = BuildPositionalArgsForBytecode(byteFn.Params, e.Args);
-                }
+                List<Value> args;
+                if (e.Args.Any(a => a.IsNamed) || (bf.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
+                    args = BuildPositionalArgsForBytecode(bf.Params, e.Args);
                 else
                 {
-                    processedArgs = new List<Value>();
-                    foreach (var arg in e.Args) processedArgs.Add(Evaluate(arg.Value));
+                    args = new List<Value>(e.Args.Count);
+                    foreach (var a in e.Args) args.Add(Evaluate(a.Value));
                 }
-
-                if (receiver.Type != ValueType.Nil && byteFn.FunctionKind == UserFunction.Kind.Normal)
-                    fn = byteFn.BindThis(receiver);
-
-                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                string fnName =
-                    fn is BuiltinFunction bf ? bf.Name :
-                    "<anonymous>";
+                if (receiver.Type != ValueType.Nil && bf.FunctionKind == UserFunction.Kind.Normal)
+                    fn = bf.BindThis(receiver);
+                if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
                 var callSite = e?.Span ?? default(SourceSpan);
-                _callStack.Push(new CallFrame(fnName, callSite));
-                try
-                {
-                    return fn.Call(this, processedArgs);
-                }
-                catch (MiniDynRuntimeError ex)
-                {
-                    AttachErrorContext(ex);
-                    throw;
-                }
-                finally
-                {
-                    _callStack.Pop();
-                }
+                _callStack.Push(new CallFrame("<anonymous>", callSite));
+                try { return fn.Call(this, args); }
+                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                finally { _callStack.Pop(); }
             }
 
-            // Builtins: do not support named args
+            // Builtins: no named args
             if (e.Args.Any(a => a.IsNamed))
                 throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-
-            var processedArgs2 = new List<Value>();
-            foreach (var arg in e.Args) processedArgs2.Add(Evaluate(arg.Value));
-
-            string fnName2 =
-                fn is BuiltinFunction bf2 ? bf2.Name :
-                "<anonymous>";
-            var callSite2 = e?.Span ?? default(SourceSpan);
-            _callStack.Push(new CallFrame(fnName2, callSite2));
-            try
             {
-                return fn.Call(this, processedArgs2);
-            }
-            catch (MiniDynRuntimeError ex)
-            {
-                AttachErrorContext(ex);
-                throw;
-            }
-            finally
-            {
-                _callStack.Pop();
+                var args = new List<Value>(e.Args.Count);
+                foreach (var a in e.Args) args.Add(Evaluate(a.Value));
+                var callSite = e?.Span ?? default(SourceSpan);
+                var name = (fn is BuiltinFunction bf2) ? bf2.Name : "<anonymous>";
+                _callStack.Push(new CallFrame(name, callSite));
+                try { return fn.Call(this, args); }
+                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                finally { _callStack.Pop(); }
             }
         }
 
