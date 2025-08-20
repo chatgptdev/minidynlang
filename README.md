@@ -1,60 +1,61 @@
 # MiniDynLang
 
-A tiny **dynamically-typed** programming language implemented in **C#**. MiniDynLang is a single-file reference interpreter with a friendly REPL, a compact but expressive syntax (objects, arrays, first-class/arrow functions, destructuring, computed keys, named arguments, ternary/logical operators, compound assignments), and a small standard library.
+A tiny, expressive, dynamically-typed programming language implemented in C#. MiniDynLang features objects, arrays, first-class and arrow functions, destructuring (with defaults and rest), computed keys, named arguments, optional chaining and nullish operations, exceptions with try/catch/finally, a simple module system, and a compact standard library.
 
-> If you like languages in the "small but sharp" vein (à la Lox / Little Lisp / JS-ish minimal cores), you’ll feel at home.
+For the complete language specification, see the Language Reference:
+- [LanguageReference.md](LanguageReference.md)
 
 ---
 
 ## Table of contents
 
-* [Highlights](#highlights)
-* [Install & build](#install--build)
-* [CLI & REPL](#cli--repl)
-* [Language tour](#language-tour)
-
-  * [Values & variables](#values--variables)
-  * [Control flow](#control-flow)
-  * [Operators](#operators)
-  * [Arrays](#arrays)
-  * [Objects & computed keys](#objects--computed-keys)
-  * [Destructuring (decl & assign)](#destructuring-decl--assign)
-  * [Functions](#functions)
-  * [Arrow functions](#arrow-functions)
-  * [`this` & methods](#this--methods)
-  * [Named arguments](#named-arguments)
-  * [Ternary & logical](#ternary--logical)
-* [Standard library (selected)](#standard-library-selected)
-* [Design notes](#design-notes)
-* [Errors](#errors)
-* [Project structure](#project-structure)
-* [Contributing](#contributing)
-* [License](#license)
+- Highlights
+- Install & build
+- CLI & REPL
+- Quick start
+- Language tour
+  - Values, truthiness, equality
+  - Variables & scope
+  - Expressions & operators
+  - Strings & interpolation
+  - Arrays & objects
+  - Destructuring (decl & assign)
+  - Functions & arrow functions
+  - this & methods
+  - Named arguments
+  - Optional chaining & nullish
+  - Control flow
+  - Errors & exceptions
+  - Modules
+- Standard library (selected)
+- Design and implementation notes
+- Tests
+- License
 
 ---
 
 ## Highlights
 
-* **Values**: number (**int** / **double** / **bigint**), string, boolean, nil, array, object, function
-* **Variables**: `var`, `let` (block-scoped), `const`
-* **Control flow**: `if/else`, `while`, `break`, `continue`, `return`
-* **Operators**: `+ - * / %` (numeric promotion), comparisons, logical `and/or/not`, unary `+ - !`, **ternary** `? :`
-* **Arrays / Objects**: literals, indexing, dot/bracket property access, **computed object keys**, concat arrays via `+`
-* **Destructuring**: in declarations **and** assignments; defaults and `...rest` for arrays/objects; alias to lvalues
-* **Functions**: `fn` declarations/expressions, **default & rest params**, closures
-* **Arrow functions**: `x => x*2`, `(x,y)=>{ ... }`, with expression or block bodies
-* **Named arguments**: call user functions with `f(x: 1, y: 2)`; mix with positionals; works with defaults & rest
-* **Methods & `this`**: `obj.method()` binds `this` to `obj`
-* **REPL**: expression-result echo
-* **Tiny runtime**: one C# file; easy to hack/extend
+- Values: number (int64 / double / big integer), string, boolean, nil, array, object, function
+- Variables: var (function/global-scoped), let/const (block-scoped with TDZ)
+- First-class functions: defaults, rest, closures; arrow functions
+- Computed object keys: { [expr]: value }
+- Destructuring: in declarations and in assignment statements; defaults and ...rest; alias to lvalues
+- Named arguments for user functions; mixing with positional; defaults and rest supported
+- Optional chaining (. ?.[]) and nullish coalescing (??) plus nullish assignment (??=)
+- Indexing: arrays (negative indices allowed), strings (1-char result; negatives allowed)
+- Loops: for-of (values), for-in (keys/indices), classic for, while; break/continue
+- Errors: throw any value; try/catch/finally; runtime errors as objects with name/message/stack
+- Modules: require(...) with CommonJS-like exports/module.exports; caching and cycle support
+- Comma operator: (a, b, c) sequences expressions; result is last
 
 ---
 
 ## Install & build
 
-**Prerequisite**: .NET 6.0 SDK or later.
+Prerequisite: .NET Framework 4.8 (or a compatible SDK for building/running on your system).
 
-```bash
+```bat
 git clone https://github.com/chatgptdev/minidynlang.git
 cd minidynlang
 dotnet build -c Release
@@ -64,315 +65,229 @@ dotnet build -c Release
 
 ## CLI & REPL
 
-Start REPL:
+Start a REPL:
 
-```bash
-dotnet run
+```bat
+bin\Release\minidynlang.exe
 ```
 
-Run the built-in **demo** program showcasing most features:
+Run the demo program:
 
-```bash
-dotnet run -- -demo
+```bat
+bin\Release\minidynlang.exe demo.mdl
 ```
 
-Run a file:
+Run the test suite:
 
-```bash
-dotnet run -- path/to/file.mini
+```bat
+bin\Release\minidynlang.exe tests\tests.mdl
+```
+
+---
+
+## Quick start
+
+```text
+println("Hello, world");
+let x = 41; x += 1;
+println(x == 42 ? "ok" : "fail");
+
+let o = { a: 1, b: 2, d: "str" };
+o.a += 5; o["b"] = o["b"] * 10;
+println(o.a, o.b); // 6 20
 ```
 
 ---
 
 ## Language tour
 
-### Values & variables
+### Values, truthiness, equality
 
-```text
-let x = 42;
-const msg = "hello";
-var y;           // defaults to nil
+- Types: number, string, boolean, nil, array, object, function
+- Truthiness:
+  - false: nil, boolean false, numeric 0, empty string ""
+  - true: non-0 numbers, non-empty strings, functions, arrays, objects
+- Equality:
+  - Same-type: numeric/string compare by value; arrays/objects/functions by reference
+  - Cross-type: number == string is numeric if the string parses; otherwise false
 
-println(true, false, nil);  // true false nil
-println(1 + 2 * 3);         // 7
-println("Hello " + "World");// Hello World
-```
+### Variables & scope
 
-### Control flow
+- var: function-scoped (or global), reassignable
+- let: block-scoped, reassignable, Temporal Dead Zone (TDZ)
+- const: block-scoped, must be initialized, non-reassignable binding (object contents can still mutate)
 
-```text
-let n = 3;
-while (n > 0) {
-  println(n);
-  n = n - 1;
-}
-if (n == 0) println("Done"); else println("Not done");
-```
+### Expressions & operators
 
-### Operators
+- Arithmetic: + - * / % (division is integer when exact; otherwise double)
+- Unary: -x, +x, !x
+- Comparison: == != < <= > >=
+- Logical: && || ! (keywords and/or/not also supported)
+- Ternary: cond ? a : b
+- Nullish: a ?? b; a ??= b
+- Optional chaining: obj?.prop, obj?.[key], obj?.method(args)
+- Comma operator: (a, b, c) evaluates left-to-right, returns c
+- Arrays + concatenate with + and += when both sides are arrays
 
-* Arithmetic: `+ - * / %`
-  Division yields an **integer** when exact, otherwise a **double**.
-* Comparison: `== != < <= > >=`
-  Numbers vs numeric strings compare numerically when the string parses as a number.
-* Logical: `and`, `or`, `not`
-* Unary: `+`, `-`, `!`
-* **Ternary**: `cond ? a : b`
-* **Compound assignment**: `+= -= *= /= %=`
+Indexing:
+- Arrays: arr[i] (negative indices allowed; -1 is last)
+- Strings: s[i] returns a 1-character string; negative indices allowed; out-of-bounds is a runtime error
+- Objects: obj[key] (key coerced to string)
 
-```text
-let a = 10;
-a += 5;              // 15
-println(1 < 2 ? "yes" : "no"); // yes
-```
+### Strings & interpolation
 
-### Arrays
+- Normal strings: "hello", escapes: \n \r \t \" \\ \0 \xNN \uNNNN
+- Interpolation: "Hello, ${name}!"
+- Raw triple-quoted: """anything including " and \ and ${...}""" (no escapes, no interpolation)
 
-```text
-let arr = [1, 2, 3];
-println(arr[0]);     // 1
-arr[0] += 41;        // compound index assignment
-println(arr);        // [42, 2, 3]
+### Arrays & objects
 
-// Concat
-println([1,2] + [3,4]);  // [1, 2, 3, 4]
-```
-
-Helpers (see stdlib): `length`, `array`, `push`, `pop`, `slice(arrOrStr, start[, end])`, `join`, `at(arr, idx)`, `set_at`.
-
-* **Negative indices** are supported by helpers like `slice` and `at` (Python-style from the end).
-
-### Objects & computed keys
-
-```text
-let o = { a: 1, b: 2, d: "str" };
-println(o.a, o["b"]);      // 1 2
-o.a += 5;
-o["b"] = o["b"] * 10;
-println(o.a, o.b);         // 6 20
-
-let k = "x";
-let o2 = { [k + "1"]: 11, [k + "2"]: 22 };
-println(o2["x1"], o2["x2"]); // 11 22
-```
-
-Object helpers: `keys`, `has_key`, `remove_key`, `merge`.
+- Arrays: [1, 2, "x"] (holes allowed via elision: [1, , 3])
+- Objects: { a: 1, b: 2 } with insertion-ordered keys
+- Shorthand properties: let a=1; { a } → { a:1 }
+- Computed keys: { ["k" + x]: v }
 
 ### Destructuring (decl & assign)
 
-Array/object patterns in **declarations** and **assignments**, with defaults and `...rest`.
-Object patterns support **aliasing to lvalues**, e.g. assign directly into properties.
+- Declarations: let/const/var patterns with defaults and ...rest
+- Assignment statement form for swapping or assigning into lvalues
+- Object aliases can target lvalues (including obj.prop or obj[key])
 
+Examples:
 ```text
-let [p, q = 20, ...rest] = [10, , 30, 40, 50];
-println(p, q, rest);             // 10 20 [30, 40, 50]
-
-const { a, b: bb, z = 99, ...other } = { a: 1, b: 2 };
-println(a, bb, z, other);
-
-[p, q] = [100, 200];
-{ a: o.a, b: o.b } = { a: 7, b: 8 };  // assign into object properties
-println(p, q, o.a, o.b);              // 100 200 7 8
+let [a, b=2, ...rest] = [1, , 3, 4, 5]; // a=1, b=2, rest=[3,4,5]
+const { x, y: z=10, ...others } = { x:1 };
+{ a: obj.a, b: obj.b } = { a: 7, b: 8 }; // assign into properties
 ```
 
-### Functions
+### Functions & arrow functions
 
-Declare with `fn`, both statements and expressions. Parameters support **defaults** and `...rest`. Closures are supported.
+- Function literal: fn (params) { ... }
+- Declaration: fn name(params) { ... }
+- Arrow functions:
+  - x => x + 1
+  - (a, b=2, ...rest) => { return a + b; }
+  - Expression body returns value; block body requires return
 
-```text
-fn add(x, y = 0) {
-  return x + y;
-}
-println(add(2), add(2, 3)); // 2 5
+Parameters:
+- Defaults: fn (x=10, y=2*x) { ... }
+- Rest: fn (a, ...rest) { ... } (must be last)
+- Unique parameter names enforced
 
-let sum = fn (...nums) {
-  let s = 0, i = 0;
-  while (i < length(nums)) { s += nums[i]; i += 1; }
-  return s;
-};
-println(sum(1,2,3,4)); // 10
-```
+Tail-call optimization: self-tail-calls in user functions are optimized (including named-arg variants).
 
-### Arrow functions
+### this & methods
 
-Expression or block body; single-param arrows may omit parentheses.
-
-```text
-let double = x => x * 2;
-let fact = n => { if (n <= 1) return 1; return n * fact(n-1); };
-
-println(double(7));  // 14
-println(fact(5));    // 120
-```
-
-> Note: Arrow functions **do not bind their own `this`**; see next section.
-
-### `this` & methods
-
-Calling a user function via property syntax **binds** `this` to the receiver.
-
-```text
-let counter = {
-  value: 10,
-  add: fn(n) { this.value = this.value + n; return this.value; },
-  get: fn() { return this.value; }
-};
-
-println(counter.get());    // 10
-println(counter.add(5));   // 15
-```
-
-Arrow functions don’t automatically bind `this`. If you need `this`, use `fn` for methods.
+- Method call target.prop(args) binds this to target for normal (non-arrow) user functions
+- Arrow functions capture this lexically at creation; calling as a method does not rebind this
 
 ### Named arguments
 
-User-defined functions support **named arguments**, mixing with positional arguments, plus defaults and rest. (Built-ins are positional only.)
+- User functions support named args: f(x: 1, y: 2)
+- You may mix positional and named; after the first named arg, remaining positionals go to rest (if present), otherwise error
+- Defaults evaluate in the callee environment, left-to-right
+- Built-ins do not support named args
 
-```text
-fn createUser(name, age = 25, city = "Unknown", active = true) {
-  return { name: name, age: age, city: city, active: active };
-}
+### Optional chaining & nullish
 
-let u1 = createUser("Alice", 28, "NY", true);           // positionals
-let u2 = createUser(name: "Bob", city: "London", age: 35); // named
-let u3 = createUser("Charlie", city: "Tokyo", active: false); // mixed
+- obj?.prop, obj?.[key], obj?.method(args) → nil if base is nil (no call/access)
+- a ?? b returns a unless it is nil; otherwise b
+- a ??= b assigns only if target is nil
+- Optional chaining is supported on assignment targets; if the base is nil, the assignment short-circuits without evaluating RHS or index/key
 
-println(u1, u2, u3);
-```
+### Control flow
 
-Named arguments that don’t match parameters are rejected unless a **rest** parameter exists—in which case the extras are collected.
+- if (cond) stmt else stmt
+- while (cond) stmt
+- for (init; cond; inc) stmt (init can be decl or expression)
+- for-of: iterates values of arrays/strings/objects; nil yields zero iterations
+- for-in: iterates keys/indices (strings for arrays/strings); nil yields zero iterations
+- break, continue
 
-### Ternary & logical
+### Errors & exceptions
 
-```text
-println(true and false);        // false
-println(false or true);         // true
-println(not true);              // false
-println(1 < 2 ? "yes" : "no");  // yes
-```
+- throw expr (any value)
+- try/catch/finally; catch with or without a binding
+- Built-ins: error(msg) returns an error object; raise(msg) throws one
+- Runtime errors (e.g., division by zero) are caught as objects with:
+  - name: "RuntimeError"
+  - message, at, stack (stack is an array of frames)
+
+### Modules
+
+- require(specifier)
+  - Resolves absolute/relative paths; tries "", ".mdl", ".minidyn"; directories use index
+  - Execution environment has exports and module objects; return value is module.exports if set; else exports
+  - Caching by absolute path; cycles supported (temporary exports provided during load)
 
 ---
 
 ## Standard library (selected)
 
-Output & IO
-
-* `print(...)`, `println(...)`
-* `gets()` → read a line from stdin or `nil` on EOF
+I/O and time
+- print(...), println(...), gets()
+- now_ms(), sleep_ms(ms)
 
 Type & conversion
-
-* `to_number(x)`, `to_string(x)`, `type(x)`, `length(x)`
+- type(x), to_number(x), to_string(x), length(x)
 
 Math
-
-* `abs`, `floor`, `ceil`, `round`, `sqrt`, `pow`, `min`, `max`
-* `random()`, `srand(seed)`
+- abs, floor, ceil, round, sqrt, pow, min, max
+- random(), srand(seed)
 
 Strings
+- substring, index_of, contains, starts_with, ends_with
+- to_upper, to_lower, trim, split, replace, repeat
+- pad_start, pad_end
 
-* `substring(s, start[, len])`, `index_of(hay, needle)`, `contains`, `starts_with`, `ends_with`
-* `to_upper`, `to_lower`, `trim`, `split(s, sep)`, `parse_int`, `parse_float`
+Parsing & JSON
+- parse_int, parse_float
+- json_stringify(value[, pretty=false]) (throws on cycles)
+- json_parse(s) (JSON null → nil)
 
-Arrays
+Arrays & objects
+- array(...), push, pop, slice(arrOrStr, start[, end]) (negative indices)
+- join, at(arr, idx), set_at, clone
+- keys, values, entries, from_entries
+- has_key, remove_key, merge
 
-* `array(...)`, `push(arr, ...items)`, `pop(arr)`
-* `slice(arrOrStr, start[, end])` *(supports negative indices)*
-* `join(arr, sep)`, `at(arr, idx)`, `set_at(arr, idx, val)`, `clone(arrOrObj)`
+Functional & utility
+- map, filter, reduce, sort([, comparator])
+- unique, deep_equal
+- range(n | start,end[,step])
 
-Objects
-
-* `keys(obj)`, `has_key(obj, key)`, `remove_key(obj, key)`, `merge(a, b)`
-
-Time
-
-* `now_ms()` → Unix time in milliseconds (UTC)
-
----
-
-## Design notes
-
-* **Numbers** promote across `int` / `bigint` / `double` as needed.
-  Division is integer when exact, otherwise double. Modulo and division by zero throw runtime errors.
-* **Equality**: numbers and numeric strings compare numerically when possible; arrays/objects/functions compare by **identity**.
-* **Truthiness**:
-
-  * `nil` is falsey
-  * empty string/array/object are falsey
-  * numbers are falsey only if `0`
-  * everything else is truthy
-* Arrays/objects are **reference types**.
-* `let`/`const` are **block-scoped**; `const` prevents **reassignment of the binding** (but you can still mutate the object the binding points to).
+See LanguageReference.md for the full list and details.
 
 ---
 
-## Errors
+## Design and implementation notes
 
-* **Lexing**: `MiniDynLexError`
-* **Parsing**: `MiniDynParseError`
-* **Runtime**: `MiniDynRuntimeError`
+- Numbers automatically promote across Int64 / Double / BigInteger as needed
+- Division is integer when exact; otherwise double
+- Arrays/objects preserve insertion order for keys; equality is by identity
+- Strings index to 1-character strings; assignment into string indices is an error
+- let/const have TDZ checks; var is function/global-scoped and cannot redeclare a block-scoped name in the same function/global
+- Named arguments are supported for user functions (not for built-ins)
+- Comma operator is supported in expressions; result is the last subexpression
+- Optional chaining applies to property/index access, calls, and assignment targets
+- A simple bytecode compiler/VM accelerates a subset of functions; the interpreter handles full semantics (including defaults/rest/try/finally/optional chaining)
 
-Messages generally include `line:column` where useful.
-
----
-
-## Project structure
-
-Single-file reference implementation (namespace `MiniDynLang`):
-
-* **Lexer** → tokens & keywords
-* **Parser** → AST for expressions/statements, including destructuring & arrow functions
-* **Interpreter** → environments, `this` binding for method calls, named arguments resolution, built-ins
-* **Program** → REPL / file runner / `-demo`
-
-This layout is purposely compact so you can read it end-to-end and extend it.
+For full semantics and edge cases, see LanguageReference.md.
 
 ---
 
-## Contributing
+## Tests
 
-Issues and PRs welcome! Possible directions:
+Run the test suite:
 
-* Modules / import system
-* More stdlib (maps/sets, JSON, file IO, formatting)
-* Better diagnostics & error recovery
-* Performance (e.g., bytecode VM)
-* Tests & CI
-* Named-args support for built-ins
+```bat
+bin\Release\minidynlang.exe tests\tests.mdl
+```
+
+The suite covers arithmetic and number literals (hex/binary/underscores/exponents/bigints), logical and ternary ops, the comma operator, strings (escapes, interpolation, raw), arrays/objects (including computed keys and insertion order), destructuring, functions/arrow/this/named args, loops (for-of/for-in/classic), errors and finally semantics, optional chaining with assignment, JSON, cycle-safe stringification, and tail-call optimization.
 
 ---
 
 ## License
 
 MIT
-
----
-
-## Quick snippets
-
-```text
-// Objects + computed keys + merge
-let base = { a: 1, b: 2 };
-let key = "x";
-let extra = { [key+"1"]: 11, [key+"2"]: 22 };
-println( merge(base, extra) );
-
-// Destructuring assign directly into properties
-let o = { a: 0, b: 0 };
-{ a: o.a, b: o.b } = { a: 7, b: 8 };
-println(o);  // {a: 7, b: 8}
-
-// Named arguments + defaults + rest
-fn log(level = "INFO", ...fields, msg = "") {
-  println(level + ": " + msg, fields);
-}
-log("WARN", "u=42", "ip=1.2.3.4", msg: "rate limited");
-```
-
----
-
-> Run the **demo** to see many of these features in action:
-
-```bash
-dotnet run -- -demo
-```
