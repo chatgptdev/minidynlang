@@ -34,3 +34,23 @@ println("cycle B seenA =", b.seenA, " aName =", b.aName);
 // 7) Cache identity again
 let util2 = require("./lib/util");
 println("util === util2 ->", util == util2);
+
+println("");
+println("8) Failed modules are not cached (no partial exports persisted)");
+
+try {
+    let x = require("./fail/partial");
+    println("UNEXPECTED success:", x); // should not happen
+} catch (e) {
+    println("first require threw as expected");
+}
+
+try {
+    let x2 = require("./fail/partial");
+    println("UNEXPECTED success on retry:", x2); // should not happen
+} catch (e) {
+    println("second require threw as expected");
+}
+
+let wrap = require("./fail/wrapper");
+println("wrapper.ok =", wrap.ok, "(expected true)");

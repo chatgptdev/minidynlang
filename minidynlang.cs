@@ -6059,7 +6059,16 @@ namespace MiniDynLang
         private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
         private readonly IModuleLoader _moduleLoader;
-        private sealed class ModuleCacheEntry { public Value? Exports; }
+        private sealed class ModuleCacheEntry
+        {
+            // Final exports available after successful execution
+            public Value? Exports;
+
+            // Loading state support for cyclic dependencies
+            public bool IsLoading;
+            // Pre-seeded exports object used during loading (for cycles)
+            public Value? TempExports;
+        }
         private readonly Dictionary<string, ModuleCacheEntry> _moduleCache =
             new Dictionary<string, ModuleCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
@@ -6571,60 +6580,87 @@ namespace MiniDynLang
                 if (string.IsNullOrEmpty(abs))
                     throw new MiniDynRuntimeError($"Cannot resolve module '{spec}' from '{baseDir}'");
 
-                if (i._moduleCache.TryGetValue(abs, out var cached) && cached.Exports.HasValue)
+                // Cache lookup with loading-state handling
+                if (i._moduleCache.TryGetValue(abs, out var cached))
                 {
-                    return cached.Exports.Value;
+                    // Fully loaded -> return final exports
+                    if (!cached.IsLoading && cached.Exports.HasValue)
+                        return cached.Exports.Value;
+
+                    // In-progress (cyclic) -> return the pre-seeded temp exports
+                    if (cached.IsLoading && cached.TempExports.HasValue)
+                        return cached.TempExports.Value;
                 }
 
+                // Create or reuse cache entry and mark loading
                 if (!i._moduleCache.TryGetValue(abs, out cached))
                 {
                     cached = new ModuleCacheEntry();
                     i._moduleCache[abs] = cached;
                 }
 
-                if (!i._moduleLoader.TryLoad(abs, out var src))
+                string src;
+                if (!i._moduleLoader.TryLoad(abs, out src))
+                {
+                    // Cleanup on load failure
+                    i._moduleCache.Remove(abs);
                     throw new MiniDynRuntimeError($"Cannot load module '{abs}'");
+                }
 
-                // Parse
-                var lexer = new Lexer(src, abs);
-                var parser = new Parser(lexer);
-                var stmts = parser.Parse();
-
-                // Module environment: child of Globals; mark as FunctionEnvironment so 'var' is module-local
-                var moduleEnv = new FunctionEnvironment(i.Globals);
-
-                // Predefine exports and module
-                var initialExportsObj = new ObjectValue();
-                moduleEnv.DefineVar("exports", Value.Object(initialExportsObj));
-                var moduleObj = new ObjectValue();
-                moduleObj.Set("exports", Value.Object(initialExportsObj));
-                moduleEnv.DefineVar("module", Value.Object(moduleObj));
-
-                // Seed cache for cyclic dependencies
-                cached.Exports = Value.Object(initialExportsObj);
-
-                // Execute program in this environment
-                i.InterpretInEnv(stmts, moduleEnv);
-
-                // Read final module.exports
-                Value moduleVal;
-                if (!moduleEnv.TryGetHere("module", out moduleVal))
-                    moduleVal = Value.Object(moduleObj);
-
-                Value finalExports = Value.Nil();
-                if (moduleVal.Type == ValueType.Object)
+                try
                 {
-                    var mo = moduleVal.AsObject();
-                    if (!mo.TryGet("exports", out finalExports))
+                    // Parse
+                    var lexer = new Lexer(src, abs);
+                    var parser = new Parser(lexer);
+                    var stmts = parser.Parse();
+
+                    // Module environment: child of Globals; mark as FunctionEnvironment so 'var' is module-local
+                    var moduleEnv = new FunctionEnvironment(i.Globals);
+
+                    // Predefine exports and module
+                    var initialExportsObj = new ObjectValue();
+                    moduleEnv.DefineVar("exports", Value.Object(initialExportsObj));
+                    var moduleObj = new ObjectValue();
+                    moduleObj.Set("exports", Value.Object(initialExportsObj));
+                    moduleEnv.DefineVar("module", Value.Object(moduleObj));
+
+                    // Seed cache for cyclic dependencies (but do not finalize Exports yet)
+                    cached.IsLoading = true;
+                    cached.TempExports = Value.Object(initialExportsObj);
+
+                    // Execute program in this environment
+                    i.InterpretInEnv(stmts, moduleEnv);
+
+                    // Read final module.exports
+                    Value moduleVal;
+                    if (!moduleEnv.TryGetHere("module", out moduleVal))
+                        moduleVal = Value.Object(moduleObj);
+
+                    Value finalExports = Value.Nil();
+                    if (moduleVal.Type == ValueType.Object)
+                    {
+                        var mo = moduleVal.AsObject();
+                        if (!mo.TryGet("exports", out finalExports))
+                            finalExports = Value.Object(initialExportsObj);
+                    }
+                    else
+                    {
                         finalExports = Value.Object(initialExportsObj);
-                }
-                else
-                {
-                    finalExports = Value.Object(initialExportsObj);
-                }
+                    }
 
-                cached.Exports = finalExports;
-                return finalExports;
+                    // Commit success: finalize cache
+                    cached.Exports = finalExports;
+                    cached.IsLoading = false;
+                    cached.TempExports = null;
+
+                    return finalExports;
+                }
+                catch
+                {
+                    // On any failure, clear the cache entry so future require() retries the load
+                    i._moduleCache.Remove(abs);
+                    throw;
+                }
             });
         }
 

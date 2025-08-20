@@ -1,0 +1,6 @@
+// This module simulates partial exports then throws.
+// It should never be cached; every require() should throw.
+
+exports.foo = 123;
+println("fail/partial: set exports.foo, now throwing...");
+throw "module init failed";

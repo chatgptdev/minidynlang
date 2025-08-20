@@ -1,0 +1,18 @@
+// Wrapper that requires the failing module and reports whether require() threw.
+
+let ok = true;
+let hasFoo = nil;
+
+try {
+    let m = require("./partial");
+    // If we got here, require() returned a partial exports object incorrectly.
+    hasFoo = has_key(m, "foo");
+    ok = false;
+} catch (e) {
+    ok = true; // Correct: require() should throw for failing modules.
+}
+
+exports.ok = ok;
+if (hasFoo != nil) {
+    exports.hasFoo = hasFoo;
+}
