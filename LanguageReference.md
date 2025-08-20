@@ -32,9 +32,12 @@ MiniDynLang at a glance
   - false: nil, boolean false, numeric 0, empty string ""
   - true: non-0 numbers, non-empty strings, functions, arrays, objects
 - Equality
-  - Same-type equality uses natural equality (numbers with numeric promotion, strings ordinal, reference for objects/arrays/functions).
+  - Same-type equality uses natural equality:
+    - numbers compare by numeric value with promotion across Int64/Double/BigInteger,
+    - strings compare ordinal,
+    - arrays/objects/functions compare by reference (identity).
   - Cross type equality:
-    - number == string converts string to number if possible; else false.
+    - number == string converts the string to a number if possible; else false.
     - otherwise false.
 
 3. Literals
@@ -43,9 +46,10 @@ MiniDynLang at a glance
   - Hex: 0xFF, 0Xdead_beef
   - Binary: 0b1010_1100
   - Internally: Int64, Double, BigInteger as needed.
+  - Literal selection: decimals with a dot or exponent produce Double; otherwise choose the smallest integer kind that fits (Int64, else BigInteger). Hex/bin choose Int64 or BigInteger depending on size.
 - Strings
   - Normal: "hello", escapes: \n \r \t \" \\ \0 \xNN \uNNNN
-  - Interpolation: "Hello, ${name}!" (expression inside ${...})
+  - Interpolation: "Hello, ${name}!" — ${...} parses a full expression (nesting supported); syntax errors are reported at the interpolation site.
   - Raw triple-quoted: """anything including " and \ and ${...}""" (no escapes, no interpolation)
 - Arrays: [1, 2, "x"] (holes allowed: [,,] inserts nils)
 - Objects
@@ -60,26 +64,42 @@ MiniDynLang at a glance
 - Resolution: lexical, with runtime TDZ checks for let/const.
 
 5. Expressions and operators
-- Arithmetic: + - * / % (numbers). + also concatenates strings and concatenates arrays when both sides are arrays.
-- Unary: -x, +x (coerces to number), !x
-- Comparisons: numeric or string relational (< <= > >=). Throws on invalid type combinations.
-- Equality: ==, !=
-- Logical: a && b, a || b (short-circuit). Also and/or keywords.
-- Ternary: cond ? thenExpr : elseExpr
-- Nullish: a ?? b (returns a unless a is nil), a ??= b (assign b if target is nil)
-- Optional chaining:
+- Arithmetic
+  - Operators: + - * / %
+  - + also concatenates strings if either operand is a string, and concatenates arrays when both sides are arrays; otherwise numeric addition.
+  - Numeric representation and promotion: numbers are Int64, Double, or BigInteger. Promotion rules: if either is Double → Double; else if either is BigInteger → BigInteger; else Int64.
+  - Division: if evenly divisible in integer domain, result stays integer; otherwise a Double. Division or modulo by zero is a runtime error.
+- Unary
+  - -x, +x (coerces to number), !x
+- Comparisons
+  - Numeric or string relational (< <= > >=). Allowed only for two numbers or two strings (ordinal for strings). Other combinations throw a runtime error.
+- Equality
+  - ==, != follow the rules in section 2 (numeric promotion across number kinds; number==string tries numeric parse; other cross-type comparisons are false).
+- Logical
+  - a && b, a || b (short-circuit). They return one of the operands (no implicit boolean coercion of the result).
+  - Also and/or keywords as aliases.
+- Ternary
+  - cond ? thenExpr : elseExpr
+- Nullish
+  - a ?? b returns a unless a is nil; otherwise b.
+  - a ??= b assigns only if the target is nil (works for variables, properties, and indexes).
+- Optional chaining
   - obj?.prop -> nil if obj is nil
   - obj?.[key] -> nil if obj is nil
-  - obj?.method(args) -> nil if obj is nil; otherwise call with this set (see below)
-- Comma operator: (a, b, c) evaluates left to right; value is last.
+  - obj?.method(args) -> nil if obj is nil; otherwise calls with this set appropriately (see section 7)
+  - Optional LHS assignment: a?.b = x and a?.[k] = x are no-ops if a is nil and evaluate to nil; otherwise they behave like normal assignment. The same applies to a?.b ??= x.
+- Comma operator
+  - (a, b, c) evaluates left to right; value is the last.
+- Assignments
+  - Assignments yield the assigned value. Compound assignments (+=, -=, etc.) apply the operator using the above rules and then assign.
 
 Indexing rules
-- Arrays: arr[i], negative indices allowed (normalize: -1 means last).
-- Strings: s[i] returns 1-character string; negatives supported; out of bounds: runtime error.
-- Objects: obj[key] coerces key to string.
+- Arrays: arr[i], negative indices allowed (normalize: -1 means last). Out of bounds is a runtime error; use at(arr, i) to get nil instead (negatives supported).
+- Strings: s[i] returns a 1-character string; negatives supported; out of bounds: runtime error.
+- Objects: obj[key] coerces key to string; missing keys return nil (not an error).
 
 6. Strings and interpolation
-- Use ${...} inside normal strings to embed any expression.
+- Use ${...} inside normal strings to embed any expression; nested braces inside the expression are supported.
 - Escaping works only in normal strings.
 - Triple-quoted raw strings do not process escapes or interpolation.
 
@@ -104,6 +124,7 @@ Examples
 - Named arguments (user functions)
   - Call with name: expr pairs: f(x: 1, y: 2)
   - You can mix positional and named; once a named arg is seen, remaining positionals go to rest (if rest exists), otherwise it’s an error.
+  - Duplicate names are an error; missing required (non-defaulted) parameters are an error.
   - Built-ins do not support named arguments.
 - this binding
   - Method call target.prop(args) passes this = target for normal (non-arrow) user functions.
@@ -151,8 +172,9 @@ Assignment statement (statement form; requires semicolon)
 - for-in / for-of
   - for (pattern in expr) { ... } iterates keys/indices (strings for arrays/strings, object keys).
   - for (pattern of expr) { ... } iterates values (arrays, strings, object values).
+  - Iterating over nil performs zero iterations.
   - The pattern may be a declaration (var/let/const) or an assignment target (including destructuring).
-  - for-of on non-iterable (non-array/string/object/nil) is a runtime error; for-in on non-indexable is a runtime error.
+  - for-of on non-iterable (non-array/string/object/nil) is a runtime error; for-in on non-indexable (non-array/string/object/nil) is a runtime error.
 - break, continue
 
 Examples
@@ -187,8 +209,10 @@ try {
 
 11. Optional chaining and nullish
 - obj?.prop, obj?.[key], obj?.method(args) return nil if obj is nil.
+- Optional method calls bind this = receiver for normal functions when the receiver is non-nil.
 - a ?? b returns a unless it is nil; otherwise b.
-- a ??= b assigns only if target is nil (works for variables, properties, indexes; optional targets short-circuit to nil without assignment).
+- a ??= b assigns only if target is nil (works for variables, properties, indexes).
+- Optional assignment targets short-circuit to nil without assignment when the base is nil (e.g., a?.b = x, a?.[k] ??= x).
 
 12. Modules
 - require(specifier) loads a module.
@@ -289,13 +313,15 @@ Errors
 - let TDZ: reading a let/const name before its first assignment throws “Cannot access 'name' before initialization”.
 - var collisions: var cannot redeclare existing block-scoped name in the same function/global.
 - Arrays: concatenation with + and +=; negative indices supported in many operations.
-- Strings: indexing returns 1-char string; assignment into string indices is an error.
+- Indexing: missing object properties return nil; array/string out-of-bounds is a runtime error (use at(...) to get nil instead for arrays); assignment into string indices is an error.
 - Object property order is preserved by insertion order; object keys are strings.
-- Optional calls: obj?.method(args) yields nil if obj is nil (no call performed).
+- Optional calls: obj?.method(args) yields nil if obj is nil (no call performed) and binds this = receiver when called.
+- Assignments are expressions and evaluate to the assigned value.
 - Named arguments:
   - User functions: supported (default/rest handled).
   - Built-ins: not supported (throws).
   - Compiled functions (a subset, internally): may accept named args mapped to positional if they declare no defaults/rest.
+- Iteration over nil in for-in/for-of performs zero iterations.
 
 15. Examples
 
