@@ -11,6 +11,98 @@ using System.Collections.Concurrent;
 
 namespace MiniDynLang
 {
+    internal static class JsonUtil
+    {
+        public static string EscapeJson(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (var ch in s)
+            {
+                switch (ch)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (char.IsControl(ch)) sb.Append("\\u").Append(((int)ch).ToString("x4"));
+                        else sb.Append(ch);
+                        break;
+                }
+            }
+            return sb.ToString();
+        }
+    }
+    internal static class RuntimeOps
+    {
+        // Conversion/coercion semantics used across interpreter and VM
+        public static NumberValue ToNumber(Value v)
+        {
+            switch (v.Type)
+            {
+                case ValueType.Number: return v.AsNumber();
+                case ValueType.Boolean: return NumberValue.FromBool(v.AsBoolean());
+                case ValueType.Nil: return NumberValue.FromLong(0);
+                case ValueType.String:
+                    return NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0);
+                default:
+                    return NumberValue.FromLong(0);
+            }
+        }
+
+        public static string ToStringValue(Value v) => v.ToString();
+
+        public static int NormalizeIndex(int idx, int len)
+        {
+            if (idx < 0) idx = len + idx;
+            return idx;
+        }
+
+        public static bool CompareEq(Value a, Value b)
+        {
+            if (a.Type == b.Type) return a.Equals(b);
+
+            // numeric <-> string soft equality
+            if (a.Type == ValueType.Number && b.Type == ValueType.String)
+                return NumberValue.TryFromString(b.AsString(), out var nb) && NumberValue.Compare(a.AsNumber(), nb) == 0;
+
+            if (a.Type == ValueType.String && b.Type == ValueType.Number)
+                return NumberValue.TryFromString(a.AsString(), out var na) && NumberValue.Compare(na, b.AsNumber()) == 0;
+
+            return false;
+        }
+
+        public static bool CompareRel(Value a, Value b, string op)
+        {
+            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
+            {
+                int cmp = NumberValue.Compare(a.AsNumber(), b.AsNumber());
+                switch (op)
+                {
+                    case "<": return cmp < 0;
+                    case "<=": return cmp <= 0;
+                    case ">": return cmp > 0;
+                    case ">=": return cmp >= 0;
+                }
+            }
+            if (a.Type == ValueType.String && b.Type == ValueType.String)
+            {
+                int cmp = string.CompareOrdinal(a.AsString(), b.AsString());
+                switch (op)
+                {
+                    case "<": return cmp < 0;
+                    case "<=": return cmp <= 0;
+                    case ">": return cmp > 0;
+                    case ">=": return cmp >= 0;
+                }
+            }
+            throw new MiniDynRuntimeError("Relational comparison only on numbers or strings");
+        }
+    }
+
     // Exceptions
     public class MiniDynException : Exception
     {
@@ -3725,7 +3817,6 @@ namespace MiniDynLang
                 return v;
             }
             void Push(Value v) => stack.Add(v);
-            bool Truthy(Value v) => Value.IsTruthy(v);
 
             // Core unwinding routine: returns true if a handler/finally was found and ip updated.
             bool Unwind(bool acceptCatch)
@@ -3859,13 +3950,13 @@ namespace MiniDynLang
                             case OpCode.Neg:
                                 {
                                     var r = Pop();
-                                    Push(Value.Number(NumberValue.Neg(ToNum(r))));
+                                    Push(Value.Number(NumberValue.Neg(RuntimeOps.ToNumber(r))));
                                     break;
                                 }
                             case OpCode.Not:
                                 {
                                     var r = Pop();
-                                    Push(Value.Boolean(!Truthy(r)));
+                                    Push(Value.Boolean(!Value.IsTruthy(r)));
                                     break;
                                 }
 
@@ -3915,19 +4006,19 @@ namespace MiniDynLang
                             case OpCode.CmpEq:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Boolean(CompareEq(a, b)));
+                                    Push(Value.Boolean(RuntimeOps.CompareEq(a, b)));
                                     break;
                                 }
                             case OpCode.CmpNe:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Boolean(!CompareEq(a, b)));
+                                    Push(Value.Boolean(!RuntimeOps.CompareEq(a, b)));
                                     break;
                                 }
-                            case OpCode.CmpLt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<"))); break; }
-                            case OpCode.CmpLe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, "<="))); break; }
-                            case OpCode.CmpGt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">"))); break; }
-                            case OpCode.CmpGe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(CmpRel(a, b, ">="))); break; }
+                            case OpCode.CmpLt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(RuntimeOps.CompareRel(a, b, "<"))); break; }
+                            case OpCode.CmpLe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(RuntimeOps.CompareRel(a, b, "<="))); break; }
+                            case OpCode.CmpGt: { var b = Pop(); var a = Pop(); Push(Value.Boolean(RuntimeOps.CompareRel(a, b, ">"))); break; }
+                            case OpCode.CmpGe: { var b = Pop(); var a = Pop(); Push(Value.Boolean(RuntimeOps.CompareRel(a, b, ">="))); break; }
 
                             case OpCode.Dup:
                                 {
@@ -3949,14 +4040,14 @@ namespace MiniDynLang
                             case OpCode.JumpIfFalse:
                                 {
                                     var cnd = Pop();
-                                    if (!Truthy(cnd)) ip = ins.A;
+                                    if (!Value.IsTruthy(cnd)) ip = ins.A;
                                     break;
                                 }
 
                             case OpCode.JumpIfTruthy:
                                 {
                                     var cnd = Pop();
-                                    if (Truthy(cnd)) ip = ins.A;
+                                    if (Value.IsTruthy(cnd)) ip = ins.A;
                                     break;
                                 }
 
@@ -3997,8 +4088,8 @@ namespace MiniDynLang
                                     if (target.Type == ValueType.Array)
                                     {
                                         var arr = target.AsArray();
-                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                                        idx = NormalizeIndex(idx, arr.Length);
+                                        int idx = (int)RuntimeOps.ToNumber(index).ToDoubleNV().Dbl;
+                                        idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
                                         if (idx < 0 || idx >= arr.Length)
                                             throw new MiniDynRuntimeError("Array index out of range");
                                         Push(arr[idx]);
@@ -4006,8 +4097,8 @@ namespace MiniDynLang
                                     else if (target.Type == ValueType.String)
                                     {
                                         var s = target.AsString();
-                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                                        idx = NormalizeIndex(idx, s.Length);
+                                        int idx = (int)RuntimeOps.ToNumber(index).ToDoubleNV().Dbl;
+                                        idx = RuntimeOps.NormalizeIndex(idx, s.Length);
                                         if (idx < 0 || idx >= s.Length)
                                             throw new MiniDynRuntimeError("String index out of range");
                                         Push(Value.String(s[idx].ToString()));
@@ -4033,8 +4124,8 @@ namespace MiniDynLang
                                     if (target.Type == ValueType.Array)
                                     {
                                         var arr = target.AsArray();
-                                        int idx = (int)ToNum(index).ToDoubleNV().Dbl;
-                                        idx = NormalizeIndex(idx, arr.Length);
+                                        int idx = (int)RuntimeOps.ToNumber(index).ToDoubleNV().Dbl;
+                                        idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
                                         if (idx < 0 || idx >= arr.Length)
                                             throw new MiniDynRuntimeError("Array index out of range");
                                         arr[idx] = value;
@@ -4379,56 +4470,6 @@ namespace MiniDynLang
                         return NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0);
                     default: return NumberValue.FromLong(0);
                 }
-            }
-
-            // index normalization
-            int NormalizeIndex(int idx, int len)
-            {
-                if (idx < 0) idx = len + idx;
-                return idx;
-            }
-
-            bool CompareEq(Value a, Value b)
-            {
-                if (a.Type == b.Type) return a.Equals(b);
-                if (a.Type == ValueType.Number && b.Type == ValueType.String)
-                {
-                    if (NumberValue.TryFromString(b.AsString(), out var nb)) return NumberValue.Compare(a.AsNumber(), nb) == 0;
-                    return false;
-                }
-                if (a.Type == ValueType.String && b.Type == ValueType.Number)
-                {
-                    if (NumberValue.TryFromString(a.AsString(), out var na)) return NumberValue.Compare(na, b.AsNumber()) == 0;
-                    return false;
-                }
-                return false;
-            }
-
-            bool CmpRel(Value a, Value b, string op)
-            {
-                if (a.Type == ValueType.Number && b.Type == ValueType.Number)
-                {
-                    int cmp = NumberValue.Compare(a.AsNumber(), b.AsNumber());
-                    switch (op)
-                    {
-                        case "<": return cmp < 0;
-                        case "<=": return cmp <= 0;
-                        case ">": return cmp > 0;
-                        case ">=": return cmp >= 0;
-                    }
-                }
-                if (a.Type == ValueType.String && b.Type == ValueType.String)
-                {
-                    int cmp = string.CompareOrdinal(a.AsString(), b.AsString());
-                    switch (op)
-                    {
-                        case "<": return cmp < 0;
-                        case "<=": return cmp <= 0;
-                        case ">": return cmp > 0;
-                        case ">=": return cmp >= 0;
-                    }
-                }
-                throw new MiniDynRuntimeError("Relational comparison only on numbers or strings");
             }
         }
     }
@@ -6301,13 +6342,13 @@ namespace MiniDynLang
                 if (a[0].Type == ValueType.Array)
                 {
                     var arr = a[0].AsArray();
-                    int start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
-                    start = NormalizeIndex(start, arr.Length);
+                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = RuntimeOps.NormalizeIndex(start, arr.Length);
                     int end = arr.Length;
                     if (a.Count == 3)
                     {
-                        end = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
-                        end = NormalizeIndex(end, arr.Length);
+                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = RuntimeOps.NormalizeIndex(end, arr.Length);
                     }
                     if (start < 0) start = 0;
                     if (end < start) end = start;
@@ -6319,13 +6360,13 @@ namespace MiniDynLang
                 else if (a[0].Type == ValueType.String)
                 {
                     var s = a[0].AsString();
-                    int start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
-                    start = NormalizeIndex(start, s.Length);
+                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = RuntimeOps.NormalizeIndex(start, s.Length);
                     int end = s.Length;
                     if (a.Count == 3)
                     {
-                        end = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
-                        end = NormalizeIndex(end, s.Length);
+                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = RuntimeOps.NormalizeIndex(end, s.Length);
                     }
                     if (start < 0) start = 0;
                     if (end < start) end = start;
@@ -6497,9 +6538,9 @@ namespace MiniDynLang
             DefineBuiltin("range", 1, 3, (i, a) =>
             {
                 long start, end, step;
-                if (a.Count == 1) { start = 0; end = (long)ToNumber(a[0]).ToDoubleNV().Dbl; step = 1; }
-                else if (a.Count == 2) { start = (long)ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)ToNumber(a[1]).ToDoubleNV().Dbl; step = 1; }
-                else { start = (long)ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)ToNumber(a[1]).ToDoubleNV().Dbl; step = (long)ToNumber(a[2]).ToDoubleNV().Dbl; }
+                if (a.Count == 1) { start = 0; end = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; step = 1; }
+                else if (a.Count == 2) { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = 1; }
+                else { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = (long)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl; }
                 if (step == 0) throw new MiniDynRuntimeError("range step cannot be 0");
                 var res = new ArrayValue();
                 if (step > 0) for (long v = start; v < end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
@@ -7601,8 +7642,8 @@ namespace MiniDynLang
             var r = Evaluate(e.Right);
             switch (e.Op.Type)
             {
-                case TokenType.Minus: return Value.Number(NumberValue.Neg(ToNumber(r)));
-                case TokenType.Plus: return r.Type == ValueType.Number ? r : Value.Number(ToNumber(r));
+                case TokenType.Minus: return Value.Number(NumberValue.Neg(RuntimeOps.ToNumber(r)));
+                case TokenType.Plus: return r.Type == ValueType.Number ? r : Value.Number(RuntimeOps.ToNumber(r));
                 case TokenType.Not: return Value.Boolean(!Value.IsTruthy(r));
                 default: throw new MiniDynRuntimeError("Unknown unary");
             }
@@ -7648,12 +7689,12 @@ namespace MiniDynLang
                             case TokenType.Star: return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
                             case TokenType.Slash: return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
                             case TokenType.Percent: return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
-                            case TokenType.Equal: return Value.Boolean(CompareEqual(l, r));
-                            case TokenType.NotEqual: return Value.Boolean(!CompareEqual(l, r));
-                            case TokenType.Less: return Value.Boolean(CompareRel(l, r, "<"));
-                            case TokenType.LessEq: return Value.Boolean(CompareRel(l, r, "<="));
-                            case TokenType.Greater: return Value.Boolean(CompareRel(l, r, ">"));
-                            case TokenType.GreaterEq: return Value.Boolean(CompareRel(l, r, ">="));
+                            case TokenType.Equal: return Value.Boolean(RuntimeOps.CompareEq(l, r));
+                            case TokenType.NotEqual: return Value.Boolean(!RuntimeOps.CompareEq(l, r));
+                            case TokenType.Less: return Value.Boolean(RuntimeOps.CompareRel(l, r, "<"));
+                            case TokenType.LessEq: return Value.Boolean(RuntimeOps.CompareRel(l, r, "<="));
+                            case TokenType.Greater: return Value.Boolean(RuntimeOps.CompareRel(l, r, ">"));
+                            case TokenType.GreaterEq: return Value.Boolean(RuntimeOps.CompareRel(l, r, ">="));
                         }
                         break;
                     }
@@ -8068,17 +8109,17 @@ namespace MiniDynLang
 
             if (target.Type == ValueType.Array)
             {
-                int idx = (int)ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
+                int idx = (int)RuntimeOps.ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
                 var arr = target.AsArray();
-                idx = NormalizeIndex(idx, arr.Length);
+                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
                 if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
                 return arr[idx];
             }
             if (target.Type == ValueType.String)
             {
                 var s = target.AsString();
-                int idx = (int)ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
-                idx = NormalizeIndex(idx, s.Length);
+                int idx = (int)RuntimeOps.ToNumber(Evaluate(e.IndexExpr)).ToDoubleNV().Dbl;
+                idx = RuntimeOps.NormalizeIndex(idx, s.Length);
                 if (idx < 0 || idx >= s.Length) throw new MiniDynRuntimeError("String index out of range");
                 return Value.String(s[idx].ToString());
             }
@@ -8155,26 +8196,6 @@ namespace MiniDynLang
             return idx;
         }
 
-        private static bool CompareEqual(Value a, Value b)
-        {
-            if (a.Type == b.Type)
-            {
-                return a.Equals(b);
-            }
-            // Optional numeric-string numeric equality
-            if (a.Type == ValueType.Number && b.Type == ValueType.String)
-            {
-                if (NumberValue.TryFromString(b.AsString(), out var nb)) return NumberValue.Compare(a.AsNumber(), nb) == 0;
-                return false;
-            }
-            if (a.Type == ValueType.String && b.Type == ValueType.Number)
-            {
-                if (NumberValue.TryFromString(a.AsString(), out var na)) return NumberValue.Compare(na, b.AsNumber()) == 0;
-                return false;
-            }
-            return false;
-        }
-
         // Deep structural equality with cycle detection
         private bool DeepEqual(Value a, Value b)
         {
@@ -8235,35 +8256,6 @@ namespace MiniDynLang
             }
         }
 
-        private static bool CompareRel(Value a, Value b, string op)
-        {
-            if (a.Type == ValueType.Number && b.Type == ValueType.Number)
-            {
-                int cmp = NumberValue.Compare(a.AsNumber(), b.AsNumber());
-                switch (op)
-                {
-                    case "<": return cmp < 0;
-                    case "<=": return cmp <= 0;
-                    case ">": return cmp > 0;
-                    case ">=": return cmp >= 0;
-                    default: return false;
-                }
-            }
-            if (a.Type == ValueType.String && b.Type == ValueType.String)
-            {
-                int cmp = string.CompareOrdinal(a.AsString(), b.AsString());
-                switch (op)
-                {
-                    case "<": return cmp < 0;
-                    case "<=": return cmp <= 0;
-                    case ">": return cmp > 0;
-                    case ">=": return cmp >= 0;
-                    default: return false;
-                }
-            }
-            throw new MiniDynRuntimeError("Relational comparison only on numbers or strings");
-        }
-
         private static NumberValue ToNumber(Value v)
         {
             switch (v.Type)
@@ -8277,30 +8269,6 @@ namespace MiniDynLang
                 case ValueType.Object: return NumberValue.FromLong(0);
                 default: return NumberValue.FromLong(0);
             }
-        }
-
-        // Helpers for JSON
-        private static string EscapeJson(string s)
-        {
-            var sb = new StringBuilder();
-            foreach (var ch in s)
-            {
-                switch (ch)
-                {
-                    case '\\': sb.Append("\\\\"); break;
-                    case '"': sb.Append("\\\""); break;
-                    case '\b': sb.Append("\\b"); break;
-                    case '\f': sb.Append("\\f"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default:
-                        if (char.IsControl(ch)) sb.Append("\\u").Append(((int)ch).ToString("x4"));
-                        else sb.Append(ch);
-                        break;
-                }
-            }
-            return sb.ToString();
         }
 
         // Build a simple Error object from name/message and optional runtime error details
@@ -8343,7 +8311,7 @@ namespace MiniDynLang
                 case ValueType.Nil: return "null";
                 case ValueType.Boolean: return v.AsBoolean() ? "true" : "false";
                 case ValueType.Number: return v.AsNumber().ToString();
-                case ValueType.String: return "\"" + EscapeJson(v.AsString()) + "\"";
+                case ValueType.String: return "\"" + JsonUtil.EscapeJson(v.AsString()) + "\"";
                 case ValueType.Array:
                     {
                         var arr = v.AsArray();
@@ -8372,7 +8340,7 @@ namespace MiniDynLang
                         var parts = new List<string>(obj.Count);
                         foreach (var kv in obj.Entries)
                         {
-                            var key = "\"" + EscapeJson(kv.Key) + "\"";
+                            var key = "\"" + JsonUtil.EscapeJson(kv.Key) + "\"";
                             var val = JsonStringifyValueInternal(kv.Value, pretty, indent + 2, path);
                             parts.Add(pretty ? (Ind2() + key + ": " + val) : (key + ":" + val));
                         }
@@ -8448,16 +8416,6 @@ namespace MiniDynLang
 
     class Program
     {
-        static void Run(string source)
-        {
-            var lexer = new Lexer(source, "<script>");
-            var parser = new Parser(lexer);
-            var program = parser.Parse();
-            var loader = new FileSystemModuleLoader();
-            var interp = new Interpreter(loader);
-            interp.Interpret(program);
-        }
-
         static void RunFile(string filePath)
         {
             if (!File.Exists(filePath))
