@@ -7427,19 +7427,27 @@ namespace MiniDynLang
                     return newVal;
                 }
             }
-            // Property
+            // Property (supports optional chaining short-circuit)
             else if (e.Target is Expr.Property p)
             {
-                if (p.IsOptional) throw new MiniDynRuntimeError("Cannot assign through optional chain");
                 var objVal = Evaluate(p.Target);
-                if (objVal.Type != ValueType.Object) throw new MiniDynRuntimeError("Property assignment target must be object");
+
+                if (p.IsOptional && objVal.Type == ValueType.Nil)
+                {
+                    // Short-circuit: do not evaluate RHS; no assignment
+                    return Value.Nil();
+                }
+
+                if (objVal.Type != ValueType.Object)
+                    throw new MiniDynRuntimeError("Property assignment target must be object");
+
                 var obj = objVal.AsObject();
-                var exists = obj.TryGet(p.Name, out var cur);
+                obj.TryGet(p.Name, out var cur); // cur = nil if missing
 
                 Value newVal;
                 if (e.Op.Type == TokenType.NullishAssign)
                 {
-                    if (!exists || cur.Type == ValueType.Nil)
+                    if (cur.Type == ValueType.Nil)
                     {
                         var rhs = Evaluate(e.Value);
                         newVal = rhs;
@@ -7459,11 +7467,17 @@ namespace MiniDynLang
                     return newVal;
                 }
             }
-            // Index
+            // Index (supports optional chaining short-circuit)
             else if (e.Target is Expr.Index idx)
             {
-                if (idx.IsOptional) throw new MiniDynRuntimeError("Cannot assign through optional chain");
                 var target = Evaluate(idx.Target);
+
+                if (idx.IsOptional && target.Type == ValueType.Nil)
+                {
+                    // Short-circuit: do not evaluate index or RHS; no assignment
+                    return Value.Nil();
+                }
+
                 var idxV = Evaluate(idx.IndexExpr);
 
                 if (target.Type == ValueType.Array)
@@ -7501,12 +7515,12 @@ namespace MiniDynLang
                 {
                     var obj = target.AsObject();
                     var key = ToStringValue(idxV);
-                    var exists = obj.TryGet(key, out var cur);
+                    obj.TryGet(key, out var cur); // cur = nil if missing
 
                     Value newVal;
                     if (e.Op.Type == TokenType.NullishAssign)
                     {
-                        if (!exists || cur.Type == ValueType.Nil)
+                        if (cur.Type == ValueType.Nil)
                         {
                             var rhs = Evaluate(e.Value);
                             newVal = rhs;

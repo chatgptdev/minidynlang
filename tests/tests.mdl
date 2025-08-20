@@ -940,6 +940,101 @@ test_true("json_stringify cyclic object throws", (fn(){
     return ok;
 })());
 
+// --- Optional chaining assignment --------------------------------------------
+section("Optional chaining assignment");
+
+// Property assignment: base present
+test_eq("a?.b = v assigns and returns value when base present", (fn(){
+    let o = { a: { b: 1 } };
+    let r = (o.a?.b = 2);
+    return [o.a.b, r];
+})(), [2, 2]);
+
+// Property assignment: base nil short-circuits (no RHS eval, no write)
+test_eq("a?.b = rhs() short-circuits with nil base", (fn(){
+    let o = {};
+    let side = 0;
+    fn rhs() { side = side + 1; return 99; }
+    let r = (o.a?.b = rhs());
+    return [has_key(o, "a"), r, side];
+})(), [false, nil, 0]);
+
+// Property compound: += when base present
+test_eq("a?.x += rhs applies when base present", (fn(){
+    let o = { a: { x: 1 } };
+    let r = (o.a?.x += 2);
+    return [o.a.x, r];
+})(), [3, 3]);
+
+// Property compound: += short-circuits with nil base (skip RHS)
+test_eq("a?.x += rhs() short-circuits with nil base", (fn(){
+    let o = {};
+    let side = 0;
+    fn rhs() { side = side + 1; return 2; }
+    let r = (o.a?.x += rhs());
+    return [has_key(o, "a"), r, side];
+})(), [false, nil, 0]);
+
+// Property nullish-assign: base present, prop nil -> assigns
+test_eq("a?.x ??= v assigns when prop is nil", (fn(){
+    let o = { a: { x: nil } };
+    let r = (o.a?.x ??= 5);
+    return [o.a.x, r];
+})(), [5, 5]);
+
+// Property nullish-assign: base present, prop non-nil -> no assign, skip RHS
+test_eq("a?.x ??= rhs() skips when prop non-nil", (fn(){
+    let o = { a: { x: 1 } };
+    let side = 0;
+    fn rhs() { side = side + 1; return 9; }
+    let r = (o.a?.x ??= rhs());
+    return [o.a.x, r, side];
+})(), [1, 1, 0]);
+
+// Property nullish-assign: base nil -> short-circuit
+test_eq("a?.x ??= rhs() short-circuits with nil base", (fn(){
+    let o = {};
+    let side = 0;
+    fn rhs() { side = side + 1; return 7; }
+    let r = (o.a?.x ??= rhs());
+    return [has_key(o, "a"), r, side];
+})(), [false, nil, 0]);
+
+// Index assignment on object: base present
+test_eq("a?.[k] = v assigns by computed key when base present", (fn(){
+    let o = { a: {} };
+    let k = "y";
+    let r = (o.a?.[k] = 4);
+    return [o.a.y, r];
+})(), [4, 4]);
+
+// Index assignment on object: base nil skips key and RHS
+test_eq("a?.[getK()] = rhs() short-circuits with nil base", (fn(){
+    let o = {};
+    let s = 0;
+    fn getK() { s = s + 1; return "z"; }
+    fn rhs() { s = s + 1; return 5; }
+    let r = (o.a?.[getK()] = rhs());
+    return [has_key(o, "a"), s, r];
+})(), [false, 0, nil]);
+
+// Index assignment on array: base present
+test_eq("arr?.[i] += v updates array when base present", (fn(){
+    let arr = [10, 20];
+    let r = (arr?.[0] += 5);
+    return [arr, r];
+})(), [[15, 20], 15]);
+
+// Index assignment on array: base nil skips index and RHS
+test_eq("arr?.[idx()] = rhs() short-circuits with nil base", (fn(){
+    let arr = nil;
+    let s = 0;
+    fn idx() { s = s + 1; return 0; }
+    fn rhs() { s = s + 1; return 1; }
+    let r = (arr?.[idx()] = rhs());
+    return [s, r];
+})(), [0, nil]);
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
