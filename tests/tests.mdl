@@ -405,6 +405,54 @@ test_true("1 < 2 && 3 < 4", 1 < 2 && 3 < 4);
 test_true("1 < 2 || 3 < 1", 1 < 2 || 3 < 1);
 test_true("1 != 2", 1 != 2);
 
+// --- Truthiness of arrays and objects ----------------------------------------
+section("Truthiness of arrays and objects");
+
+// In conditions
+test_true("if ([]) enters then-branch", (fn(){ if ([]) return true; return false; })());
+test_true("if ({}) enters then-branch", (fn(){ if ({}) return true; return false; })());
+
+// Short-circuit with keyword operators
+test_eq("[] and inc() evaluates right", (fn(){
+    let s = 0;
+    fn inc3() { s = s + 1; return true; }
+    ([] and inc3()); // wrap in parentheses to avoid destructuring parse
+    return s;
+})(), 1);
+
+test_eq("{} or inc() skips right", (fn(){
+    let s = 0;
+    fn inc4() { s = s + 1; return true; }
+    ({} or inc4()); // wrap in parentheses to avoid block/destructuring parse
+    return s;
+})(), 0);
+
+// not on arrays/objects
+test_eq("not [] is false", not [], false);
+test_eq("not {} is false", not {}, false);
+
+// Ternary
+test_eq("([] ? 't' : 'f') == 't'", ([] ? "t" : "f"), "t");
+test_eq("({} ? 't' : 'f') == 't'", ({} ? "t" : "f"), "t");
+
+// Alias operators behave the same
+test_eq("[] && inc() evaluates right", (fn(){
+    let s = 0;
+    fn inc5() { s = s + 1; return true; }
+    ([] && inc5()); // wrap in parentheses to avoid destructuring parse
+    return s;
+})(), 1);
+
+test_eq("{} || inc() skips right", (fn(){
+    let s = 0;
+    fn inc6() { s = s + 1; return true; }
+    ({} || inc6()); // wrap in parentheses to avoid block/destructuring parse
+    return s;
+})(), 0);
+
+test_eq("![] == false", ![], false);
+test_eq("!{} == false", !{}, false);
+
 // --- Built-in deep_equal -----------------------------------------------------
 section("Built-in deep_equal (structural)");
 

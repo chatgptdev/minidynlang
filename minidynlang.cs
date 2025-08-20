@@ -520,8 +520,8 @@ namespace MiniDynLang
                 case ValueType.Number: return NumberValue.Compare(v._num, NumberValue.FromLong(0)) != 0;
                 case ValueType.String: return !string.IsNullOrEmpty(v._str);
                 case ValueType.Function: return true;
-                case ValueType.Array: return v._arr != null && v._arr.Length != 0;
-                case ValueType.Object: return v._obj != null && v._obj.Count != 0;
+                case ValueType.Array: return true;   // arrays are always truthy (even when empty)
+                case ValueType.Object: return true;  // objects are always truthy (even when empty)
                 default: return false;
             }
         }
