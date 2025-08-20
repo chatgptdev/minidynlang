@@ -812,7 +812,7 @@ namespace MiniDynLang
         public override string ToString() => $"{Type} '{Lexeme}' @ {Line}:{Column}";
     }
 
-    public class Lexer
+    public sealed class Lexer
     {
         private readonly string _src;
         private int _pos;
@@ -895,6 +895,12 @@ namespace MiniDynLang
         private Token MakeToken(TokenType t, string lexeme, object lit, int startPos, int startLine, int startCol)
             => new Token(t, lexeme, lit, startPos, startLine, startCol, _fileName);
 
+        // Small helper for operators that have an '=’ form (+=, -=, *=, /=, %=)
+        private Token SimpleOrAssign(char opChar, TokenType simple, TokenType assign, int start, int startLine, int startCol)
+        {
+            if (Peek() == '=') { Advance(); return MakeToken(assign, opChar.ToString() + "=", null, start, startLine, startCol); }
+            return MakeToken(simple, opChar.ToString(), null, start, startLine, startCol);
+        }
         public Token NextToken()
         {
             SkipWhitespaceAndComments();
@@ -924,20 +930,15 @@ namespace MiniDynLang
                 case ',':
                     return MakeToken(TokenType.Comma, ",", null, start, startLine, startCol);
                 case '+':
-                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.PlusAssign, "+=", null, start, startLine, startCol); }
-                    return MakeToken(TokenType.Plus, "+", null, start, startLine, startCol);
+                    return SimpleOrAssign('+', TokenType.Plus, TokenType.PlusAssign, start, startLine, startCol);
                 case '-':
-                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.MinusAssign, "-=", null, start, startLine, startCol); }
-                    return MakeToken(TokenType.Minus, "-", null, start, startLine, startCol);
+                    return SimpleOrAssign('-', TokenType.Minus, TokenType.MinusAssign, start, startLine, startCol);
                 case '*':
-                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.StarAssign, "*=", null, start, startLine, startCol); }
-                    return MakeToken(TokenType.Star, "*", null, start, startLine, startCol);
+                    return SimpleOrAssign('*', TokenType.Star, TokenType.StarAssign, start, startLine, startCol);
                 case '/':
-                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.SlashAssign, "/=", null, start, startLine, startCol); }
-                    return MakeToken(TokenType.Slash, "/", null, start, startLine, startCol);
+                    return SimpleOrAssign('/', TokenType.Slash, TokenType.SlashAssign, start, startLine, startCol);
                 case '%':
-                    if (Peek() == '=') { Advance(); return MakeToken(TokenType.PercentAssign, "%=", null, start, startLine, startCol); }
-                    return MakeToken(TokenType.Percent, "%", null, start, startLine, startCol);
+                    return SimpleOrAssign('%', TokenType.Percent, TokenType.PercentAssign, start, startLine, startCol);
                 case '?':
                     // Optional chaining '?.', nullish coalescing '??', and ternary '?'
                     if (Peek() == '.')
@@ -1675,7 +1676,7 @@ namespace MiniDynLang
     }
 
     // Parser
-    public class Parser
+    public sealed class Parser
     {
         private readonly List<Token> _tokens;
         private int _current;
@@ -3234,7 +3235,7 @@ namespace MiniDynLang
         Value Call(Interpreter interp, List<Value> args);
     }
 
-    public class BuiltinFunction : ICallable
+    internal sealed class BuiltinFunction : ICallable
     {
         public string Name { get; }
         private readonly Func<Interpreter, List<Value>, Value> _fn;
@@ -3250,7 +3251,7 @@ namespace MiniDynLang
         public override string ToString() => $"<builtin {Name}>";
     }
 
-    public class UserFunction : ICallable
+    internal sealed class UserFunction : ICallable
     {
         public struct ParamSpec
         {
@@ -3981,25 +3982,25 @@ namespace MiniDynLang
                             case OpCode.Sub:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Sub(ToNum(a), ToNum(b))));
+                                    Push(Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
                                     break;
                                 }
                             case OpCode.Mul:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Mul(ToNum(a), ToNum(b))));
+                                    Push(Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
                                     break;
                                 }
                             case OpCode.Div:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Div(ToNum(a), ToNum(b))));
+                                    Push(Value.Number(NumberValue.Div(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
                                     break;
                                 }
                             case OpCode.Mod:
                                 {
                                     var b = Pop(); var a = Pop();
-                                    Push(Value.Number(NumberValue.Mod(ToNum(a), ToNum(b))));
+                                    Push(Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(a), RuntimeOps.ToNumber(b))));
                                     break;
                                 }
 
@@ -4458,19 +4459,6 @@ namespace MiniDynLang
                 return r.Value;
             }
             return Value.Nil();
-
-            NumberValue ToNum(Value v)
-            {
-                switch (v.Type)
-                {
-                    case ValueType.Number: return v.AsNumber();
-                    case ValueType.Boolean: return NumberValue.FromBool(v.AsBoolean());
-                    case ValueType.Nil: return NumberValue.FromLong(0);
-                    case ValueType.String:
-                        return NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0);
-                    default: return NumberValue.FromLong(0);
-                }
-            }
         }
     }
 
@@ -6067,21 +6055,21 @@ namespace MiniDynLang
         }
 
         // Tail-call trampoline signal
-        public class TailCallSignal : Exception
+        internal class TailCallSignal : Exception
         {
-            public UserFunction Function { get; }
-            public List<Value> Args { get; }
+            internal UserFunction Function { get; }
+            internal List<Value> Args { get; }
             // carry an argument mapping for named-args/defaults
-            public ArgMapping? Mapping { get; }
+            internal ArgMapping? Mapping { get; }
 
-            public TailCallSignal(UserFunction fn, List<Value> args)
+            internal TailCallSignal(UserFunction fn, List<Value> args)
             {
                 Function = fn;
                 Args = args;
                 Mapping = null;
             }
 
-            public TailCallSignal(UserFunction fn, ArgMapping mapping)
+            internal TailCallSignal(UserFunction fn, ArgMapping mapping)
             {
                 Function = fn;
                 Mapping = mapping;
@@ -6236,7 +6224,7 @@ namespace MiniDynLang
             // Math
             DefineBuiltin("abs", 1, 1, (i, a) =>
             {
-                var n = ToNumber(a[0]);
+                var n = RuntimeOps.ToNumber(a[0]);
                 switch (n.Kind)
                 {
                     case NumberValue.NumKind.Int: return Value.Number(NumberValue.FromLong(Math.Abs(n.I64)));
@@ -6245,44 +6233,44 @@ namespace MiniDynLang
                     default: return Value.Number(NumberValue.FromLong(0));
                 }
             });
-            DefineBuiltin("floor", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Floor(ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("ceil", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Ceiling(ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("round", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Round(ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("sqrt", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Sqrt(ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("pow", 2, 2, (i, a) => Value.Number(NumberValue.FromDouble(Math.Pow(ToNumber(a[0]).ToDoubleNV().Dbl, ToNumber(a[1]).ToDoubleNV().Dbl))));
+            DefineBuiltin("floor", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Floor(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("ceil", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Ceiling(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("round", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Round(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("sqrt", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Sqrt(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            DefineBuiltin("pow", 2, 2, (i, a) => Value.Number(NumberValue.FromDouble(Math.Pow(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl, RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl))));
             DefineBuiltin("min", 1, int.MaxValue, (i, a) =>
             {
                 if (a.Count == 0) return Value.Nil();
-                var cur = ToNumber(a[0]);
+                var cur = RuntimeOps.ToNumber(a[0]);
                 for (int k = 1; k < a.Count; k++)
-                    if (NumberValue.Compare(ToNumber(a[k]), cur) < 0) cur = ToNumber(a[k]);
+                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) < 0) cur = RuntimeOps.ToNumber(a[k]);
                 return Value.Number(cur);
             });
             DefineBuiltin("max", 1, int.MaxValue, (i, a) =>
             {
                 if (a.Count == 0) return Value.Nil();
-                var cur = ToNumber(a[0]);
+                var cur = RuntimeOps.ToNumber(a[0]);
                 for (int k = 1; k < a.Count; k++)
-                    if (NumberValue.Compare(ToNumber(a[k]), cur) > 0) cur = ToNumber(a[k]);
+                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) > 0) cur = RuntimeOps.ToNumber(a[k]);
                 return Value.Number(cur);
             });
 
             var rng = new Random();
             DefineBuiltin("random", 0, 0, (i, a) => Value.Number(NumberValue.FromDouble(rng.NextDouble())));
-            DefineBuiltin("srand", 1, 1, (i, a) => { rng = new Random((int)(ToNumber(a[0]).ToDoubleNV().Dbl)); return Value.Nil(); });
+            DefineBuiltin("srand", 1, 1, (i, a) => { rng = new Random((int)(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl)); return Value.Nil(); });
 
             // String utilities
             DefineBuiltin("substring", 2, 3, (i, a) =>
             {
                 var s = a[0].AsString();
-                var start = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
                 if (start < 0) start = 0;
                 if (start > s.Length) start = s.Length;
                 if (a.Count == 2)
                 {
                     return Value.String(s.Substring(start));
                 }
-                var len = (int)ToNumber(a[2]).ToDoubleNV().Dbl;
+                var len = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
                 if (len < 0) len = 0;
                 if (start + len > s.Length) len = s.Length - start;
                 return Value.String(s.Substring(start, len));
@@ -6390,16 +6378,16 @@ namespace MiniDynLang
             DefineBuiltin("at", 2, 2, (i, a) =>
             {
                 var arr = a[0].AsArray();
-                int idx = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
-                idx = NormalizeIndex(idx, arr.Length);
+                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
                 if (idx < 0 || idx >= arr.Length) return Value.Nil();
                 return arr[idx];
             });
             DefineBuiltin("set_at", 3, 3, (i, a) =>
             {
                 var arr = a[0].AsArray();
-                int idx = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
-                idx = NormalizeIndex(idx, arr.Length);
+                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
                 if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
                 arr[idx] = a[2];
                 return a[2];
@@ -6557,7 +6545,7 @@ namespace MiniDynLang
             });
             DefineBuiltin("repeat", 2, 2, (i, a) =>
             {
-                var s = a[0].AsString(); int n = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var s = a[0].AsString(); int n = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
                 if (n < 0) n = 0;
                 var sb = new StringBuilder(s.Length * n);
                 for (int k = 0; k < n; k++) sb.Append(s);
@@ -6565,7 +6553,7 @@ namespace MiniDynLang
             });
             DefineBuiltin("pad_start", 2, 3, (i, a) =>
             {
-                var s = a[0].AsString(); int len = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
                 var pad = a.Count == 3 ? a[2].AsString() : " ";
                 if (pad.Length == 0) pad = " ";
                 if (s.Length >= len) return Value.String(s);
@@ -6576,7 +6564,7 @@ namespace MiniDynLang
             });
             DefineBuiltin("pad_end", 2, 3, (i, a) =>
             {
-                var s = a[0].AsString(); int len = (int)ToNumber(a[1]).ToDoubleNV().Dbl;
+                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
                 var pad = a.Count == 3 ? a[2].AsString() : " ";
                 if (pad.Length == 0) pad = " ";
                 if (s.Length >= len) return Value.String(s);
@@ -6589,7 +6577,7 @@ namespace MiniDynLang
             // === Time ===
             DefineBuiltin("sleep_ms", 1, 1, (i, a) =>
             {
-                var ms = (int)ToNumber(a[0]).ToDoubleNV().Dbl;
+                var ms = (int)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
                 System.Threading.Thread.Sleep(ms < 0 ? 0 : ms);
                 return Value.Nil();
             });
@@ -7473,13 +7461,13 @@ namespace MiniDynLang
                         }
                         throw new MiniDynRuntimeError("Invalid '+=' operands");
                     case TokenType.MinusAssign:
-                        return Value.Number(NumberValue.Sub(ToNumber(cur), ToNumber(rhsVal)));
+                        return Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
                     case TokenType.StarAssign:
-                        return Value.Number(NumberValue.Mul(ToNumber(cur), ToNumber(rhsVal)));
+                        return Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
                     case TokenType.SlashAssign:
-                        return Value.Number(NumberValue.Div(ToNumber(cur), ToNumber(rhsVal)));
+                        return Value.Number(NumberValue.Div(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
                     case TokenType.PercentAssign:
-                        return Value.Number(NumberValue.Mod(ToNumber(cur), ToNumber(rhsVal)));
+                        return Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(cur), RuntimeOps.ToNumber(rhsVal)));
                     default:
                         throw new MiniDynRuntimeError("Unknown compound assignment");
                 }
@@ -7568,8 +7556,8 @@ namespace MiniDynLang
                 if (target.Type == ValueType.Array)
                 {
                     var arr = target.AsArray();
-                    int i = (int)ToNumber(idxV).ToDoubleNV().Dbl;
-                    i = NormalizeIndex(i, arr.Length);
+                    int i = (int)RuntimeOps.ToNumber(idxV).ToDoubleNV().Dbl;
+                    i = RuntimeOps.NormalizeIndex(i, arr.Length);
                     if (i < 0 || i >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
                     var cur = arr[i];
 
@@ -7685,10 +7673,10 @@ namespace MiniDynLang
                                     return Value.Array(res);
                                 }
                                 throw new MiniDynRuntimeError("Invalid '+' operands");
-                            case TokenType.Minus: return Value.Number(NumberValue.Sub(ToNumber(l), ToNumber(r)));
-                            case TokenType.Star: return Value.Number(NumberValue.Mul(ToNumber(l), ToNumber(r)));
-                            case TokenType.Slash: return Value.Number(NumberValue.Div(ToNumber(l), ToNumber(r)));
-                            case TokenType.Percent: return Value.Number(NumberValue.Mod(ToNumber(l), ToNumber(r)));
+                            case TokenType.Minus: return Value.Number(NumberValue.Sub(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
+                            case TokenType.Star: return Value.Number(NumberValue.Mul(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
+                            case TokenType.Slash: return Value.Number(NumberValue.Div(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
+                            case TokenType.Percent: return Value.Number(NumberValue.Mod(RuntimeOps.ToNumber(l), RuntimeOps.ToNumber(r)));
                             case TokenType.Equal: return Value.Boolean(RuntimeOps.CompareEq(l, r));
                             case TokenType.NotEqual: return Value.Boolean(!RuntimeOps.CompareEq(l, r));
                             case TokenType.Less: return Value.Boolean(RuntimeOps.CompareRel(l, r, "<"));
@@ -8190,12 +8178,6 @@ namespace MiniDynLang
             return Evaluate(e.Right);
         }
 
-        private static int NormalizeIndex(int idx, int len)
-        {
-            if (idx < 0) idx = len + idx;
-            return idx;
-        }
-
         // Deep structural equality with cycle detection
         private bool DeepEqual(Value a, Value b)
         {
@@ -8253,21 +8235,6 @@ namespace MiniDynLang
                     }
                 default:
                     return false;
-            }
-        }
-
-        private static NumberValue ToNumber(Value v)
-        {
-            switch (v.Type)
-            {
-                case ValueType.Number: return v.AsNumber();
-                case ValueType.Boolean: return NumberValue.FromBool(v.AsBoolean());
-                case ValueType.Nil: return NumberValue.FromLong(0);
-                case ValueType.String:
-                    return NumberValue.TryFromString(v.AsString(), out var nv) ? nv : NumberValue.FromLong(0);
-                case ValueType.Array: return NumberValue.FromLong(0);
-                case ValueType.Object: return NumberValue.FromLong(0);
-                default: return NumberValue.FromLong(0);
             }
         }
 
