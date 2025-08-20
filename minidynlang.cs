@@ -336,15 +336,8 @@ namespace MiniDynLang
         public ArrayValue Clone() => new ArrayValue(Items);
         public override string ToString()
         {
-            var sb = new StringBuilder();
-            sb.Append('[');
-            for (int i = 0; i < Items.Count; i++)
-            {
-                if (i > 0) sb.Append(", ");
-                sb.Append(Items[i].ToString());
-            }
-            sb.Append(']');
-            return sb.ToString();
+            // Use cycle-aware printer
+            return SafeStringifier.PrintArray(this);
         }
     }
 
@@ -424,19 +417,8 @@ namespace MiniDynLang
 
         public override string ToString()
         {
-            var sb = new StringBuilder();
-            sb.Append('{');
-            bool first = true;
-            foreach (var k in _order)
-            {
-                if (!first) sb.Append(", ");
-                first = false;
-                sb.Append(k);
-                sb.Append(": ");
-                sb.Append(_map[k].ToString());
-            }
-            sb.Append('}');
-            return sb.ToString();
+            // Use cycle-aware printer
+            return SafeStringifier.PrintObject(this);
         }
     }
 
@@ -454,6 +436,79 @@ namespace MiniDynLang
                 _pool[s] = s;
                 return s;
             }
+        }
+    }
+
+    // Cycle-safe pretty printer for Value, ArrayValue and ObjectValue.
+    internal static class SafeStringifier
+    {
+        public static string Print(Value v)
+        {
+            var path = new HashSet<object>();
+            return PrintValue(v, path);
+        }
+
+        public static string PrintArray(ArrayValue arr)
+        {
+            var path = new HashSet<object>();
+            return PrintArray(arr, path);
+        }
+
+        public static string PrintObject(ObjectValue obj)
+        {
+            var path = new HashSet<object>();
+            return PrintObject(obj, path);
+        }
+
+        private static string PrintValue(Value v, HashSet<object> path)
+        {
+            switch (v.Type)
+            {
+                case ValueType.Nil: return "nil";
+                case ValueType.Boolean: return v.AsBoolean() ? "true" : "false";
+                case ValueType.Number: return v.AsNumber().ToString();
+                case ValueType.String: return v.AsString();
+                case ValueType.Function: return v.AsFunction() != null ? v.AsFunction().ToString() : "<function>";
+                case ValueType.Array: return PrintArray(v.AsArray(), path);
+                case ValueType.Object: return PrintObject(v.AsObject(), path);
+                default: return "nil";
+            }
+        }
+
+        private static string PrintArray(ArrayValue arr, HashSet<object> path)
+        {
+            if (path.Contains(arr)) return "[<cycle>]";
+            path.Add(arr);
+            var sb = new StringBuilder();
+            sb.Append('[');
+            for (int i = 0; i < arr.Length; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(PrintValue(arr[i], path));
+            }
+            sb.Append(']');
+            path.Remove(arr);
+            return sb.ToString();
+        }
+
+        private static string PrintObject(ObjectValue obj, HashSet<object> path)
+        {
+            if (path.Contains(obj)) return "{<cycle>}";
+            path.Add(obj);
+            var sb = new StringBuilder();
+            sb.Append('{');
+            bool first = true;
+            foreach (var kv in obj.Entries)
+            {
+                if (!first) sb.Append(", ");
+                first = false;
+                sb.Append(kv.Key);
+                sb.Append(": ");
+                sb.Append(PrintValue(kv.Value, path));
+            }
+            sb.Append('}');
+            path.Remove(obj);
+            return sb.ToString();
         }
     }
 
@@ -499,16 +554,8 @@ namespace MiniDynLang
 
         public override string ToString()
         {
-            switch (Type)
-            {
-                case ValueType.Number: return _num.ToString();
-                case ValueType.String: return _str;
-                case ValueType.Boolean: return _bool ? "true" : "false";
-                case ValueType.Function: return _func != null ? _func.ToString() : "<function>";
-                case ValueType.Array: return _arr != null ? _arr.ToString() : "[]";
-                case ValueType.Object: return _obj != null ? _obj.ToString() : "{}";
-                default: return "nil";
-            }
+            // Delegate to cycle-aware printer
+            return SafeStringifier.Print(this);
         }
 
         public static bool IsTruthy(in Value v)
@@ -8330,6 +8377,13 @@ namespace MiniDynLang
 
         private string JsonStringifyValue(Value v, bool pretty = false, int indent = 0)
         {
+            // Use an object path to detect cycles along the current traversal
+            var path = new HashSet<object>();
+            return JsonStringifyValueInternal(v, pretty, indent, path);
+        }
+
+        private string JsonStringifyValueInternal(Value v, bool pretty, int indent, HashSet<object> path)
+        {
             string Ind() => new string(' ', indent);
             string Ind2() => new string(' ', indent + 2);
 
@@ -8342,28 +8396,40 @@ namespace MiniDynLang
                 case ValueType.Array:
                     {
                         var arr = v.AsArray();
-                        if (arr.Length == 0) return "[]";
+                        if (path.Contains(arr))
+                            throw new MiniDynRuntimeError("Cannot stringify cyclic structure");
+                        path.Add(arr);
+
+                        if (arr.Length == 0) { path.Remove(arr); return "[]"; }
                         var parts = new List<string>(arr.Length);
                         for (int k = 0; k < arr.Length; k++)
-                            parts.Add(JsonStringifyValue(arr[k], pretty, indent + 2));
-                        if (!pretty) return "[" + string.Join(",", parts) + "]";
-                        var lines = string.Join(",\n", parts.Select(p => Ind2() + p));
-                        return "[\n" + lines + "\n" + Ind() + "]";
+                            parts.Add(JsonStringifyValueInternal(arr[k], pretty, indent + 2, path));
+                        var result = !pretty
+                            ? "[" + string.Join(",", parts) + "]"
+                            : "[\n" + string.Join(",\n", parts.Select(p => Ind2() + p)) + "\n" + Ind() + "]";
+                        path.Remove(arr);
+                        return result;
                     }
                 case ValueType.Object:
                     {
                         var obj = v.AsObject();
-                        if (obj.Count == 0) return "{}";
+                        if (path.Contains(obj))
+                            throw new MiniDynRuntimeError("Cannot stringify cyclic structure");
+                        path.Add(obj);
+
+                        if (obj.Count == 0) { path.Remove(obj); return "{}"; }
                         var parts = new List<string>(obj.Count);
                         foreach (var kv in obj.Entries)
                         {
                             var key = "\"" + EscapeJson(kv.Key) + "\"";
-                            var val = JsonStringifyValue(kv.Value, pretty, indent + 2);
+                            var val = JsonStringifyValueInternal(kv.Value, pretty, indent + 2, path);
                             parts.Add(pretty ? (Ind2() + key + ": " + val) : (key + ":" + val));
                         }
-                        if (!pretty) return "{" + string.Join(",", parts) + "}";
-                        var lines = string.Join(",\n", parts);
-                        return "{\n" + lines + "\n" + Ind() + "}";
+                        var result = !pretty
+                            ? "{" + string.Join(",", parts) + "}"
+                            : "{\n" + string.Join(",\n", parts) + "\n" + Ind() + "}";
+                        path.Remove(obj);
+                        return result;
                     }
                 default:
                     return "null";

@@ -905,6 +905,41 @@ test_true("for-in non-indexable still raises when 'error' is shadowed", (fn(){
     return ok;
 })());
 
+// --- Cycle-safe stringification and JSON -------------------------------------
+section("Cycle-safe stringification and JSON");
+
+// to_string must not recurse infinitely on cyclic arrays/objects
+test_eq("to_string on cyclic array is finite", (fn(){
+    let a = [];
+    push(a, a); // self-cycle
+    return to_string(a);
+})(), "[[<cycle>]]");
+
+test_eq("to_string on cyclic object is finite", (fn(){
+    let o = {};
+    o.self = o; // self-cycle
+    return to_string(o);
+})(), "{self: {<cycle>}}");
+
+// json_stringify must throw on cycles
+test_true("json_stringify cyclic array throws", (fn(){
+    let ok = false;
+    let a = [];
+    push(a, a);
+    try { json_stringify(a); }
+    catch (e) { ok = contains(e.message, "cyclic"); }
+    return ok;
+})());
+
+test_true("json_stringify cyclic object throws", (fn(){
+    let ok = false;
+    let o = {};
+    o.self = o;
+    try { json_stringify(o); }
+    catch (e) { ok = contains(e.message, "cyclic"); }
+    return ok;
+})());
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");
