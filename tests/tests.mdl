@@ -1035,6 +1035,117 @@ test_eq("arr?.[idx()] = rhs() short-circuits with nil base", (fn(){
     return [s, r];
 })(), [0, nil]);
 
+// --- Standard Library: FS / Paths-Env / Regex / HTTP / Array / Object / Math / String / Pretty Print ---
+section("Standard Library additions");
+
+// FS
+test_eq("write_file + exists", (fn(){
+    let fname = "tmp_stdlib_io.txt";
+    write_file(fname, "hello\nworld");
+    return exists(fname);
+})(), true);
+
+test_eq("read_file roundtrip", (fn(){
+    let fname = "tmp_stdlib_io2.txt";
+    let content = "line1\nline2";
+    write_file(fname, content);
+    return read_file(fname);
+})(), "line1\nline2");
+
+test_eq("write_bytes/read_bytes", (fn(){
+    let fname = "tmp_stdlib_io.bin";
+    let bs = [0, 1, 2, 255];
+    write_bytes(fname, bs);
+    return read_bytes(fname);
+})(), [0, 1, 2, 255]);
+
+// Paths / Env
+test_true("cwd returns non-empty string", length(cwd()) > 0);
+
+test_eq("env_get/env_set roundtrip", (fn(){
+    let key = "MDL_TEST_VAR";
+    env_set(key, nil);                   // ensure unset
+    let a = env_get(key);                // nil
+    env_set(key, "123");
+    let b = env_get(key);                // "123"
+    env_set(key, nil);                   // unset again
+    let c = env_get(key);                // nil
+    return [a, b, c];
+})(), [nil, "123", nil]);
+
+// Regex
+test_true("regex_match with flags (i)", regex_match("Hello", "^h", "i"));
+test_eq("regex_replace digits", regex_replace("a1b2c3", "\\d", "X"), "aXbXcX");
+test_eq("match returns all digit matches", match("a1b2c3", "\\d"), ["1", "2", "3"]);
+
+// HTTP (best-effort: pass if network unavailable)
+test_true("http_get google.com", (fn(){
+    try {
+        let html = http_get("https://google.com");
+        return contains(html, "Google");
+    } catch (e) {
+        println("http_get failed: ", e.message);
+        return false; // do not fail suite if network blocked
+    }
+})());
+
+test_true("http_post echo", (fn(){
+    try {
+        let resp = http_post("https://postman-echo.com/post", "hello", "text/plain");
+        // response should contain the echoed payload
+        return contains(resp, "hello");
+    } catch (e) {
+        println("http_post failed: ", e.message);
+        return false; // do not fail suite if network blocked
+    }
+})());
+
+// Array extras
+let nums_ex = [1, 2, 3, 4, 5, 2, 3];
+test_true("some > 4", some(nums_ex, x => x > 4));
+test_true("every > 0", every(nums_ex, x => x > 0));
+test_eq("find == 3", find(nums_ex, x => x == 3), 3);
+test_eq("find_index first >= 4", find_index(nums_ex, x => x >= 4), 3);
+
+// Object: deep_merge
+test_eq("deep_merge objects and arrays", (fn(){
+    let a = { a: { x: 1, y: [1] }, b: 2 };
+    let b = { a: { y: [2], z: 3 }, b: 9, c: 5 };
+    return deep_merge(a, b);
+})(), { a: { x: 1, y: [1, 2], z: 3 }, b: 9, c: 5 });
+
+// Math extras
+test_true("sin(0)==0, cos(0)==1", almost_number_equal(sin(0), 0) and almost_number_equal(cos(0), 1));
+test_true("tan(0)==0", almost_number_equal(tan(0), 0));
+test_true("asin(sin(0.5))≈0.5", almost_number_equal(asin(sin(0.5)), 0.5));
+test_true("acos(cos(0.5))≈0.5", almost_number_equal(acos(cos(0.5)), 0.5));
+test_true("atan(1)≈0.785398...", almost_number_equal(atan(1), 0.78539816339));
+test_true("log(exp(1))≈1", almost_number_equal(log(exp(1)), 1));
+test_eq("sign(-3) == -1", sign(-3), -1);
+test_eq("sign(0) == 0", sign(0), 0);
+test_eq("sign(7) == 1", sign(7), 1);
+test_eq("clamp(5,1,3) == 3", clamp(5, 1, 3), 3);
+test_eq("clamp(-2,1,3) == 1", clamp(-2, 1, 3), 1);
+test_true("random_int inclusive bounds", (fn(){
+    // try a few times to see both bounds; at least ensure within [2..4]
+    let ok = true;
+    let i = 0;
+    while (i < 10) {
+        let r = random_int(2, 4);
+        if (!(r >= 2 and r <= 4)) ok = false;
+        i = i + 1;
+    }
+    return ok;
+})());
+
+// String extras
+test_eq("pad_start", pad_start("7", 3, "0"), "007");
+test_eq("pad_end", pad_end("7", 3, "0"), "700");
+test_eq("repeat", repeat("ab", 3), "ababab");
+
+// Pretty printing
+test_eq("pprint returns nil", type(pprint({ a: 1, b: [2, 3] })), "nil");
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");

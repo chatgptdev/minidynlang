@@ -8,6 +8,7 @@ using System.Numerics;
 using System.Text;
 using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 
 namespace MiniDynLang
 {
@@ -3073,7 +3074,7 @@ namespace MiniDynLang
     }
 
     // Environment
-    public class Environment
+    public class MDLEnv
     {
         // Use Ordinal everywhere for identifiers to match object-key semantics.
         private readonly Dictionary<string, Value> _values = new Dictionary<string, Value>(StringComparer.Ordinal);
@@ -3083,9 +3084,9 @@ namespace MiniDynLang
         private readonly HashSet<string> _uninitialized = new HashSet<string>(StringComparer.Ordinal);
 
         public virtual bool IsFunction => false; // mark function/global boundaries
-        public Environment Enclosing { get; }
+        public MDLEnv Enclosing { get; }
 
-        public Environment(Environment enclosing = null) { Enclosing = enclosing; }
+        public MDLEnv(MDLEnv enclosing = null) { Enclosing = enclosing; }
 
         // helper – is name declared in this exact env (no parents)
         public virtual bool HasHere(string name) => _values.ContainsKey(name);
@@ -3104,7 +3105,7 @@ namespace MiniDynLang
         }
 
         // nearest function/global env (fallback to self if none)
-        private Environment GetNearestFunctionEnv()
+        private MDLEnv GetNearestFunctionEnv()
         {
             var e = this;
             while (e != null && !e.IsFunction) e = e.Enclosing;
@@ -3199,12 +3200,12 @@ namespace MiniDynLang
     }
 
     // Environment that exposes current bytecode function's params/locals (backed by the VM slots array)
-    internal sealed class LocalsBackedEnvironment : Environment
+    internal sealed class LocalsBackedEnvironment : MDLEnv
     {
         private readonly Value[] _slots;
         private readonly Dictionary<string, int> _slotOf;
 
-        public LocalsBackedEnvironment(Environment enclosing, Value[] slots, Dictionary<string, int> slotOf)
+        public LocalsBackedEnvironment(MDLEnv enclosing, Value[] slots, Dictionary<string, int> slotOf)
             : base(enclosing)
         {
             _slots = slots ?? Array.Empty<Value>();
@@ -3246,10 +3247,10 @@ namespace MiniDynLang
     }
 
     // Marks function/global scopes (nearest target for 'var')
-    public class FunctionEnvironment : Environment
+    public class FunctionEnvironment : MDLEnv
     {
         public override bool IsFunction => true;
-        public FunctionEnvironment(Environment enclosing = null) : base(enclosing) { }
+        public FunctionEnvironment(MDLEnv enclosing = null) : base(enclosing) { }
     }
 
     public interface ICallable
@@ -3292,7 +3293,7 @@ namespace MiniDynLang
 
         public List<ParamSpec> Params { get; }
         public Stmt.Block Body { get; }
-        public Environment Closure { get; }
+        public MDLEnv Closure { get; }
         public string Name { get; }
         public SourceSpan DefSpan { get; } // where function was defined
 
@@ -3326,7 +3327,7 @@ namespace MiniDynLang
 
         // kind + capturedThis parameters (default to Normal/null for old call sites)
         // functionId (optional) to preserve identity across clones/binds
-        public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, Environment closure,
+        public UserFunction(string name, List<Expr.Param> parameters, Stmt.Block body, MDLEnv closure,
                             Kind kind = Kind.Normal, Value? capturedThis = null, SourceSpan defSpan = default(SourceSpan),
                             int functionId = 0)
         {
@@ -3362,7 +3363,7 @@ namespace MiniDynLang
                 Interpreter.ArgMapping? currentMap = null; // support mapping from tail-calls
                 while (true)
                 {
-                    var env = new Environment(Closure);
+                    var env = new MDLEnv(Closure);
 
                     // define 'this' according to kind (arrow uses captured lexical; normal uses bound call-site)
                     if (FunctionKind == Kind.Arrow)
@@ -3491,7 +3492,7 @@ namespace MiniDynLang
 
                 while (true)
                 {
-                    var env = new Environment(Closure);
+                    var env = new MDLEnv(Closure);
 
                     if (FunctionKind == Kind.Arrow)
                     {
@@ -3570,7 +3571,7 @@ namespace MiniDynLang
             return Name != null ? $"<fn {Name}>" : "<fn>";
         }
 
-        public UserFunction Bind(Environment newClosure) =>
+        public UserFunction Bind(MDLEnv newClosure) =>
             new UserFunction(Name, ToExprParams(), Body, newClosure, FunctionKind, _capturedThis, DefSpan, FunctionId);
 
         private List<Expr.Param> ToExprParams()
@@ -3584,7 +3585,7 @@ namespace MiniDynLang
     // central registry for built-ins
     internal static class Builtins
     {
-        public static void Register(Interpreter i, Environment env)
+        public static void Register(Interpreter i, MDLEnv env)
         {
             void Def(string name, int min, int max, Func<Interpreter, List<Value>, Value> fn)
                 => env.DefineVar(name, Value.Function(new BuiltinFunction(name, min, max, fn)));
@@ -4069,6 +4070,234 @@ namespace MiniDynLang
                 var spec = a[0].AsString();
                 return interp.RequireModule(spec);
             });
+            // === FS ===
+            Def("read_file", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                return Value.String(File.ReadAllText(p, Encoding.UTF8));
+            });
+            Def("write_file", 2, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                var s = a[1].AsString();
+                File.WriteAllText(p, s, Encoding.UTF8);
+                return Value.Nil();
+            });
+            Def("exists", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                return Value.Boolean(File.Exists(p) || Directory.Exists(p));
+            });
+            Def("read_bytes", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                var bytes = File.ReadAllBytes(p);
+                var arr = new ArrayValue();
+                foreach (var b in bytes) arr.Items.Add(Value.Number(NumberValue.FromLong(b)));
+                return Value.Array(arr);
+            });
+            Def("write_bytes", 2, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                var arr = a[1].AsArray();
+                var bytes = new byte[arr.Length];
+                for (int k = 0; k < arr.Length; k++)
+                {
+                    var n = RuntimeOps.ToNumber(arr[k]).ToDoubleNV().Dbl;
+                    if (n < 0 || n > 255) throw new MiniDynRuntimeError("write_bytes expects values 0..255");
+                    bytes[k] = (byte)n;
+                }
+                File.WriteAllBytes(p, bytes);
+                return Value.Nil();
+            });
+
+            // === Paths / Env ===
+            Def("cwd", 0, 0, (interp, a) => Value.String(Directory.GetCurrentDirectory()));
+            Def("env_get", 1, 1, (interp, a) =>
+            {
+                var v = Environment.GetEnvironmentVariable(a[0].AsString());
+                return v == null ? Value.Nil() : Value.String(v);
+            });
+            Def("env_set", 2, 2, (interp, a) =>
+            {
+                Environment.SetEnvironmentVariable(a[0].AsString(), a[1].Type == ValueType.Nil ? null : a[1].AsString());
+                return Value.Nil();
+            });
+
+            // === Regex / String.match ===
+            RegexOptions ParseFlags(string f)
+            {
+                if (string.IsNullOrEmpty(f)) return RegexOptions.CultureInvariant;
+                var o = RegexOptions.CultureInvariant;
+                foreach (var ch in f)
+                {
+                    switch (ch)
+                    {
+                        case 'i': o |= RegexOptions.IgnoreCase; break;
+                        case 'm': o |= RegexOptions.Multiline; break;
+                        case 's': o |= RegexOptions.Singleline; break;
+                        default: throw new MiniDynRuntimeError($"Unknown regex flag '{ch}'");
+                    }
+                }
+                return o;
+            }
+            Def("regex_match", 2, 3, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                var pat = a[1].AsString();
+                var flags = a.Count == 3 ? a[2].AsString() : "";
+                var re = new Regex(pat, ParseFlags(flags));
+                return Value.Boolean(re.IsMatch(s));
+            });
+            Def("regex_replace", 3, 4, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                var pat = a[1].AsString();
+                var repl = a[2].AsString();
+                var flags = a.Count == 4 ? a[3].AsString() : "";
+                var re = new Regex(pat, ParseFlags(flags));
+                return Value.String(re.Replace(s, repl));
+            });
+            Def("match", 2, 3, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                var pat = a[1].AsString();
+                var flags = a.Count == 3 ? a[2].AsString() : "";
+                var re = new Regex(pat, ParseFlags(flags));
+                var m = re.Matches(s);
+                var arr = new ArrayValue();
+                foreach (Match mm in m) arr.Items.Add(Value.String(mm.Value));
+                return Value.Array(arr);
+            });
+
+            // === HTTP (host-provided client, disabled by default) ===
+            Def("http_get", 1, 1, (interp, a) =>
+            {
+                var url = a[0].AsString();
+                var text = interp.HttpGet(url);
+                return Value.String(text);
+            });
+            Def("http_post", 2, 3, (interp, a) =>
+            {
+                var url = a[0].AsString();
+                var body = a[1].AsString();
+                var contentType = a.Count == 3 ? a[2].AsString() : "application/json";
+                var text = interp.HttpPost(url, body, contentType);
+                return Value.String(text);
+            });
+
+            // === Array extras ===
+            Def("some", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                for (int i2 = 0; i2 < arr.Length; i2++)
+                    if (Value.IsTruthy(fn.Call(interp, new List<Value> { arr[i2] })))
+                        return Value.Boolean(true);
+                return Value.Boolean(false);
+            });
+            Def("every", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                for (int i2 = 0; i2 < arr.Length; i2++)
+                    if (!Value.IsTruthy(fn.Call(interp, new List<Value> { arr[i2] })))
+                        return Value.Boolean(false);
+                return Value.Boolean(true);
+            });
+            Def("find", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                for (int i2 = 0; i2 < arr.Length; i2++)
+                    if (Value.IsTruthy(fn.Call(interp, new List<Value> { arr[i2] })))
+                        return arr[i2];
+                return Value.Nil();
+            });
+            Def("find_index", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                for (int i2 = 0; i2 < arr.Length; i2++)
+                    if (Value.IsTruthy(fn.Call(interp, new List<Value> { arr[i2] })))
+                        return Value.Number(NumberValue.FromLong(i2));
+                return Value.Number(NumberValue.FromLong(-1));
+            });
+
+            // === Object deep_merge ===
+            Value DeepMergeValues(Value a0, Value b0)
+            {
+                if (a0.Type == ValueType.Object && b0.Type == ValueType.Object)
+                {
+                    var res = a0.AsObject().CloneShallow();
+                    foreach (var kv in b0.AsObject().Entries)
+                    {
+                        if (res.TryGet(kv.Key, out var av))
+                            res.Set(kv.Key, DeepMergeValues(av, kv.Value));
+                        else
+                            res.Set(kv.Key, kv.Value);
+                    }
+                    return Value.Object(res);
+                }
+                if (a0.Type == ValueType.Array && b0.Type == ValueType.Array)
+                {
+                    var res = new ArrayValue();
+                    foreach (var v in a0.AsArray().Items) res.Items.Add(v);
+                    foreach (var v in b0.AsArray().Items) res.Items.Add(v);
+                    return Value.Array(res);
+                }
+                // otherwise b overrides a
+                return b0;
+            }
+            Def("deep_merge", 2, 2, (interp, a) => DeepMergeValues(a[0], a[1]));
+
+            // === Math extras ===
+            Def("sin", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Sin(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("cos", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Cos(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("tan", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Tan(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("asin", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Asin(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("acos", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Acos(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("atan", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Atan(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("log", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Log(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("exp", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Exp(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("sign", 1, 1, (interp, a) =>
+            {
+                var d = RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
+                return Value.Number(NumberValue.FromLong(Math.Sign(d)));
+            });
+            Def("clamp", 3, 3, (interp, a) =>
+            {
+                var x = RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
+                var lo = RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                var hi = RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                if (lo > hi) { var tmp = lo; lo = hi; hi = tmp; }
+                var y = Math.Min(Math.Max(x, lo), hi);
+                return Value.Number(NumberValue.FromDouble(y));
+            });
+            Def("random_int", 2, 2, (interp, a) =>
+            {
+                var min = (int)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
+                var max = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                if (max < min) { var t = min; min = max; max = t; }
+                // inclusive
+                var r = new Random().Next(min, max + 1);
+                return Value.Number(NumberValue.FromLong(r));
+            });
+
+            // === Pretty printing ===
+            Def("pprint", 1, 1, (interp, a) =>
+            {
+                try
+                {
+                    var s = interp.JsonStringifyValue(a[0], pretty: true);
+                    Console.WriteLine(s);
+                }
+                catch
+                {
+                    Console.WriteLine(interp.ToStringValue(a[0]));
+                }
+                return Value.Nil();
+            });
         }
     }
     
@@ -4150,6 +4379,13 @@ namespace MiniDynLang
             source = null;
             return false;
         }
+    }
+
+    // Host-provided HTTP client
+    public interface INetworkClient
+    {
+        string Get(string url);
+        string Post(string url, string body, string contentType = "application/json");
     }
 
     // Simple bytecode for expression-bodied functions
@@ -4358,7 +4594,7 @@ namespace MiniDynLang
         private readonly Interpreter _interp;
         public BytecodeVM(Interpreter interp) { _interp = interp; }
 
-        public Value Run(Chunk chunk, Environment env, Value[] locals = null)
+        public Value Run(Chunk chunk, MDLEnv env, Value[] locals = null)
         {
             var stack = new List<Value>(16);
             int ip = 0;
@@ -5013,7 +5249,7 @@ namespace MiniDynLang
     {
         private readonly string _name;
         private readonly List<Expr.Param> _params;
-        private readonly Environment _closure;
+        private readonly MDLEnv _closure;
         private readonly Chunk _chunk;
         private readonly Interpreter _interp;
         private readonly UserFunction.Kind _kind;
@@ -5026,7 +5262,7 @@ namespace MiniDynLang
         public int ArityMin { get; }
         public int ArityMax { get; }
 
-        public BytecodeFunction(string name, List<Expr.Param> ps, Environment closure, Chunk chunk, Interpreter interp,
+        public BytecodeFunction(string name, List<Expr.Param> ps, MDLEnv closure, Chunk chunk, Interpreter interp,
                                 UserFunction.Kind kind, Value? capturedThis, Value? boundThis = null,
                                 int localCount = 0)
         {
@@ -5065,7 +5301,7 @@ namespace MiniDynLang
         public Value Call(Interpreter interp, List<Value> args)
         {
             // same env handling as user fn but simpler; no defaults/rest in this first step
-            var env = new Environment(_closure);
+            var env = new MDLEnv(_closure);
 
             if (_kind == UserFunction.Kind.Arrow)
             {
@@ -6599,9 +6835,9 @@ namespace MiniDynLang
             public List<Value> Rest; // extra positional args for rest param (if any)
         }
 
-        public readonly Environment Globals;
-        private Environment _env;
-        public Environment CurrentEnv => _env;
+        public readonly MDLEnv Globals;
+        private MDLEnv _env;
+        public MDLEnv CurrentEnv => _env;
 
         // Track whether we're inside a loop to validate break/continue usage
         private int _loopDepth = 0;
@@ -6628,6 +6864,8 @@ namespace MiniDynLang
         internal void PopFunction() { if (_fnExecStack.Count > 0) _fnExecStack.Pop(); }
         internal UserFunction CurrentFunction => _fnExecStack.Count > 0 ? _fnExecStack.Peek() : null;
 
+        private readonly INetworkClient _netClient;
+        
         public Interpreter(IModuleLoader moduleLoader = null)
         {
             _moduleLoader = moduleLoader ?? new FileSystemModuleLoader();
@@ -6638,6 +6876,25 @@ namespace MiniDynLang
 
             // Register all built-ins in a single place
             Builtins.Register(this, Globals);
+        }
+
+        // constructor overload to enable HTTP
+        public Interpreter(IModuleLoader moduleLoader, INetworkClient netClient)
+            : this(moduleLoader)
+        {
+            _netClient = netClient;
+        }
+
+        // HTTP helpers (throw when disabled)
+        internal string HttpGet(string url)
+        {
+            if (_netClient == null) throw new MiniDynRuntimeError("HTTP is disabled");
+            return _netClient.Get(url);
+        }
+        internal string HttpPost(string url, string body, string contentType = "application/json")
+        {
+            if (_netClient == null) throw new MiniDynRuntimeError("HTTP is disabled");
+            return _netClient.Post(url, body, contentType);
         }
 
         private string GetCallerDirectory()
@@ -6751,7 +7008,7 @@ namespace MiniDynLang
             }
         }
 
-        public void InterpretInEnv(List<Stmt> statements, Environment env)
+        public void InterpretInEnv(List<Stmt> statements, MDLEnv env)
         {
             var prev = _env;
             try
@@ -6811,7 +7068,7 @@ namespace MiniDynLang
             var frames = _callStack.Reverse().ToList();
             ex.WithContext(span, frames);
         }
-        public Value EvaluateWithEnv(Expr e, Environment env)
+        public Value EvaluateWithEnv(Expr e, MDLEnv env)
         {
             var prev = _env;
             try { _env = env; return Evaluate(e); }
@@ -6888,11 +7145,11 @@ namespace MiniDynLang
 
         public object VisitBlock(Stmt.Block s)
         {
-            ExecuteBlock(s.Statements, new Environment(_env));
+            ExecuteBlock(s.Statements, new MDLEnv(_env));
             return null;
         }
 
-        public void ExecuteBlock(List<Stmt> stmts, Environment env)
+        public void ExecuteBlock(List<Stmt> stmts, MDLEnv env)
         {
             var prev = _env;
             try
@@ -6950,7 +7207,7 @@ namespace MiniDynLang
                     (s.Initializer is Stmt.DestructuringDecl dd &&
                     (dd.DeclKind == Stmt.DestructuringDecl.Kind.Let || dd.DeclKind == Stmt.DestructuringDecl.Kind.Const));
 
-                var loopEnv = hasBlockScopedInit ? new Environment(_env) : _env;
+                var loopEnv = hasBlockScopedInit ? new MDLEnv(_env) : _env;
 
                 if (s.Initializer != null)
                 {
@@ -7089,7 +7346,7 @@ namespace MiniDynLang
                 else
                 {
                     // let/const: fresh block environment per iteration
-                    var loopEnv = new Environment(_env);
+                    var loopEnv = new MDLEnv(_env);
                     void declare(string name, Value v)
                     {
                         if (s.DeclKind == Stmt.DestructuringDecl.Kind.Let) loopEnv.DefineLet(name, v);
@@ -7361,7 +7618,7 @@ namespace MiniDynLang
                 if (s.Catch != null)
                 {
                     caught = ts.Value;
-                    var catchEnv = new Environment(_env);
+                    var catchEnv = new MDLEnv(_env);
                     if (!string.IsNullOrEmpty(s.CatchName))
                         catchEnv.DefineLet(s.CatchName, caught);
                     ExecuteBlock(s.Catch.Statements, catchEnv);
@@ -7378,7 +7635,7 @@ namespace MiniDynLang
                 {
                     var errVal = MakeError("RuntimeError", ex.Message, ex);
                     caught = errVal;
-                    var catchEnv = new Environment(_env);
+                    var catchEnv = new MDLEnv(_env);
                     if (!string.IsNullOrEmpty(s.CatchName))
                         catchEnv.DefineLet(s.CatchName, errVal);
                     ExecuteBlock(s.Catch.Statements, catchEnv);
@@ -8162,6 +8419,27 @@ namespace MiniDynLang
         }
     }
 
+    public sealed class HttpWebClient : INetworkClient
+    {
+        public string Get(string url)
+        {
+            using (var wc = new System.Net.WebClient())
+            {
+                wc.Encoding = Encoding.UTF8;
+                return wc.DownloadString(url);
+            }
+        }
+        public string Post(string url, string body, string contentType = "application/json")
+        {
+            using (var wc = new System.Net.WebClient())
+            {
+                wc.Encoding = Encoding.UTF8;
+                wc.Headers[System.Net.HttpRequestHeader.ContentType] = contentType ?? "application/json";
+                return wc.UploadString(url, "POST", body ?? "");
+            }
+        }
+    }
+
     class Program
     {
         static void RunFile(string filePath)
@@ -8176,7 +8454,8 @@ namespace MiniDynLang
             var parser = new Parser(lexer);
             var program = parser.Parse();
             var loader = new FileSystemModuleLoader();
-            var interp = new Interpreter(loader);
+            var net = new HttpWebClient();
+            var interp = new Interpreter(loader, net);
             interp.Interpret(program);
         }
 
@@ -8184,7 +8463,8 @@ namespace MiniDynLang
         {
             Console.WriteLine("MiniDynLang REPL. Ctrl+C to exit.");
             var loader = new FileSystemModuleLoader();
-            var interp = new Interpreter(loader);
+            var net = new HttpWebClient();
+            var interp = new Interpreter(loader, net);
             while (true)
             {
                 Console.Write("> ");
