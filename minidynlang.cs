@@ -4217,6 +4217,50 @@ namespace MiniDynLang
         ContinuePending  // A = target ip to jump to after unwinding finally blocks
     }
 
+    // Centralized TokenType -> OpCode maps for compiler emission
+    internal static class OperatorMaps
+    {
+        private static readonly Dictionary<TokenType, OpCode> CompoundAssignToOp =
+            new Dictionary<TokenType, OpCode>
+            {
+                { TokenType.PlusAssign,   OpCode.Add },
+                { TokenType.MinusAssign,  OpCode.Sub },
+                { TokenType.StarAssign,   OpCode.Mul },
+                { TokenType.SlashAssign,  OpCode.Div },
+                { TokenType.PercentAssign,OpCode.Mod },
+            };
+
+        private static readonly Dictionary<TokenType, OpCode> ArithmeticToOp =
+            new Dictionary<TokenType, OpCode>
+            {
+                { TokenType.Plus,     OpCode.Add },
+                { TokenType.Minus,    OpCode.Sub },
+                { TokenType.Star,     OpCode.Mul },
+                { TokenType.Slash,    OpCode.Div },
+                { TokenType.Percent,  OpCode.Mod },
+            };
+
+        private static readonly Dictionary<TokenType, OpCode> CompareToOp =
+            new Dictionary<TokenType, OpCode>
+            {
+                { TokenType.Equal,      OpCode.CmpEq },
+                { TokenType.NotEqual,   OpCode.CmpNe },
+                { TokenType.Less,       OpCode.CmpLt },
+                { TokenType.LessEq,     OpCode.CmpLe },
+                { TokenType.Greater,    OpCode.CmpGt },
+                { TokenType.GreaterEq,  OpCode.CmpGe },
+            };
+
+        public static bool TryGetCompoundAssignBinary(TokenType t, out OpCode op)
+            => CompoundAssignToOp.TryGetValue(t, out op);
+
+        public static bool TryGetArithmetic(TokenType t, out OpCode op)
+            => ArithmeticToOp.TryGetValue(t, out op);
+
+        public static bool TryGetCompare(TokenType t, out OpCode op)
+            => CompareToOp.TryGetValue(t, out op);
+    }
+
     internal sealed class Instruction
     {
         public OpCode Op;
@@ -5881,169 +5925,141 @@ namespace MiniDynLang
                     return true;
 
                 case Expr.Assign asg:
-                   {
-                       // Helper to map token -> opcode for compound
-                       OpCode BinOp(TokenType t)
-                       {
-                           switch (t)
-                           {
-                               case TokenType.PlusAssign: return OpCode.Add;
-                               case TokenType.MinusAssign: return OpCode.Sub;
-                               case TokenType.StarAssign: return OpCode.Mul;
-                               case TokenType.SlashAssign: return OpCode.Div;
-                               case TokenType.PercentAssign: return OpCode.Mod;
-                               default: return (OpCode)(-1);
-                           }
-                       }
+                {
+                    // variable target
+                    if (asg.Target is Expr.Variable v)
+                    {
+                        int slot;
+                        bool isCompiledVar = TryResolveVarSlot(v.Name, out slot);
 
-                       // variable target
-                       if (asg.Target is Expr.Variable v)
-                       {
-                           int slot;
-                           bool isCompiledVar = TryResolveVarSlot(v.Name, out slot);
-                           if (asg.Op.Type == TokenType.Assign)
-                           {
-                               if (!TryEmitExpr(asg.Value, c)) return false;
-                               if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
-                               else c.Emit(OpCode.StoreName, 0, v.Name);
-                               return true;
-                           }
+                        if (asg.Op.Type == TokenType.Assign)
+                        {
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                            else c.Emit(OpCode.StoreName, 0, v.Name);
+                            return true;
+                        }
 
-                           if (asg.Op.Type == TokenType.NullishAssign)
-                           {
-                               // cur ??= rhs
-                               if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
-                               else c.Emit(OpCode.LoadName, 0, v.Name);
-                               c.Emit(OpCode.Dup);
-                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0); // if not nil -> leave cur
-                               c.Emit(OpCode.Pop); // drop nil
-                               if (!TryEmitExpr(asg.Value, c)) return false;
-                               if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
-                               else c.Emit(OpCode.StoreName, 0, v.Name);
-                               int jEnd = c.Emit(OpCode.Jump, 0);
-                               c.PatchJump(jHave, c.Code.Count);
-                               // stack already has cur (non-nil)
-                               c.PatchJump(jEnd, c.Code.Count);
-                               return true;
-                           }
+                        if (asg.Op.Type == TokenType.NullishAssign)
+                        {
+                            if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
+                            else c.Emit(OpCode.LoadName, 0, v.Name);
+                            c.Emit(OpCode.Dup);
+                            int jHave = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                            else c.Emit(OpCode.StoreName, 0, v.Name);
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+                            c.PatchJump(jHave, c.Code.Count);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
 
-                           // Compound op
-                           if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
-                           else c.Emit(OpCode.LoadName, 0, v.Name);
-                           if (!TryEmitExpr(asg.Value, c)) return false;
-                           var bop = BinOp(asg.Op.Type);
-                           if ((int)bop == -1) return false;
-                           c.Emit(bop);
-                           if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
-                           else c.Emit(OpCode.StoreName, 0, v.Name);
-                           return true;
-                       }
+                        if (!OperatorMaps.TryGetCompoundAssignBinary(asg.Op.Type, out var bop)) return false;
+                        if (isCompiledVar) c.Emit(OpCode.LoadLocal, slot);
+                        else c.Emit(OpCode.LoadName, 0, v.Name);
+                        if (!TryEmitExpr(asg.Value, c)) return false;
+                        c.Emit(bop);
+                        if (isCompiledVar) c.Emit(OpCode.StoreLocal, slot);
+                        else c.Emit(OpCode.StoreName, 0, v.Name);
+                        return true;
+                    }
 
-                       // property target
-                       if (asg.Target is Expr.Property p && !p.IsOptional)
-                       {
-                           if (asg.Op.Type == TokenType.Assign)
-                           {
-                               if (!TryEmitExpr(p.Target, c)) return false;    // T
-                               if (!TryEmitExpr(asg.Value, c)) return false;   // T, rhs
-                               c.Emit(OpCode.StoreProp, 0, p.Name);            // -> rhs
-                               return true;
-                           }
+                    // property target
+                    if (asg.Target is Expr.Property p && !p.IsOptional)
+                    {
+                        if (asg.Op.Type == TokenType.Assign)
+                        {
+                            if (!TryEmitExpr(p.Target, c)) return false;
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            c.Emit(OpCode.StoreProp, 0, p.Name);
+                            return true;
+                        }
 
-                           if (asg.Op.Type == TokenType.NullishAssign)
-                           {
-                               // T; dup; getprop -> T cur; dup; if not nil => pop T and keep cur
-                               if (!TryEmitExpr(p.Target, c)) return false;    // T
-                               c.Emit(OpCode.Dup);                              // T T
-                               c.Emit(OpCode.GetProp, 0, p.Name);              // T cur
-                               c.Emit(OpCode.Dup);                              // T cur cur
-                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0);     // if non-nil -> T cur
-                               c.Emit(OpCode.Pop);                              // drop nil -> T
-                               if (!TryEmitExpr(asg.Value, c)) return false;   // T rhs
-                               c.Emit(OpCode.StoreProp, 0, p.Name);            // rhs
-                               int jEnd = c.Emit(OpCode.Jump, 0);
-                               c.PatchJump(jHave, c.Code.Count);               // T cur
-                               c.Emit(OpCode.Pop);                              // cur
-                               c.PatchJump(jEnd, c.Code.Count);
-                               return true;
-                           }
+                        if (asg.Op.Type == TokenType.NullishAssign)
+                        {
+                            if (!TryEmitExpr(p.Target, c)) return false;
+                            c.Emit(OpCode.Dup);
+                            c.Emit(OpCode.GetProp, 0, p.Name);
+                            c.Emit(OpCode.Dup);
+                            int jHave = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            c.Emit(OpCode.StoreProp, 0, p.Name);
+                            int jEnd = c.Emit(OpCode.Jump, 0);
+                            c.PatchJump(jHave, c.Code.Count);
+                            c.Emit(OpCode.Pop);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
 
-                           // Compound op
-                           if (!TryEmitExpr(p.Target, c)) return false;    // T
-                           c.Emit(OpCode.Dup);                              // T, T
-                           c.Emit(OpCode.GetProp, 0, p.Name);              // T, cur
-                           if (!TryEmitExpr(asg.Value, c)) return false;   // T, cur, rhs
-                           var bop2 = BinOp(asg.Op.Type);
-                           if ((int)bop2 == -1) return false;
-                           c.Emit(bop2);                                    // T, new
-                           c.Emit(OpCode.StoreProp, 0, p.Name);            // new
-                           return true;
-                       }
+                        if (!OperatorMaps.TryGetCompoundAssignBinary(asg.Op.Type, out var bop2)) return false;
+                        if (!TryEmitExpr(p.Target, c)) return false;
+                        c.Emit(OpCode.Dup);
+                        c.Emit(OpCode.GetProp, 0, p.Name);
+                        if (!TryEmitExpr(asg.Value, c)) return false;
+                        c.Emit(bop2);
+                        c.Emit(OpCode.StoreProp, 0, p.Name);
+                        return true;
+                    }
 
-                       // index target
-                       if (asg.Target is Expr.Index ix && !ix.IsOptional)
-                       {
-                           if (asg.Op.Type == TokenType.Assign)
-                           {
-                               if (!TryEmitExpr(ix.Target, c)) return false;       // T
-                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
-                               if (!TryEmitExpr(asg.Value, c)) return false;       // T, I, rhs
-                               c.Emit(OpCode.StoreIndex);                          // rhs
-                               return true;
-                           }
+                    // index target
+                    if (asg.Target is Expr.Index ix && !ix.IsOptional)
+                    {
+                        if (asg.Op.Type == TokenType.Assign)
+                        {
+                            if (!TryEmitExpr(ix.Target, c)) return false;
+                            if (!TryEmitExpr(ix.IndexExpr, c)) return false;
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            c.Emit(OpCode.StoreIndex);
+                            return true;
+                        }
 
-                           if (asg.Op.Type == TokenType.NullishAssign)
-                           {
-                               // Preserve T and I in temp locals, compute cur once, short-circuit if non-nil
-                               int tSlot = NewTempSlot();
-                               int iSlot = NewTempSlot();
+                        if (asg.Op.Type == TokenType.NullishAssign)
+                        {
+                            int tSlot = NewTempSlot();
+                            int iSlot = NewTempSlot();
 
-                               if (!TryEmitExpr(ix.Target, c)) return false;       // T
-                               c.Emit(OpCode.StoreLocal, ParamCount + tSlot);      // T
-                               c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(ix.Target, c)) return false;
+                            c.Emit(OpCode.StoreLocal, ParamCount + tSlot);
+                            c.Emit(OpCode.Pop);
 
-                               if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // I
-                               c.Emit(OpCode.StoreLocal, ParamCount + iSlot);      // I
-                               c.Emit(OpCode.Pop);
+                            if (!TryEmitExpr(ix.IndexExpr, c)) return false;
+                            c.Emit(OpCode.StoreLocal, ParamCount + iSlot);
+                            c.Emit(OpCode.Pop);
 
-                               // cur = t[i]
-                               c.Emit(OpCode.LoadLocal, ParamCount + tSlot);       // T
-                               c.Emit(OpCode.LoadLocal, ParamCount + iSlot);       // T, I
-                               c.Emit(OpCode.GetIndex);                            // cur
-                               c.Emit(OpCode.Dup);
-                               int jHave = c.Emit(OpCode.JumpIfNotNil, 0);        // if non-nil -> cur
-                               c.Emit(OpCode.Pop);                                 // drop nil
+                            c.Emit(OpCode.LoadLocal, ParamCount + tSlot);
+                            c.Emit(OpCode.LoadLocal, ParamCount + iSlot);
+                            c.Emit(OpCode.GetIndex);
+                            c.Emit(OpCode.Dup);
+                            int jHave = c.Emit(OpCode.JumpIfNotNil, 0);
+                            c.Emit(OpCode.Pop);
 
-                               // nil path: T, I, rhs -> StoreIndex
-                               c.Emit(OpCode.LoadLocal, ParamCount + tSlot);       // T
-                               c.Emit(OpCode.LoadLocal, ParamCount + iSlot);       // T, I
-                               if (!TryEmitExpr(asg.Value, c)) return false;       // T, I, rhs
-                               c.Emit(OpCode.StoreIndex);                          // rhs
-                               int jEnd = c.Emit(OpCode.Jump, 0);
+                            c.Emit(OpCode.LoadLocal, ParamCount + tSlot);
+                            c.Emit(OpCode.LoadLocal, ParamCount + iSlot);
+                            if (!TryEmitExpr(asg.Value, c)) return false;
+                            c.Emit(OpCode.StoreIndex);
+                            int jEnd = c.Emit(OpCode.Jump, 0);
 
-                               // non-nil path: leave cur
-                               c.PatchJump(jHave, c.Code.Count);                   // cur
+                            c.PatchJump(jHave, c.Code.Count);
+                            c.PatchJump(jEnd, c.Code.Count);
+                            return true;
+                        }
 
-                               c.PatchJump(jEnd, c.Code.Count);
-                               return true;
-                           }
+                        if (!OperatorMaps.TryGetCompoundAssignBinary(asg.Op.Type, out var bop3)) return false;
+                        if (!TryEmitExpr(ix.Target, c)) return false;
+                        if (!TryEmitExpr(ix.IndexExpr, c)) return false;
+                        c.Emit(OpCode.Dup2);
+                        c.Emit(OpCode.GetIndex);
+                        if (!TryEmitExpr(asg.Value, c)) return false;
+                        c.Emit(bop3);
+                        c.Emit(OpCode.StoreIndex);
+                        return true;
+                    }
 
-                           // Compound op
-                           if (!TryEmitExpr(ix.Target, c)) return false;       // T
-                           if (!TryEmitExpr(ix.IndexExpr, c)) return false;    // T, I
-                           c.Emit(OpCode.Dup2);                                 // T, I, T, I
-                           c.Emit(OpCode.GetIndex);                             // T, I, cur
-                           if (!TryEmitExpr(asg.Value, c)) return false;        // T, I, cur, rhs
-                           var bop3 = BinOp(asg.Op.Type);
-                           if ((int)bop3 == -1) return false;
-                           c.Emit(bop3);                                        // T, I, new
-                           c.Emit(OpCode.StoreIndex);                           // new
-                           return true;
-                       }
-
-                       // optional-chained or unsupported assignment target -> fallback
-                       return false;
-                   }
+                    return false;
+                }
 
                 case Expr.Variable v:
                     {
@@ -6073,37 +6089,34 @@ namespace MiniDynLang
                     return true;
 
                 case Expr.Binary b:
+                {
+                    if (b.Op.Type == TokenType.NullishCoalesce)
                     {
                         if (!TryEmitExpr(b.Left, c)) return false;
+                        c.Emit(OpCode.Dup);
+                        int j = c.Emit(OpCode.JumpIfNotNil, 0);
+                        c.Emit(OpCode.Pop);
                         if (!TryEmitExpr(b.Right, c)) return false;
-                        switch (b.Op.Type)
-                        {
-                            case TokenType.Plus: c.Emit(OpCode.Add); return true;
-                            case TokenType.Minus: c.Emit(OpCode.Sub); return true;
-                            case TokenType.Star: c.Emit(OpCode.Mul); return true;
-                            case TokenType.Slash: c.Emit(OpCode.Div); return true;
-                            case TokenType.Percent: c.Emit(OpCode.Mod); return true;
-
-                            case TokenType.Equal: c.Emit(OpCode.CmpEq); return true;
-                            case TokenType.NotEqual: c.Emit(OpCode.CmpNe); return true;
-                            case TokenType.Less: c.Emit(OpCode.CmpLt); return true;
-                            case TokenType.LessEq: c.Emit(OpCode.CmpLe); return true;
-                            case TokenType.Greater: c.Emit(OpCode.CmpGt); return true;
-                            case TokenType.GreaterEq: c.Emit(OpCode.CmpGe); return true;
-
-                            case TokenType.NullishCoalesce:
-                                {
-                                    c.Emit(OpCode.Dup);
-                                    int j = c.Emit(OpCode.JumpIfNotNil, 0);
-                                    c.Emit(OpCode.Pop);
-                                    if (!TryEmitExpr(b.Right, c)) return false;
-                                    c.PatchJump(j, c.Code.Count);
-                                    return true;
-                                }
-                            default:
-                                return false;
-                        }
+                        c.PatchJump(j, c.Code.Count);
+                        return true;
                     }
+
+                    if (!TryEmitExpr(b.Left, c)) return false;
+                    if (!TryEmitExpr(b.Right, c)) return false;
+
+                    if (OperatorMaps.TryGetArithmetic(b.Op.Type, out var arOp))
+                    {
+                        c.Emit(arOp);
+                        return true;
+                    }
+                    if (OperatorMaps.TryGetCompare(b.Op.Type, out var cmpOp))
+                    {
+                        c.Emit(cmpOp);
+                        return true;
+                    }
+
+                    return false;
+                }
 
                 case Expr.Logical l:
                     {
@@ -6425,91 +6438,89 @@ namespace MiniDynLang
                     }
                     return false;
 
-                case Expr.Binary b:
-                    if (TryFold(b.Left, out var lv) && TryFold(b.Right, out var rv2))
+        case Expr.Binary b:
+            if (TryFold(b.Left, out var lv) && TryFold(b.Right, out var rv2))
+            {
+                // Arithmetic (+, -, *, /, %)
+                if (OperatorMaps.TryGetArithmetic(b.Op.Type, out var arOp))
+                {
+                    // String concatenation for '+' (keep other cases numeric-only)
+                    if (arOp == OpCode.Add &&
+                        lv.Type == ValueType.String && rv2.Type == ValueType.String)
                     {
-                        switch (b.Op.Type)
+                        v = Value.String(lv.AsString() + rv2.AsString());
+                        return true;
+                    }
+
+                    if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                    {
+                        var a = lv.AsNumber();
+                        var bnum = rv2.AsNumber();
+                        try
                         {
-                            case TokenType.Plus:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                { v = Value.Number(NumberValue.Add(lv.AsNumber(), rv2.AsNumber())); return true; }
-                                if (lv.Type == ValueType.String && rv2.Type == ValueType.String)
-                                { v = Value.String(lv.AsString() + rv2.AsString()); return true; }
-                                return false;
-                            case TokenType.Minus:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                { v = Value.Number(NumberValue.Sub(lv.AsNumber(), rv2.AsNumber())); return true; }
-                                return false;
-                            case TokenType.Star:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                { v = Value.Number(NumberValue.Mul(lv.AsNumber(), rv2.AsNumber())); return true; }
-                                return false;
-                            case TokenType.Slash:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                {
-                                    // Avoid compile-time exceptions (e.g., division by zero) so runtime try/catch can handle them.
-                                    var div = rv2.AsNumber();
-                                    if (NumberValue.Compare(div, NumberValue.FromLong(0)) == 0) return false;
-                                    try
-                                    {
-                                        v = Value.Number(NumberValue.Div(lv.AsNumber(), div));
-                                        return true;
-                                    }
-                                    catch (MiniDynRuntimeError)
-                                    {
-                                        // Defer to runtime
-                                        return false;
-                                    }
-                                }
-                                return false;
-                            case TokenType.Percent:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                {
-                                    // Avoid compile-time exceptions (e.g., modulo by zero).
-                                    var mod = rv2.AsNumber();
-                                    if (NumberValue.Compare(mod, NumberValue.FromLong(0)) == 0) return false;
-                                    try
-                                    {
-                                        v = Value.Number(NumberValue.Mod(lv.AsNumber(), mod));
-                                        return true;
-                                    }
-                                    catch (MiniDynRuntimeError)
-                                    {
-                                        // Defer to runtime
-                                        return false;
-                                    }
-                                }
-                                return false;
-                            case TokenType.Equal:
-                                v = Value.Boolean(lv.Equals(rv2)); return true;
-                            case TokenType.NotEqual:
-                                v = Value.Boolean(!lv.Equals(rv2)); return true;
-                            case TokenType.Less:
-                            case TokenType.LessEq:
-                            case TokenType.Greater:
-                            case TokenType.GreaterEq:
-                                if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
-                                {
-                                    int cmp = NumberValue.Compare(lv.AsNumber(), rv2.AsNumber());
-                                    bool res = b.Op.Type == TokenType.Less ? (cmp < 0)
-                                        : b.Op.Type == TokenType.LessEq ? (cmp <= 0)
-                                        : b.Op.Type == TokenType.Greater ? (cmp > 0) : (cmp >= 0);
-                                    v = Value.Boolean(res); return true;
-                                }
-                                if (lv.Type == ValueType.String && rv2.Type == ValueType.String)
-                                {
-                                    int cmp = string.CompareOrdinal(lv.AsString(), rv2.AsString());
-                                    bool res = b.Op.Type == TokenType.Less ? (cmp < 0)
-                                        : b.Op.Type == TokenType.LessEq ? (cmp <= 0)
-                                        : b.Op.Type == TokenType.Greater ? (cmp > 0) : (cmp >= 0);
-                                    v = Value.Boolean(res); return true;
-                                }
-                                return false;
-                            case TokenType.NullishCoalesce:
-                                v = (lv.Type != ValueType.Nil) ? lv : rv2; return true;
+                            switch (arOp)
+                            {
+                                case OpCode.Add:
+                                    v = Value.Number(NumberValue.Add(a, bnum)); return true;
+                                case OpCode.Sub:
+                                    v = Value.Number(NumberValue.Sub(a, bnum)); return true;
+                                case OpCode.Mul:
+                                    v = Value.Number(NumberValue.Mul(a, bnum)); return true;
+                                case OpCode.Div:
+                                    if (NumberValue.Compare(bnum, NumberValue.FromLong(0)) == 0) return false;
+                                    v = Value.Number(NumberValue.Div(a, bnum)); return true;
+                                case OpCode.Mod:
+                                    if (NumberValue.Compare(bnum, NumberValue.FromLong(0)) == 0) return false;
+                                    v = Value.Number(NumberValue.Mod(a, bnum)); return true;
+                            }
+                        }
+                        catch (MiniDynRuntimeError)
+                        {
+                            // Defer exceptions (e.g., div by zero) to runtime so try/catch works.
+                            return false;
                         }
                     }
                     return false;
+                }
+
+                // Comparisons (==, !=, <, <=, >, >=)
+                if (OperatorMaps.TryGetCompare(b.Op.Type, out var cmpOp))
+                {
+                    if (cmpOp == OpCode.CmpEq) { v = Value.Boolean(lv.Equals(rv2)); return true; }
+                    if (cmpOp == OpCode.CmpNe) { v = Value.Boolean(!lv.Equals(rv2)); return true; }
+
+                    // Relational: only fold number/number or string/string to match runtime rules
+                    if (lv.Type == ValueType.Number && rv2.Type == ValueType.Number)
+                    {
+                        int cmp = NumberValue.Compare(lv.AsNumber(), rv2.AsNumber());
+                        bool res = cmpOp == OpCode.CmpLt ? (cmp < 0)
+                                  : cmpOp == OpCode.CmpLe ? (cmp <= 0)
+                                  : cmpOp == OpCode.CmpGt ? (cmp > 0)
+                                  : /* CmpGe */             (cmp >= 0);
+                        v = Value.Boolean(res);
+                        return true;
+                    }
+                    if (lv.Type == ValueType.String && rv2.Type == ValueType.String)
+                    {
+                        int cmp = string.CompareOrdinal(lv.AsString(), rv2.AsString());
+                        bool res = cmpOp == OpCode.CmpLt ? (cmp < 0)
+                                  : cmpOp == OpCode.CmpLe ? (cmp <= 0)
+                                  : cmpOp == OpCode.CmpGt ? (cmp > 0)
+                                  : /* CmpGe */             (cmp >= 0);
+                        v = Value.Boolean(res);
+                        return true;
+                    }
+                    return false;
+                }
+
+                // Nullish coalescing
+                if (b.Op.Type == TokenType.NullishCoalesce)
+                {
+                    v = (lv.Type != ValueType.Nil) ? lv : rv2;
+                    return true;
+                }
+            }
+            return false;
 
                 case Expr.Logical l:
                     if (TryFold(l.Left, out var lv2))
