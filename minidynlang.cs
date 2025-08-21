@@ -3580,6 +3580,497 @@ namespace MiniDynLang
             return list;
         }
     }
+
+    // central registry for built-ins
+    internal static class Builtins
+    {
+        public static void Register(Interpreter i, Environment env)
+        {
+            void Def(string name, int min, int max, Func<Interpreter, List<Value>, Value> fn)
+                => env.DefineVar(name, Value.Function(new BuiltinFunction(name, min, max, fn)));
+
+            // Core
+            Def("length", 1, 1, (interp, a) =>
+            {
+                var v = a[0];
+                switch (v.Type)
+                {
+                    case ValueType.String: return Value.Number(NumberValue.FromLong(v.AsString().Length));
+                    case ValueType.Array: return Value.Number(NumberValue.FromLong(v.AsArray().Length));
+                    case ValueType.Object: return Value.Number(NumberValue.FromLong(v.AsObject().Count));
+                    case ValueType.Nil: return Value.Number(NumberValue.FromLong(0));
+                    case ValueType.Boolean:
+                    case ValueType.Number:
+                    case ValueType.Function: return Value.Number(NumberValue.FromLong(1));
+                    default: return Value.Number(NumberValue.FromLong(0));
+                }
+            });
+
+            Def("print", 1, int.MaxValue, (interp, a) =>
+            {
+                var sb = new StringBuilder();
+                for (int idx = 0; idx < a.Count; idx++)
+                {
+                    sb.Append(interp.ToStringValue(a[idx]));
+                    if (idx + 1 < a.Count) sb.Append(' ');
+                }
+                Console.Write(sb.ToString());
+                return Value.Nil();
+            });
+
+            Def("println", 0, int.MaxValue, (interp, a) =>
+            {
+                if (a.Count == 0) { Console.WriteLine(); return Value.Nil(); }
+                var sb = new StringBuilder();
+                for (int idx = 0; idx < a.Count; idx++)
+                {
+                    sb.Append(interp.ToStringValue(a[idx]));
+                    if (idx + 1 < a.Count) sb.Append(' ');
+                }
+                Console.WriteLine(sb.ToString());
+                return Value.Nil();
+            });
+
+            Def("gets", 0, 0, (interp, a) => Value.String(Console.ReadLine()));
+
+            Def("to_number", 1, 1, (interp, a) =>
+            {
+                var v = a[0];
+                switch (v.Type)
+                {
+                    case ValueType.Number: return v;
+                    case ValueType.String:
+                        return NumberValue.TryFromString(v.AsString(), out var nv) ? Value.Number(nv) : Value.Nil();
+                    case ValueType.Boolean: return Value.Number(NumberValue.FromBool(v.AsBoolean()));
+                    case ValueType.Nil: return Value.Number(NumberValue.FromLong(0));
+                    default: return Value.Nil();
+                }
+            });
+
+            Def("to_string", 1, 1, (interp, a) => Value.String(interp.ToStringValue(a[0])));
+
+            Def("type", 1, 1, (interp, a) => Value.String(a[0].Type.ToString().ToLowerInvariant()));
+
+            // Object helpers
+            Def("keys", 1, 1, (interp, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var k in o.Keys) arr.Items.Add(Value.String(k));
+                return Value.Array(arr);
+            });
+
+            Def("has_key", 2, 2, (interp, a) =>
+            {
+                var o = a[0].AsObject();
+                var k = a[1].AsString();
+                return Value.Boolean(o.Contains(k));
+            });
+
+            Def("remove_key", 2, 2, (interp, a) =>
+            {
+                var o = a[0].AsObject();
+                var k = a[1].AsString();
+                return Value.Boolean(o.Remove(k));
+            });
+
+            Def("merge", 2, 2, (interp, a) =>
+            {
+                var o1 = a[0].AsObject();
+                var o2 = a[1].AsObject();
+                var res = o1.CloneShallow();
+                foreach (var kv in o2.Entries) res.Set(kv.Key, kv.Value);
+                return Value.Object(res);
+            });
+
+            // Math
+            Def("abs", 1, 1, (interp, a) =>
+            {
+                var n = RuntimeOps.ToNumber(a[0]);
+                switch (n.Kind)
+                {
+                    case NumberValue.NumKind.Int: return Value.Number(NumberValue.FromLong(Math.Abs(n.I64)));
+                    case NumberValue.NumKind.BigInt: return Value.Number(NumberValue.FromBigInt(BigInteger.Abs(n.BigInt)));
+                    case NumberValue.NumKind.Double: return Value.Number(NumberValue.FromDouble(Math.Abs(n.Dbl)));
+                    default: return Value.Number(NumberValue.FromLong(0));
+                }
+            });
+            Def("floor", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Floor(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("ceil", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Ceiling(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("round", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Round(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("sqrt", 1, 1, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Sqrt(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
+            Def("pow", 2, 2, (interp, a) => Value.Number(NumberValue.FromDouble(Math.Pow(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl, RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl))));
+            Def("min", 1, int.MaxValue, (interp, a) =>
+            {
+                if (a.Count == 0) return Value.Nil();
+                var cur = RuntimeOps.ToNumber(a[0]);
+                for (int k = 1; k < a.Count; k++)
+                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) < 0) cur = RuntimeOps.ToNumber(a[k]);
+                return Value.Number(cur);
+            });
+            Def("max", 1, int.MaxValue, (interp, a) =>
+            {
+                if (a.Count == 0) return Value.Nil();
+                var cur = RuntimeOps.ToNumber(a[0]);
+                for (int k = 1; k < a.Count; k++)
+                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) > 0) cur = RuntimeOps.ToNumber(a[k]);
+                return Value.Number(cur);
+            });
+
+            var rng = new Random();
+            Def("random", 0, 0, (interp, a) => Value.Number(NumberValue.FromDouble(rng.NextDouble())));
+            Def("srand", 1, 1, (interp, a) => { rng = new Random((int)(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl)); return Value.Nil(); });
+
+            // String utilities
+            Def("substring", 2, 3, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                var start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                if (start < 0) start = 0;
+                if (start > s.Length) start = s.Length;
+                if (a.Count == 2) return Value.String(s.Substring(start));
+                var len = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                if (len < 0) len = 0;
+                if (start + len > s.Length) len = s.Length - start;
+                return Value.String(s.Substring(start, len));
+            });
+            Def("index_of", 2, 2, (interp, a) => Value.Number(NumberValue.FromLong(a[0].AsString().IndexOf(a[1].AsString(), StringComparison.Ordinal))));
+            Def("contains", 2, 2, (interp, a) => Value.Boolean(a[0].AsString().IndexOf(a[1].AsString(), StringComparison.Ordinal) >= 0));
+            Def("starts_with", 2, 2, (interp, a) => Value.Boolean(a[0].AsString().StartsWith(a[1].AsString(), StringComparison.Ordinal)));
+            Def("ends_with", 2, 2, (interp, a) => Value.Boolean(a[0].AsString().EndsWith(a[1].AsString(), StringComparison.Ordinal)));
+            Def("to_upper", 1, 1, (interp, a) => Value.String(a[0].AsString().ToUpperInvariant()));
+            Def("to_lower", 1, 1, (interp, a) => Value.String(a[0].AsString().ToLowerInvariant()));
+            Def("trim", 1, 1, (interp, a) => Value.String(a[0].AsString().Trim()));
+            Def("split", 2, 2, (interp, a) =>
+            {
+                var parts = a[0].AsString().Split(new string[] { a[1].AsString() }, StringSplitOptions.None);
+                var arr = new ArrayValue();
+                foreach (var p in parts) arr.Items.Add(Value.String(p));
+                return Value.Array(arr);
+            });
+            Def("parse_int", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                if (NumberValue.TryFromString(s, out var nv) && nv.Kind != NumberValue.NumKind.Double)
+                    return Value.Number(nv);
+                if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
+                    return Value.Number(NumberValue.FromLong(l));
+                if (BigInteger.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bi))
+                    return Value.Number(NumberValue.FromBigInt(bi));
+                return Value.Nil();
+            });
+            Def("parse_float", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                if (double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var d))
+                    return Value.Number(NumberValue.FromDouble(d));
+                return Value.Nil();
+            });
+
+            // Array helpers
+            Def("array", 0, int.MaxValue, (interp, a) => Value.Array(new ArrayValue(a)));
+            Def("push", 2, int.MaxValue, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                for (int k = 1; k < a.Count; k++) arr.Items.Add(a[k]);
+                return Value.Number(NumberValue.FromLong(arr.Length));
+            });
+            Def("pop", 1, 1, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                if (arr.Length == 0) return Value.Nil();
+                var v = arr.Items[arr.Length - 1];
+                arr.Items.RemoveAt(arr.Length - 1);
+                return v;
+            });
+            Def("slice", 2, 3, (interp, a) =>
+            {
+                if (a[0].Type == ValueType.Array)
+                {
+                    var arr = a[0].AsArray();
+                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = RuntimeOps.NormalizeIndex(start, arr.Length);
+                    int end = arr.Length;
+                    if (a.Count == 3)
+                    {
+                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = RuntimeOps.NormalizeIndex(end, arr.Length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end < start) end = start;
+                    if (end > arr.Length) end = arr.Length;
+                    var res = new ArrayValue();
+                    for (int k = start; k < end; k++) res.Items.Add(arr[k]);
+                    return Value.Array(res);
+                }
+                else if (a[0].Type == ValueType.String)
+                {
+                    var s = a[0].AsString();
+                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                    start = RuntimeOps.NormalizeIndex(start, s.Length);
+                    int end = s.Length;
+                    if (a.Count == 3)
+                    {
+                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
+                        end = RuntimeOps.NormalizeIndex(end, s.Length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end < start) end = start;
+                    if (end > s.Length) end = s.Length;
+                    return Value.String(s.Substring(start, end - start));
+                }
+                throw new MiniDynRuntimeError("slice expects array or string");
+            });
+            Def("join", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var sep = a[1].AsString();
+                var sb = new StringBuilder();
+                for (int k = 0; k < arr.Length; k++)
+                {
+                    if (k > 0) sb.Append(sep);
+                    sb.Append(interp.ToStringValue(arr[k]));
+                }
+                return Value.String(sb.ToString());
+            });
+            Def("at", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
+                if (idx < 0 || idx >= arr.Length) return Value.Nil();
+                return arr[idx];
+            });
+            Def("set_at", 3, 3, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
+                if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
+                arr[idx] = a[2];
+                return a[2];
+            });
+            Def("clone", 1, 1, (interp, a) =>
+            {
+                if (a[0].Type == ValueType.Array) return Value.Array(a[0].AsArray().Clone());
+                if (a[0].Type == ValueType.Object) return Value.Object(a[0].AsObject().CloneShallow());
+                return a[0];
+            });
+
+            // Time
+            Def("now_ms", 0, 0, (interp, a) => Value.Number(NumberValue.FromLong(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())));
+
+            // Map/filter/reduce/sort helpers
+            Def("values", 1, 1, (interp, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var kv in o.Entries) arr.Items.Add(kv.Value);
+                return Value.Array(arr);
+            });
+
+            Def("entries", 1, 1, (interp, a) =>
+            {
+                var o = a[0].AsObject();
+                var arr = new ArrayValue();
+                foreach (var kv in o.Entries)
+                {
+                    var pair = new ArrayValue(new[] { Value.String(kv.Key), kv.Value });
+                    arr.Items.Add(Value.Array(pair));
+                }
+                return Value.Array(arr);
+            });
+
+            Def("from_entries", 1, 1, (interp, a) =>
+            {
+                var src = a[0].AsArray();
+                var ov = new ObjectValue();
+                for (int k = 0; k < src.Length; k++)
+                {
+                    var entry = src[k];
+                    if (entry.Type != ValueType.Array) throw new MiniDynRuntimeError("from_entries expects array of [key, value] pairs");
+                    var tup = entry.AsArray();
+                    if (tup.Length != 2 || tup[0].Type != ValueType.String) throw new MiniDynRuntimeError("from_entries expects [string, any] pairs");
+                    ov.Set(tup[0].AsString(), tup[1]);
+                }
+                return Value.Object(ov);
+            });
+
+            Def("map", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                var res = new ArrayValue();
+                for (int idx = 0; idx < arr.Length; idx++)
+                    res.Items.Add(fn.Call(interp, new List<Value> { arr[idx] }));
+                return Value.Array(res);
+            });
+
+            Def("filter", 2, 2, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                var res = new ArrayValue();
+                for (int idx = 0; idx < arr.Length; idx++)
+                {
+                    var keep = fn.Call(interp, new List<Value> { arr[idx] });
+                    if (Value.IsTruthy(keep)) res.Items.Add(arr[idx]);
+                }
+                return Value.Array(res);
+            });
+
+            Def("reduce", 2, 3, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var fn = a[1].AsFunction();
+                int start = 0;
+                Value acc;
+                if (a.Count == 3) { acc = a[2]; }
+                else
+                {
+                    if (arr.Length == 0) throw new MiniDynRuntimeError("reduce of empty array with no initial value");
+                    acc = arr[0]; start = 1;
+                }
+                for (int idx = start; idx < arr.Length; idx++)
+                    acc = fn.Call(interp, new List<Value> { acc, arr[idx] });
+                return acc;
+            });
+
+            Def("sort", 1, 2, (interp, a) =>
+            {
+                var src = a[0].AsArray();
+                var copy = src.Clone();
+                Comparison<Value> cmp;
+                if (a.Count == 2)
+                {
+                    var fn = a[1].AsFunction();
+                    cmp = (x, y) =>
+                    {
+                        var r = fn.Call(interp, new List<Value> { x, y });
+                        var n = r.Type == ValueType.Number ? r.AsNumber() : NumberValue.FromLong(0);
+                        var d = n.ToDoubleNV().Dbl;
+                        return d < 0 ? -1 : d > 0 ? 1 : 0;
+                    };
+                }
+                else
+                {
+                    cmp = (x, y) =>
+                    {
+                        if (x.Type == ValueType.Number && y.Type == ValueType.Number)
+                            return NumberValue.Compare(x.AsNumber(), y.AsNumber());
+                        if (x.Type == ValueType.String && y.Type == ValueType.String)
+                            return string.CompareOrdinal(x.AsString(), y.AsString());
+                        return string.CompareOrdinal(x.Type.ToString(), y.Type.ToString());
+                    };
+                }
+                copy.Items.Sort(cmp);
+                return Value.Array(copy);
+            });
+
+            Def("unique", 1, 1, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                var seen = new HashSet<Value>();
+                var res = new ArrayValue();
+                for (int k = 0; k < arr.Length; k++)
+                    if (seen.Add(arr[k])) res.Items.Add(arr[k]);
+                return Value.Array(res);
+            });
+
+            Def("deep_equal", 2, 2, (interp, a) => Value.Boolean(interp.DeepEqual(a[0], a[1])));
+
+            Def("range", 1, 3, (interp, a) =>
+            {
+                long start, end, step;
+                if (a.Count == 1) { start = 0; end = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; step = 1; }
+                else if (a.Count == 2) { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = 1; }
+                else { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = (long)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl; }
+                if (step == 0) throw new MiniDynRuntimeError("range step cannot be 0");
+                var res = new ArrayValue();
+                if (step > 0) for (long v = start; v < end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
+                else for (long v = start; v > end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
+                return Value.Array(res);
+            });
+
+            // String helpers
+            Def("replace", 3, 3, (interp, a) =>
+            {
+                var s = a[0].AsString(); var find = a[1].AsString(); var repl = a[2].AsString();
+                return Value.String(s.Replace(find, repl));
+            });
+            Def("repeat", 2, 2, (interp, a) =>
+            {
+                var s = a[0].AsString(); int n = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                if (n < 0) n = 0;
+                var sb = new StringBuilder(s.Length * n);
+                for (int k = 0; k < n; k++) sb.Append(s);
+                return Value.String(sb.ToString());
+            });
+            Def("pad_start", 2, 3, (interp, a) =>
+            {
+                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                var pad = a.Count == 3 ? a[2].AsString() : " ";
+                if (pad.Length == 0) pad = " ";
+                if (s.Length >= len) return Value.String(s);
+                var sb = new StringBuilder(len);
+                while (sb.Length + s.Length < len) sb.Append(pad);
+                var padCut = sb.ToString().Substring(0, len - s.Length);
+                return Value.String(padCut + s);
+            });
+            Def("pad_end", 2, 3, (interp, a) =>
+            {
+                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
+                var pad = a.Count == 3 ? a[2].AsString() : " ";
+                if (pad.Length == 0) pad = " ";
+                if (s.Length >= len) return Value.String(s);
+                var sb = new StringBuilder(len);
+                sb.Append(s);
+                while (sb.Length < len) sb.Append(pad);
+                return Value.String(sb.ToString().Substring(0, len));
+            });
+
+            // Time
+            Def("sleep_ms", 1, 1, (interp, a) =>
+            {
+                var ms = (int)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
+                System.Threading.Thread.Sleep(ms < 0 ? 0 : ms);
+                return Value.Nil();
+            });
+
+            // JSON
+            Def("json_stringify", 1, 2, (interp, a) =>
+            {
+                bool pretty = a.Count == 2 && Value.IsTruthy(a[1]);
+                return Value.String(interp.JsonStringifyValue(a[0], pretty));
+            });
+            Def("json_parse", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                var token = JToken.Parse(s);
+                return Interpreter.JsonToValue(token);
+            });
+
+            // Error helpers
+            Def("error", 1, 1, (interp, a) =>
+            {
+                var msg = interp.ToStringValue(a[0]);
+                return interp.MakeError("Error", msg);
+            });
+            Def("raise", 1, 1, (interp, a) =>
+            {
+                var msg = interp.ToStringValue(a[0]);
+                var err = interp.MakeError("Error", msg);
+                throw new Interpreter.ThrowSignal(err);
+            });
+
+            // Modules
+            Def("require", 1, 1, (interp, a) =>
+            {
+                var spec = a[0].AsString();
+                return interp.RequireModule(spec);
+            });
+        }
+    }
     
     // Host-provided module loader abstraction + default FS loader
     public interface IModuleLoader
@@ -6104,7 +6595,6 @@ namespace MiniDynLang
         // Track whether we're inside a loop to validate break/continue usage
         private int _loopDepth = 0;
 
-        private readonly Dictionary<string, ICallable> _builtins = new Dictionary<string, ICallable>();
         private readonly Stack<SourceSpan> _nodeSpanStack = new Stack<SourceSpan>();
         private readonly Stack<CallFrame> _callStack = new Stack<CallFrame>();
         private readonly IModuleLoader _moduleLoader;
@@ -6135,582 +6625,8 @@ namespace MiniDynLang
             Globals = new FunctionEnvironment();
             _env = Globals;
 
-            // Builtins
-            DefineBuiltin("length", 1, 1, (i, a) =>
-            {
-                var v = a[0];
-                switch (v.Type)
-                {
-                    case ValueType.String: return Value.Number(NumberValue.FromLong(v.AsString().Length));
-                    case ValueType.Array: return Value.Number(NumberValue.FromLong(v.AsArray().Length));
-                    case ValueType.Object: return Value.Number(NumberValue.FromLong(v.AsObject().Count));
-                    case ValueType.Nil: return Value.Number(NumberValue.FromLong(0));
-                    case ValueType.Boolean: return Value.Number(NumberValue.FromLong(1));
-                    case ValueType.Number: return Value.Number(NumberValue.FromLong(1));
-                    case ValueType.Function: return Value.Number(NumberValue.FromLong(1));
-                    default: return Value.Number(NumberValue.FromLong(0));
-                }
-            });
-
-            DefineBuiltin("print", 1, int.MaxValue, (i, a) =>
-            {
-                var sb = new StringBuilder();
-                for (int idx = 0; idx < a.Count; idx++)
-                {
-                    sb.Append(i.ToStringValue(a[idx]));
-                    if (idx + 1 < a.Count) sb.Append(' ');
-                }
-                Console.Write(sb.ToString());
-                return Value.Nil();
-            });
-
-            DefineBuiltin("println", 0, int.MaxValue, (i, a) =>
-            {
-                if (a.Count == 0) { Console.WriteLine(); return Value.Nil(); }
-                var sb = new StringBuilder();
-                for (int idx = 0; idx < a.Count; idx++)
-                {
-                    sb.Append(i.ToStringValue(a[idx]));
-                    if (idx + 1 < a.Count) sb.Append(' ');
-                }
-                Console.WriteLine(sb.ToString());
-                return Value.Nil();
-            });
-
-            DefineBuiltin("gets", 0, 0, (i, a) =>
-            {
-                string line = Console.ReadLine();
-                return Value.String(line);
-            });
-
-            DefineBuiltin("to_number", 1, 1, (i, a) =>
-            {
-                var v = a[0];
-                switch (v.Type)
-                {
-                    case ValueType.Number: return v;
-                    case ValueType.String:
-                        return NumberValue.TryFromString(v.AsString(), out var nv) ? Value.Number(nv) : Value.Nil();
-                    case ValueType.Boolean: return Value.Number(NumberValue.FromBool(v.AsBoolean()));
-                    case ValueType.Nil: return Value.Number(NumberValue.FromLong(0));
-                    default: return Value.Nil();
-                }
-            });
-
-            DefineBuiltin("to_string", 1, 1, (i, a) => Value.String(i.ToStringValue(a[0])));
-
-            DefineBuiltin("type", 1, 1, (i, a) => Value.String(a[0].Type.ToString().ToLowerInvariant()));
-
-            // Object builtins
-            DefineBuiltin("keys", 1, 1, (i, a) =>
-            {
-                var o = a[0].AsObject();
-                var arr = new ArrayValue();
-                foreach (var k in o.Keys) arr.Items.Add(Value.String(k));
-                return Value.Array(arr);
-            });
-
-            DefineBuiltin("has_key", 2, 2, (i, a) =>
-            {
-                var o = a[0].AsObject();
-                var k = a[1].AsString();
-                return Value.Boolean(o.Contains(k));
-            });
-
-            DefineBuiltin("remove_key", 2, 2, (i, a) =>
-            {
-                var o = a[0].AsObject();
-                var k = a[1].AsString();
-                return Value.Boolean(o.Remove(k));
-            });
-
-            DefineBuiltin("merge", 2, 2, (i, a) =>
-            {
-                var o1 = a[0].AsObject();
-                var o2 = a[1].AsObject();
-                var res = o1.CloneShallow();
-                foreach (var kv in o2.Entries) res.Set(kv.Key, kv.Value);
-                return Value.Object(res);
-            });
-
-            // Math
-            DefineBuiltin("abs", 1, 1, (i, a) =>
-            {
-                var n = RuntimeOps.ToNumber(a[0]);
-                switch (n.Kind)
-                {
-                    case NumberValue.NumKind.Int: return Value.Number(NumberValue.FromLong(Math.Abs(n.I64)));
-                    case NumberValue.NumKind.BigInt: return Value.Number(NumberValue.FromBigInt(BigInteger.Abs(n.BigInt)));
-                    case NumberValue.NumKind.Double: return Value.Number(NumberValue.FromDouble(Math.Abs(n.Dbl)));
-                    default: return Value.Number(NumberValue.FromLong(0));
-                }
-            });
-            DefineBuiltin("floor", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Floor(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("ceil", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Ceiling(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("round", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Round(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("sqrt", 1, 1, (i, a) => Value.Number(NumberValue.FromDouble(Math.Sqrt(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl))));
-            DefineBuiltin("pow", 2, 2, (i, a) => Value.Number(NumberValue.FromDouble(Math.Pow(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl, RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl))));
-            DefineBuiltin("min", 1, int.MaxValue, (i, a) =>
-            {
-                if (a.Count == 0) return Value.Nil();
-                var cur = RuntimeOps.ToNumber(a[0]);
-                for (int k = 1; k < a.Count; k++)
-                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) < 0) cur = RuntimeOps.ToNumber(a[k]);
-                return Value.Number(cur);
-            });
-            DefineBuiltin("max", 1, int.MaxValue, (i, a) =>
-            {
-                if (a.Count == 0) return Value.Nil();
-                var cur = RuntimeOps.ToNumber(a[0]);
-                for (int k = 1; k < a.Count; k++)
-                    if (NumberValue.Compare(RuntimeOps.ToNumber(a[k]), cur) > 0) cur = RuntimeOps.ToNumber(a[k]);
-                return Value.Number(cur);
-            });
-
-            var rng = new Random();
-            DefineBuiltin("random", 0, 0, (i, a) => Value.Number(NumberValue.FromDouble(rng.NextDouble())));
-            DefineBuiltin("srand", 1, 1, (i, a) => { rng = new Random((int)(RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl)); return Value.Nil(); });
-
-            // String utilities
-            DefineBuiltin("substring", 2, 3, (i, a) =>
-            {
-                var s = a[0].AsString();
-                var start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                if (start < 0) start = 0;
-                if (start > s.Length) start = s.Length;
-                if (a.Count == 2)
-                {
-                    return Value.String(s.Substring(start));
-                }
-                var len = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
-                if (len < 0) len = 0;
-                if (start + len > s.Length) len = s.Length - start;
-                return Value.String(s.Substring(start, len));
-            });
-            DefineBuiltin("index_of", 2, 2, (i, a) => Value.Number(NumberValue.FromLong(a[0].AsString().IndexOf(a[1].AsString(), StringComparison.Ordinal))));
-            DefineBuiltin("contains", 2, 2, (i, a) => Value.Boolean(a[0].AsString().IndexOf(a[1].AsString(), StringComparison.Ordinal) >= 0));
-            DefineBuiltin("starts_with", 2, 2, (i, a) => Value.Boolean(a[0].AsString().StartsWith(a[1].AsString(), StringComparison.Ordinal)));
-            DefineBuiltin("ends_with", 2, 2, (i, a) => Value.Boolean(a[0].AsString().EndsWith(a[1].AsString(), StringComparison.Ordinal)));
-            DefineBuiltin("to_upper", 1, 1, (i, a) => Value.String(a[0].AsString().ToUpperInvariant()));
-            DefineBuiltin("to_lower", 1, 1, (i, a) => Value.String(a[0].AsString().ToLowerInvariant()));
-            DefineBuiltin("trim", 1, 1, (i, a) => Value.String(a[0].AsString().Trim()));
-            DefineBuiltin("split", 2, 2, (i, a) =>
-            {
-                var parts = a[0].AsString().Split(new string[] { a[1].AsString() }, StringSplitOptions.None);
-                var arr = new ArrayValue();
-                foreach (var p in parts) arr.Items.Add(Value.String(p));
-                return Value.Array(arr);
-            });
-            DefineBuiltin("parse_int", 1, 1, (i, a) =>
-            {
-                var s = a[0].AsString();
-                if (NumberValue.TryFromString(s, out var nv) && nv.Kind != NumberValue.NumKind.Double)
-                    return Value.Number(nv);
-                if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
-                    return Value.Number(NumberValue.FromLong(l));
-                if (BigInteger.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bi))
-                    return Value.Number(NumberValue.FromBigInt(bi));
-                return Value.Nil();
-            });
-            DefineBuiltin("parse_float", 1, 1, (i, a) =>
-            {
-                var s = a[0].AsString();
-                if (double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var d))
-                    return Value.Number(NumberValue.FromDouble(d));
-                return Value.Nil();
-            });
-
-            // Array helpers
-            DefineBuiltin("array", 0, int.MaxValue, (i, a) => Value.Array(new ArrayValue(a)));
-            DefineBuiltin("push", 2, int.MaxValue, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                for (int k = 1; k < a.Count; k++) arr.Items.Add(a[k]);
-                return Value.Number(NumberValue.FromLong(arr.Length));
-            });
-            DefineBuiltin("pop", 1, 1, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                if (arr.Length == 0) return Value.Nil();
-                // Remove index-from-end operator (^1) for .NET Framework
-                var v = arr.Items[arr.Length - 1];
-                arr.Items.RemoveAt(arr.Length - 1);
-                return v;
-            });
-            DefineBuiltin("slice", 2, 3, (i, a) =>
-            {
-                if (a[0].Type == ValueType.Array)
-                {
-                    var arr = a[0].AsArray();
-                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                    start = RuntimeOps.NormalizeIndex(start, arr.Length);
-                    int end = arr.Length;
-                    if (a.Count == 3)
-                    {
-                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
-                        end = RuntimeOps.NormalizeIndex(end, arr.Length);
-                    }
-                    if (start < 0) start = 0;
-                    if (end < start) end = start;
-                    if (end > arr.Length) end = arr.Length;
-                    var res = new ArrayValue();
-                    for (int k = start; k < end; k++) res.Items.Add(arr[k]);
-                    return Value.Array(res);
-                }
-                else if (a[0].Type == ValueType.String)
-                {
-                    var s = a[0].AsString();
-                    int start = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                    start = RuntimeOps.NormalizeIndex(start, s.Length);
-                    int end = s.Length;
-                    if (a.Count == 3)
-                    {
-                        end = (int)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl;
-                        end = RuntimeOps.NormalizeIndex(end, s.Length);
-                    }
-                    if (start < 0) start = 0;
-                    if (end < start) end = start;
-                    if (end > s.Length) end = s.Length;
-                    return Value.String(s.Substring(start, end - start));
-                }
-                throw new MiniDynRuntimeError("slice expects array or string");
-            });
-            DefineBuiltin("join", 2, 2, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                var sep = a[1].AsString();
-                var sb = new StringBuilder();
-                for (int k = 0; k < arr.Length; k++)
-                {
-                    if (k > 0) sb.Append(sep);
-                    sb.Append(i.ToStringValue(arr[k]));
-                }
-                return Value.String(sb.ToString());
-            });
-            DefineBuiltin("at", 2, 2, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
-                if (idx < 0 || idx >= arr.Length) return Value.Nil();
-                return arr[idx];
-            });
-            DefineBuiltin("set_at", 3, 3, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                int idx = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                idx = RuntimeOps.NormalizeIndex(idx, arr.Length);
-                if (idx < 0 || idx >= arr.Length) throw new MiniDynRuntimeError("Array index out of range");
-                arr[idx] = a[2];
-                return a[2];
-            });
-            DefineBuiltin("clone", 1, 1, (i, a) =>
-            {
-                if (a[0].Type == ValueType.Array) return Value.Array(a[0].AsArray().Clone());
-                if (a[0].Type == ValueType.Object) return Value.Object(a[0].AsObject().CloneShallow());
-                return a[0];
-            });
-
-            // Time
-            DefineBuiltin("now_ms", 0, 0, (i, a) => Value.Number(NumberValue.FromLong(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())));
-
-            // === Array/object helpers ===
-            DefineBuiltin("values", 1, 1, (i, a) =>
-            {
-                var o = a[0].AsObject();
-                var arr = new ArrayValue();
-                foreach (var kv in o.Entries) arr.Items.Add(kv.Value);
-                return Value.Array(arr);
-            });
-
-            DefineBuiltin("entries", 1, 1, (i, a) =>
-            {
-                var o = a[0].AsObject();
-                var arr = new ArrayValue();
-                foreach (var kv in o.Entries)
-                {
-                    var pair = new ArrayValue(new[] { Value.String(kv.Key), kv.Value });
-                    arr.Items.Add(Value.Array(pair));
-                }
-                return Value.Array(arr);
-            });
-
-            DefineBuiltin("from_entries", 1, 1, (i, a) =>
-            {
-                var src = a[0].AsArray();
-                var ov = new ObjectValue();
-                for (int k = 0; k < src.Length; k++)
-                {
-                    var entry = src[k];
-                    if (entry.Type != ValueType.Array) throw new MiniDynRuntimeError("from_entries expects array of [key, value] pairs");
-                    var tup = entry.AsArray();
-                    if (tup.Length != 2 || tup[0].Type != ValueType.String) throw new MiniDynRuntimeError("from_entries expects [string, any] pairs");
-                    ov.Set(tup[0].AsString(), tup[1]);
-                }
-                return Value.Object(ov);
-            });
-
-            DefineBuiltin("map", 2, 2, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                var fn = a[1].AsFunction();
-                var res = new ArrayValue();
-                for (int idx = 0; idx < arr.Length; idx++)
-                    res.Items.Add(fn.Call(i, new List<Value> { arr[idx] }));
-                return Value.Array(res);
-            });
-
-            DefineBuiltin("filter", 2, 2, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                var fn = a[1].AsFunction();
-                var res = new ArrayValue();
-                for (int idx = 0; idx < arr.Length; idx++)
-                {
-                    var keep = fn.Call(i, new List<Value> { arr[idx] });
-                    if (Value.IsTruthy(keep)) res.Items.Add(arr[idx]);
-                }
-                return Value.Array(res);
-            });
-
-            DefineBuiltin("reduce", 2, 3, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                var fn = a[1].AsFunction();
-                int start = 0;
-                Value acc;
-                if (a.Count == 3) { acc = a[2]; }
-                else
-                {
-                    if (arr.Length == 0) throw new MiniDynRuntimeError("reduce of empty array with no initial value");
-                    acc = arr[0]; start = 1;
-                }
-                for (int idx = start; idx < arr.Length; idx++)
-                    acc = fn.Call(i, new List<Value> { acc, arr[idx] });
-                return acc;
-            });
-
-            DefineBuiltin("sort", 1, 2, (i, a) =>
-            {
-                var src = a[0].AsArray();
-                var copy = src.Clone();
-                Comparison<Value> cmp;
-                if (a.Count == 2)
-                {
-                    var fn = a[1].AsFunction();
-                    cmp = (x, y) =>
-                    {
-                        var r = fn.Call(i, new List<Value> { x, y });
-                        var n = r.Type == ValueType.Number ? r.AsNumber() : NumberValue.FromLong(0);
-                        var d = n.ToDoubleNV().Dbl;
-                        return d < 0 ? -1 : d > 0 ? 1 : 0;
-                    };
-                }
-                else
-                {
-                    cmp = (x, y) =>
-                    {
-                        if (x.Type == ValueType.Number && y.Type == ValueType.Number)
-                            return NumberValue.Compare(x.AsNumber(), y.AsNumber());
-                        if (x.Type == ValueType.String && y.Type == ValueType.String)
-                            return string.CompareOrdinal(x.AsString(), y.AsString());
-                        // Fallback: by type name
-                        return string.CompareOrdinal(x.Type.ToString(), y.Type.ToString());
-                    };
-                }
-                copy.Items.Sort(cmp);
-                return Value.Array(copy);
-            });
-
-            DefineBuiltin("unique", 1, 1, (i, a) =>
-            {
-                var arr = a[0].AsArray();
-                var seen = new HashSet<Value>();
-                var res = new ArrayValue();
-                for (int k = 0; k < arr.Length; k++)
-                    if (seen.Add(arr[k])) res.Items.Add(arr[k]);
-                return Value.Array(res);
-            });
-
-            // Deep structural equality
-            DefineBuiltin("deep_equal", 2, 2, (i, a) => Value.Boolean(i.DeepEqual(a[0], a[1])));
-
-            DefineBuiltin("range", 1, 3, (i, a) =>
-            {
-                long start, end, step;
-                if (a.Count == 1) { start = 0; end = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; step = 1; }
-                else if (a.Count == 2) { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = 1; }
-                else { start = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl; end = (long)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl; step = (long)RuntimeOps.ToNumber(a[2]).ToDoubleNV().Dbl; }
-                if (step == 0) throw new MiniDynRuntimeError("range step cannot be 0");
-                var res = new ArrayValue();
-                if (step > 0) for (long v = start; v < end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
-                else for (long v = start; v > end; v += step) res.Items.Add(Value.Number(NumberValue.FromLong(v)));
-                return Value.Array(res);
-            });
-
-            // === String helpers ===
-            DefineBuiltin("replace", 3, 3, (i, a) =>
-            {
-                var s = a[0].AsString(); var find = a[1].AsString(); var repl = a[2].AsString();
-                // .NET Framework doesn't have Replace with StringComparison; default Replace is ordinal and case-sensitive.
-                return Value.String(s.Replace(find, repl));
-            });
-            DefineBuiltin("repeat", 2, 2, (i, a) =>
-            {
-                var s = a[0].AsString(); int n = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                if (n < 0) n = 0;
-                var sb = new StringBuilder(s.Length * n);
-                for (int k = 0; k < n; k++) sb.Append(s);
-                return Value.String(sb.ToString());
-            });
-            DefineBuiltin("pad_start", 2, 3, (i, a) =>
-            {
-                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                var pad = a.Count == 3 ? a[2].AsString() : " ";
-                if (pad.Length == 0) pad = " ";
-                if (s.Length >= len) return Value.String(s);
-                var sb = new StringBuilder(len);
-                while (sb.Length + s.Length < len) sb.Append(pad);
-                var padCut = sb.ToString().Substring(0, len - s.Length);
-                return Value.String(padCut + s);
-            });
-            DefineBuiltin("pad_end", 2, 3, (i, a) =>
-            {
-                var s = a[0].AsString(); int len = (int)RuntimeOps.ToNumber(a[1]).ToDoubleNV().Dbl;
-                var pad = a.Count == 3 ? a[2].AsString() : " ";
-                if (pad.Length == 0) pad = " ";
-                if (s.Length >= len) return Value.String(s);
-                var sb = new StringBuilder(len);
-                sb.Append(s);
-                while (sb.Length < len) sb.Append(pad);
-                return Value.String(sb.ToString().Substring(0, len));
-            });
-
-            // === Time ===
-            DefineBuiltin("sleep_ms", 1, 1, (i, a) =>
-            {
-                var ms = (int)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
-                System.Threading.Thread.Sleep(ms < 0 ? 0 : ms);
-                return Value.Nil();
-            });
-
-            // === JSON ===
-            DefineBuiltin("json_stringify", 1, 2, (i, a) =>
-            {
-                bool pretty = a.Count == 2 && Value.IsTruthy(a[1]);
-                return Value.String(i.JsonStringifyValue(a[0], pretty));
-            });
-            DefineBuiltin("json_parse", 1, 1, (i, a) =>
-            {
-                var s = a[0].AsString();
-                // Use Newtonsoft.Json for .NET Framework
-                var token = JToken.Parse(s);
-                return JsonToValue(token);
-            });
-            // Simple error/raise builtins
-            DefineBuiltin("error", 1, 1, (i, a) =>
-            {
-                var msg = i.ToStringValue(a[0]);
-                return i.MakeError("Error", msg);
-            });
-            DefineBuiltin("raise", 1, 1, (i, a) =>
-            {
-                var msg = i.ToStringValue(a[0]);
-                var err = i.MakeError("Error", msg);
-                throw new ThrowSignal(err);
-            });
-            // --- Modules: require(path) ---
-            DefineBuiltin("require", 1, 1, (i, a) =>
-            {
-                var spec = a[0].AsString();
-                var baseDir = i.GetCallerDirectory();
-
-                var abs = i._moduleLoader.Resolve(spec, baseDir);
-                if (string.IsNullOrEmpty(abs))
-                    throw new MiniDynRuntimeError($"Cannot resolve module '{spec}' from '{baseDir}'");
-
-                // Cache lookup with loading-state handling
-                if (i._moduleCache.TryGetValue(abs, out var cached))
-                {
-                    // Fully loaded -> return final exports
-                    if (!cached.IsLoading && cached.Exports.HasValue)
-                        return cached.Exports.Value;
-
-                    // In-progress (cyclic) -> return the pre-seeded temp exports
-                    if (cached.IsLoading && cached.TempExports.HasValue)
-                        return cached.TempExports.Value;
-                }
-
-                // Create or reuse cache entry and mark loading
-                if (!i._moduleCache.TryGetValue(abs, out cached))
-                {
-                    cached = new ModuleCacheEntry();
-                    i._moduleCache[abs] = cached;
-                }
-
-                string src;
-                if (!i._moduleLoader.TryLoad(abs, out src))
-                {
-                    // Cleanup on load failure
-                    i._moduleCache.Remove(abs);
-                    throw new MiniDynRuntimeError($"Cannot load module '{abs}'");
-                }
-
-                try
-                {
-                    // Parse
-                    var lexer = new Lexer(src, abs);
-                    var parser = new Parser(lexer);
-                    var stmts = parser.Parse();
-
-                    // Module environment: child of Globals; mark as FunctionEnvironment so 'var' is module-local
-                    var moduleEnv = new FunctionEnvironment(i.Globals);
-
-                    // Predefine exports and module
-                    var initialExportsObj = new ObjectValue();
-                    moduleEnv.DefineVar("exports", Value.Object(initialExportsObj));
-                    var moduleObj = new ObjectValue();
-                    moduleObj.Set("exports", Value.Object(initialExportsObj));
-                    moduleEnv.DefineVar("module", Value.Object(moduleObj));
-
-                    // Seed cache for cyclic dependencies (but do not finalize Exports yet)
-                    cached.IsLoading = true;
-                    cached.TempExports = Value.Object(initialExportsObj);
-
-                    // Execute program in this environment
-                    i.InterpretInEnv(stmts, moduleEnv);
-
-                    // Read final module.exports
-                    Value moduleVal;
-                    if (!moduleEnv.TryGetHere("module", out moduleVal))
-                        moduleVal = Value.Object(moduleObj);
-
-                    Value finalExports = Value.Nil();
-                    if (moduleVal.Type == ValueType.Object)
-                    {
-                        var mo = moduleVal.AsObject();
-                        if (!mo.TryGet("exports", out finalExports))
-                            finalExports = Value.Object(initialExportsObj);
-                    }
-                    else
-                    {
-                        finalExports = Value.Object(initialExportsObj);
-                    }
-
-                    // Commit success: finalize cache
-                    cached.Exports = finalExports;
-                    cached.IsLoading = false;
-                    cached.TempExports = null;
-
-                    return finalExports;
-                }
-                catch
-                {
-                    // On any failure, clear the cache entry so future require() retries the load
-                    i._moduleCache.Remove(abs);
-                    throw;
-                }
-            });
+            // Register all built-ins in a single place
+            Builtins.Register(this, Globals);
         }
 
         private string GetCallerDirectory()
@@ -6732,6 +6648,98 @@ namespace MiniDynLang
             return Directory.GetCurrentDirectory();
         }
 
+        // Encapsulated module loader used by the 'require' builtin
+        internal Value RequireModule(string spec)
+        {
+            var baseDir = GetCallerDirectory();
+
+            var abs = _moduleLoader.Resolve(spec, baseDir);
+            if (string.IsNullOrEmpty(abs))
+                throw new MiniDynRuntimeError($"Cannot resolve module '{spec}' from '{baseDir}'");
+
+            // Cache lookup with loading-state handling
+            if (_moduleCache.TryGetValue(abs, out var cached))
+            {
+                // Fully loaded -> return final exports
+                if (!cached.IsLoading && cached.Exports.HasValue)
+                    return cached.Exports.Value;
+
+                // In-progress (cyclic) -> return the pre-seeded temp exports
+                if (cached.IsLoading && cached.TempExports.HasValue)
+                    return cached.TempExports.Value;
+            }
+
+            // Create or reuse cache entry and mark loading
+            if (!_moduleCache.TryGetValue(abs, out cached))
+            {
+                cached = new ModuleCacheEntry();
+                _moduleCache[abs] = cached;
+            }
+
+            string src;
+            if (!_moduleLoader.TryLoad(abs, out src))
+            {
+                // Cleanup on load failure
+                _moduleCache.Remove(abs);
+                throw new MiniDynRuntimeError($"Cannot load module '{abs}'");
+            }
+
+            try
+            {
+                // Parse
+                var lexer = new Lexer(src, abs);
+                var parser = new Parser(lexer);
+                var stmts = parser.Parse();
+
+                // Module environment: child of Globals; mark as FunctionEnvironment so 'var' is module-local
+                var moduleEnv = new FunctionEnvironment(Globals);
+
+                // Predefine exports and module
+                var initialExportsObj = new ObjectValue();
+                moduleEnv.DefineVar("exports", Value.Object(initialExportsObj));
+                var moduleObj = new ObjectValue();
+                moduleObj.Set("exports", Value.Object(initialExportsObj));
+                moduleEnv.DefineVar("module", Value.Object(moduleObj));
+
+                // Seed cache for cyclic dependencies (but do not finalize Exports yet)
+                cached.IsLoading = true;
+                cached.TempExports = Value.Object(initialExportsObj);
+
+                // Execute program in this environment
+                InterpretInEnv(stmts, moduleEnv);
+
+                // Read final module.exports
+                Value moduleVal;
+                if (!moduleEnv.TryGetHere("module", out moduleVal))
+                    moduleVal = Value.Object(moduleObj);
+
+                Value finalExports = Value.Nil();
+                if (moduleVal.Type == ValueType.Object)
+                {
+                    var mo = moduleVal.AsObject();
+                    if (!mo.TryGet("exports", out finalExports))
+                        finalExports = Value.Object(initialExportsObj);
+                }
+                else
+                {
+                    finalExports = Value.Object(initialExportsObj);
+                }
+
+                // Commit success: finalize cache
+                cached.Exports = finalExports;
+                cached.IsLoading = false;
+                cached.TempExports = null;
+
+                return finalExports;
+            }
+            catch
+            {
+                // On any failure, clear the cache entry so future require() retries the load
+                _moduleCache.Remove(abs);
+                throw;
+            }
+        }
+
         public void InterpretInEnv(List<Stmt> statements, Environment env)
         {
             var prev = _env;
@@ -6742,14 +6750,6 @@ namespace MiniDynLang
             }
             finally { _env = prev; }
         }
-
-        private void DefineBuiltin(string name, int arityMin, int arityMax, Func<Interpreter, List<Value>, Value> fn)
-        {
-            var f = new BuiltinFunction(name, arityMin, arityMax, fn);
-            _builtins[name] = f;
-            Globals.DefineVar(name, Value.Function(f));
-        }
-
         public string ToStringValue(Value v) => v.ToString();
 
         public void Interpret(List<Stmt> statements)
@@ -7949,7 +7949,7 @@ namespace MiniDynLang
         }
 
         // Deep structural equality with cycle detection
-        private bool DeepEqual(Value a, Value b)
+        internal bool DeepEqual(Value a, Value b)
         {
             var seen = new HashSet<(object, object)>(new RefPairEq());
             return DeepEqualCore(a, b, seen);
@@ -8031,7 +8031,7 @@ namespace MiniDynLang
             return Value.Object(ov);
         }
 
-        private string JsonStringifyValue(Value v, bool pretty = false, int indent = 0)
+        internal string JsonStringifyValue(Value v, bool pretty = false, int indent = 0)
         {
             // Use an object path to detect cycles along the current traversal
             var path = new HashSet<object>();
@@ -8093,7 +8093,7 @@ namespace MiniDynLang
         }
 
         // Newtonsoft.Json JToken -> Value
-        private static Value JsonToValue(JToken t)
+        internal static Value JsonToValue(JToken t)
         {
             switch (t.Type)
             {
