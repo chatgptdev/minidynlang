@@ -3075,11 +3075,12 @@ namespace MiniDynLang
     // Environment
     public class Environment
     {
-        private readonly Dictionary<string, Value> _values = new Dictionary<string, Value>();
-        private readonly HashSet<string> _consts = new HashSet<string>();
-        private readonly HashSet<string> _lets = new HashSet<string>(); // tracks block-scoped let/const by name
+        // Use Ordinal everywhere for identifiers to match object-key semantics.
+        private readonly Dictionary<string, Value> _values = new Dictionary<string, Value>(StringComparer.Ordinal);
+        private readonly HashSet<string> _consts = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _lets = new HashSet<string>(StringComparer.Ordinal); // tracks block-scoped let/const by name
         // track "uninitialized" for TDZ-like checks on let without initializer
-        private readonly HashSet<string> _uninitialized = new HashSet<string>();
+        private readonly HashSet<string> _uninitialized = new HashSet<string>(StringComparer.Ordinal);
 
         public virtual bool IsFunction => false; // mark function/global boundaries
         public Environment Enclosing { get; }
@@ -7155,6 +7156,103 @@ namespace MiniDynLang
             }
         }
 
+        // Centralized function invocation path:
+        // - Handles named/positional arguments
+        // - Binds receiver ('this') for normal functions and methods
+        // - Performs arity checks
+        // - Pushes/pops call frames consistently
+        // - In tail position, turns direct self calls into TailCallSignal
+        private Value InvokeFunction(Value calleeVal, Value receiver, List<Expr.Call.Argument> args, SourceSpan callSite, bool inTailPosition)
+        {
+            if (calleeVal.Type != ValueType.Function)
+                throw new MiniDynRuntimeError("Can only call functions");
+
+            var fn = calleeVal.AsFunction();
+
+            // Tail-call optimization: only for direct self UserFunction calls
+            var cur = CurrentFunction;
+            if (inTailPosition && cur != null && fn is UserFunction ufSelf && ufSelf.FunctionId == cur.FunctionId)
+            {
+                if (args.Any(a => a.IsNamed))
+                {
+                    var mapping = BuildArgMapping(ToParamViews(cur.Params), args);
+                    throw new TailCallSignal(cur, mapping);
+                }
+                else
+                {
+                    var finalArgs = new List<Value>(args.Count);
+                    foreach (var a in args) finalArgs.Add(Evaluate(a.Value));
+                    throw new TailCallSignal(cur, finalArgs);
+                }
+            }
+
+            // UserFunction (named args supported)
+            if (fn is UserFunction uf)
+            {
+                // Bind receiver for normal functions
+                if (receiver.Type != ValueType.Nil && uf.FunctionKind == UserFunction.Kind.Normal)
+                    uf = uf.BindThis(receiver);
+
+                if (args.Any(a => a.IsNamed))
+                {
+                    var mapping = BuildArgMapping(ToParamViews(uf.Params), args);
+                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
+                    try { return uf.CallWithMapping(this, mapping); }
+                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                    finally { _callStack.Pop(); }
+                }
+                else
+                {
+                    var pos = new List<Value>(args.Count);
+                    foreach (var a in args) pos.Add(Evaluate(a.Value));
+                    if (pos.Count < uf.ArityMin || pos.Count > uf.ArityMax)
+                        throw new MiniDynRuntimeError($"Function {uf} expected {uf.ArityMin}..{(uf.ArityMax == int.MaxValue ? "∞" : uf.ArityMax.ToString())} args, got {pos.Count}");
+                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
+                    try { return uf.Call(this, pos); }
+                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                    finally { _callStack.Pop(); }
+                }
+            }
+
+            // BytecodeFunction (named args remapped to positional when needed)
+            if (fn is BytecodeFunction bf)
+            {
+                // Bind receiver for normal functions
+                if (receiver.Type != ValueType.Nil && bf.FunctionKind == UserFunction.Kind.Normal)
+                    fn = bf.BindThis(receiver);
+
+                List<Value> pos;
+                if (args.Any(a => a.IsNamed) || (bf.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
+                    pos = BuildPositionalArgsForBytecode(bf.Params, args);
+                else
+                {
+                    pos = new List<Value>(args.Count);
+                    foreach (var a in args) pos.Add(Evaluate(a.Value));
+                }
+                if (pos.Count < fn.ArityMin || pos.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {pos.Count}");
+                _callStack.Push(new CallFrame("<anonymous>", callSite));
+                try { return fn.Call(this, pos); }
+                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                finally { _callStack.Pop(); }
+            }
+
+           // Builtins: no named arguments
+            if (args.Any(a => a.IsNamed))
+                throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
+            {
+                var pos = new List<Value>(args.Count);
+                foreach (var a in args) pos.Add(Evaluate(a.Value));
+                if (pos.Count < fn.ArityMin || pos.Count > fn.ArityMax)
+                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {pos.Count}");
+                var name = (fn is BuiltinFunction bf2) ? bf2.Name : "<anonymous>";
+                _callStack.Push(new CallFrame(name, callSite));
+                try { return fn.Call(this, pos); }
+                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
+                finally { _callStack.Pop(); }
+            }
+        }
+
         // Evaluate an expression that is in tail position of a return.
         // If it is (or reduces to) a direct self tail-call, this will throw TailCallSignal to trampoline.
         // Otherwise it evaluates and returns the value.
@@ -7206,165 +7304,14 @@ namespace MiniDynLang
             // Direct call in tail position -> use TCO path (including method/optional call cases)
             if (e is Expr.Call callExpr)
             {
-                return EvaluateTailCallOrInvoke(callExpr);
+                // Reuse centralized dispatcher in tail-position mode.
+                TryPrepareCalleeForCall(callExpr.Callee, out var calleeVal, out var receiver, out var shortCircuitToNil);
+                if (shortCircuitToNil) return Value.Nil();
+                return InvokeFunction(calleeVal, receiver, callExpr.Args, callExpr?.Span ?? default(SourceSpan), inTailPosition: true);
             }
 
             // Fallback: just evaluate normally
             return Evaluate(e);
-        }
-
-        // Execute a call in tail position:
-        // - If it's a self tail-call to the current UserFunction, throw TailCallSignal (positional or mapping).
-        // - Otherwise, perform the call and return its result.
-        private Value EvaluateTailCallOrInvoke(Expr.Call callExpr)
-        {
-            var currentFn = CurrentFunction;
-
-            // Evaluate callee once, capture receiver for method-call binding (and optional chaining short-circuit)
-            Value calleeVal; Value receiver; bool shortCircuitToNil;
-            TryPrepareCalleeForCall(callExpr.Callee, out calleeVal, out receiver, out shortCircuitToNil);
-
-            if (shortCircuitToNil)
-                return Value.Nil();
-
-            if (calleeVal.Type != ValueType.Function)
-                throw new MiniDynRuntimeError("Can only call functions");
-
-            var fn = calleeVal.AsFunction();
-
-            // Self tail-call to same UserFunction -> trampoline
-            if (currentFn != null && fn is UserFunction targetFn && targetFn.FunctionId == currentFn.FunctionId)
-            {
-                if (callExpr.Args.Any(a => a.IsNamed))
-                {
-                    var mapping = BuildArgMapping(ToParamViews(currentFn.Params), callExpr.Args);
-                    throw new TailCallSignal(currentFn, mapping);
-                }
-                else
-                {
-                    var finalArgs = new List<Value>();
-                    foreach (var a in callExpr.Args) finalArgs.Add(Evaluate(a.Value));
-                    throw new TailCallSignal(currentFn, finalArgs);
-                }
-            }
-
-            // Not a self tail-call: perform the call and return its result, preserving receiver binding
-            if (fn is UserFunction userFn2)
-            {
-                if (callExpr.Args.Any(a => a.IsNamed))
-                {
-                    var mapping = BuildArgMapping(ToParamViews(userFn2.Params), callExpr.Args);
-                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
-                        fn = userFn2.BindThis(receiver);
-
-                    string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
-                    var callSite = callExpr?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(fnName, callSite));
-                    try
-                    {
-                        return ((UserFunction)fn).CallWithMapping(this, mapping);
-                    }
-                    catch (MiniDynRuntimeError ex)
-                    {
-                        AttachErrorContext(ex);
-                        throw;
-                    }
-                    finally
-                    {
-                        _callStack.Pop();
-                    }
-                }
-                else
-                {
-                    var processedArgs = new List<Value>();
-                    foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
-
-                    if (receiver.Type != ValueType.Nil && userFn2.FunctionKind == UserFunction.Kind.Normal)
-                        fn = userFn2.BindThis(receiver);
-
-                    if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                    string fnName = !string.IsNullOrEmpty(userFn2.Name) ? userFn2.Name : "<anonymous>";
-                    var callSite = callExpr?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(fnName, callSite));
-                    try
-                    {
-                        return fn.Call(this, processedArgs);
-                    }
-                    catch (MiniDynRuntimeError ex)
-                    {
-                        AttachErrorContext(ex);
-                        throw;
-                    }
-                    finally
-                    {
-                        _callStack.Pop();
-                    }
-                }
-            }
-            else if (fn is BytecodeFunction byteFn2)
-            {
-                List<Value> processedArgs;
-                if (callExpr.Args.Any(a => a.IsNamed) || (byteFn2.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
-                    processedArgs = BuildPositionalArgsForBytecode(byteFn2.Params, callExpr.Args);
-                else
-                {
-                    processedArgs = new List<Value>();
-                    foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
-                }
-
-                if (receiver.Type != ValueType.Nil && byteFn2.FunctionKind == UserFunction.Kind.Normal)
-                    fn = byteFn2.BindThis(receiver);
-
-                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                string fnName = "<anonymous>";
-                var callSite = callExpr?.Span ?? default(SourceSpan);
-                _callStack.Push(new CallFrame(fnName, callSite));
-                try
-                {
-                    return fn.Call(this, processedArgs);
-                }
-                catch (MiniDynRuntimeError ex)
-                {
-                    AttachErrorContext(ex);
-                    throw;
-                }
-                finally
-                {
-                    _callStack.Pop();
-                }
-            }
-            else
-            {
-                if (callExpr.Args.Any(a => a.IsNamed))
-                    throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-
-                var processedArgs = new List<Value>();
-                foreach (var a in callExpr.Args) processedArgs.Add(Evaluate(a.Value));
-
-                if (processedArgs.Count < fn.ArityMin || processedArgs.Count > fn.ArityMax)
-                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {processedArgs.Count}");
-
-                string fnName = fn is BuiltinFunction bf ? bf.Name : "<anonymous>";
-                var callSite = callExpr?.Span ?? default(SourceSpan);
-                _callStack.Push(new CallFrame(fnName, callSite));
-                try
-                {
-                    return fn.Call(this, processedArgs);
-                }
-                catch (MiniDynRuntimeError ex)
-                {
-                    AttachErrorContext(ex);
-                    throw;
-                }
-                finally
-                {
-                    _callStack.Pop();
-                }
-            }
         }
 
         public object VisitFunction(Stmt.Function s)
@@ -7694,81 +7641,10 @@ namespace MiniDynLang
 
         public Value VisitCall(Expr.Call e)
         {
-            // Prepare callee once (handles property/index, optional chaining, receiver)
             if (!TryPrepareCalleeForCall(e.Callee, out var calleeVal, out var receiver, out var shortCircuitToNil))
                 throw new MiniDynRuntimeError("Invalid callee");
-
             if (shortCircuitToNil) return Value.Nil();
-            if (calleeVal.Type != ValueType.Function)
-                throw new MiniDynRuntimeError("Can only call functions");
-
-            var fn = calleeVal.AsFunction();
-
-            // UserFunction: support named args via mapping
-            if (fn is UserFunction uf)
-            {
-                if (e.Args.Any(a => a.IsNamed))
-                {
-                    var mapping = BuildArgMapping(ToParamViews(uf.Params), e.Args);
-                    if (receiver.Type != ValueType.Nil && uf.FunctionKind == UserFunction.Kind.Normal)
-                        uf = uf.BindThis(receiver);
-                    var callSite = e?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
-                    try { return uf.CallWithMapping(this, mapping); }
-                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
-                    finally { _callStack.Pop(); }
-                }
-                else
-                {
-                    var args = new List<Value>(e.Args.Count);
-                    foreach (var a in e.Args) args.Add(Evaluate(a.Value));
-                    if (receiver.Type != ValueType.Nil && uf.FunctionKind == UserFunction.Kind.Normal)
-                        fn = uf.BindThis(receiver);
-                    if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
-                        throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
-                    var callSite = e?.Span ?? default(SourceSpan);
-                    _callStack.Push(new CallFrame(!string.IsNullOrEmpty(uf.Name) ? uf.Name : "<anonymous>", callSite));
-                    try { return fn.Call(this, args); }
-                    catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
-                    finally { _callStack.Pop(); }
-                }
-            }
-
-            // BytecodeFunction: map named args to positional if needed
-            if (fn is BytecodeFunction bf)
-            {
-                List<Value> args;
-                if (e.Args.Any(a => a.IsNamed) || (bf.Params?.Any(p => p.Default != null || p.IsRest) ?? false))
-                    args = BuildPositionalArgsForBytecode(bf.Params, e.Args);
-                else
-                {
-                    args = new List<Value>(e.Args.Count);
-                    foreach (var a in e.Args) args.Add(Evaluate(a.Value));
-                }
-                if (receiver.Type != ValueType.Nil && bf.FunctionKind == UserFunction.Kind.Normal)
-                    fn = bf.BindThis(receiver);
-                if (args.Count < fn.ArityMin || args.Count > fn.ArityMax)
-                    throw new MiniDynRuntimeError($"Function {fn} expected {fn.ArityMin}..{(fn.ArityMax == int.MaxValue ? "∞" : fn.ArityMax.ToString())} args, got {args.Count}");
-                var callSite = e?.Span ?? default(SourceSpan);
-                _callStack.Push(new CallFrame("<anonymous>", callSite));
-                try { return fn.Call(this, args); }
-                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
-                finally { _callStack.Pop(); }
-            }
-
-            // Builtins: no named args
-            if (e.Args.Any(a => a.IsNamed))
-                throw new MiniDynRuntimeError("Built-in functions do not support named arguments");
-            {
-                var args = new List<Value>(e.Args.Count);
-                foreach (var a in e.Args) args.Add(Evaluate(a.Value));
-                var callSite = e?.Span ?? default(SourceSpan);
-                var name = (fn is BuiltinFunction bf2) ? bf2.Name : "<anonymous>";
-                _callStack.Push(new CallFrame(name, callSite));
-                try { return fn.Call(this, args); }
-                catch (MiniDynRuntimeError ex) { AttachErrorContext(ex); throw; }
-                finally { _callStack.Pop(); }
-            }
+            return InvokeFunction(calleeVal, receiver, e.Args, e?.Span ?? default(SourceSpan), inTailPosition: false);
         }
 
         // Helper used by VisitReturn to evaluate a call's callee once,
