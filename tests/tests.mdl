@@ -1146,6 +1146,124 @@ test_eq("repeat", repeat("ab", 3), "ababab");
 // Pretty printing
 test_eq("pprint returns nil", type(pprint({ a: 1, b: [2, 3] })), "nil");
 
+// --- Extended Standard Library: Paths/FS utils, Date/Time, Codecs, URL, UUID, Hashes, Args ---
+section("StdLib: Path/FS utils, Date/Time, Codecs, URL, UUID, Hashes, Args");
+
+// Process args
+test_true("argv is array; script_path is non-empty string",
+    type(argv) == "array" and type(script_path) == "string" and length(script_path) > 0);
+
+// Paths/FS utilities
+test_true("path_is_absolute(cwd())", path_is_absolute(cwd()));
+test_true("path_is_absolute('foo') == false", not path_is_absolute("foo"));
+test_eq("path_join joins parts", path_basename(path_join("a", "b", "c.txt")), "c.txt");
+
+test_eq("path_extname('.txt')", path_extname("x.txt"), ".txt");
+test_eq("path_change_ext", path_extname(path_change_ext("a.log", "txt")), ".txt");
+
+test_eq("path_normalize('.') == cwd()", path_normalize("."), cwd());
+test_eq("path_resolve('..') yields absolute", path_is_absolute(path_resolve("..")), true);
+
+test_true("mkdir/remove/list_dir/copy_file/move/chdir roundtrip", (fn(){
+    let orig = cwd();
+    let root = path_join(orig, "tmp_stdlib_paths");
+    // clean start
+    try { remove(root, true); } catch (e) { /* ignore */ }
+    mkdir(root, true);
+
+    let sub1 = path_join(root, "sub1");
+    mkdir(sub1);
+    let f1 = path_join(root, "a.txt");
+    let f2 = path_join(root, "b.bin");
+    write_file(f1, "hello");
+    write_bytes(f2, [0,1,2,255]);
+
+    // dirname/basename
+    if (!(path_basename(sub1) == "sub1" and path_dirname(sub1) == root)) return false;
+
+    // list_dir names (sorted for determinism)
+    let names = sort(list_dir(root));
+    if (!deep_equal(names, ["a.txt","b.bin","sub1"])) return false;
+
+    // list_dir full paths
+    let fulls = list_dir(root, true);
+    // every entry should start with root + separator (use starts_with)
+    let ok_full = true;
+    let i = 0;
+    while (i < length(fulls)) { if (!starts_with(fulls[i], root)) ok_full = false; i = i + 1; }
+    if (!ok_full) return false;
+
+    // copy and move
+    let f1copy = path_join(root, "a_copy.txt");
+    copy_file(f1, f1copy, true);
+    if (!exists(f1copy)) return false;
+
+    let f1moved = path_join(sub1, "a_moved.txt");
+    move(f1copy, f1moved);
+    if (!(exists(f1moved) and not exists(f1copy))) return false;
+
+    // chdir into sub1 and back
+    try {
+        chdir(sub1);
+        if (!ends_with(cwd(), "sub1")) return false;
+    } finally {
+        chdir(orig);
+    }
+
+    // cleanup
+    remove(root, true);
+    return not exists(root);
+})());
+
+// Date/Time formatting and parsing
+test_eq("format_date epoch (O)", format_date(0, "O"), "1970-01-01T00:00:00.0000000+00:00");
+test_eq("parse_date '1970-01-01T00:00:00Z' == 0", parse_date("1970-01-01T00:00:00Z"), 0);
+test_true("now_iso ends with +00:00", ends_with(now_iso(), "+00:00"));
+
+// URL encoding/decoding
+test_eq("url_encode 'hello world!?'",
+    url_encode("hello world!?"), "hello%20world%21%3F");
+test_eq("url_encode unicode 'café'",
+    url_encode("café"), "caf%C3%A9");
+test_eq("url_decode 'caf%C3%A9' -> 'café'",
+    url_decode("caf%C3%A9"), "café");
+
+// Base64 (string and bytes)
+test_eq("base64_encode('hello')", base64_encode("hello"), "aGVsbG8=");
+test_eq("base64_decode('aGVsbG8=')", base64_decode("aGVsbG8="), "hello");
+test_eq("base64 bytes roundtrip",
+    base64_decode_bytes(base64_encode_bytes([0,1,2,255])), [0,1,2,255]);
+
+// Hex (bytes)
+test_eq("hex_encode_bytes [0,1,2,255]", hex_encode_bytes([0,1,2,255]), "000102ff");
+test_eq("hex_decode_bytes '000102ff'", hex_decode_bytes("000102ff"), [0,1,2,255]);
+
+// UUID v4
+test_true("uuid_v4 returns 36-char with hyphens", (fn(){
+    let u = uuid_v4();
+    return length(u) == 36 and contains(u, "-");
+})());
+test_true("uuid_v4 uniqueness", (fn(){
+    let a = uuid_v4(); let b = uuid_v4();
+    return a != b;
+})());
+
+// Crypto hashes (known test vectors for 'abc')
+test_eq("md5('abc')",
+    md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+test_eq("sha1('abc')",
+    sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+test_eq("sha256('abc')",
+    sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+test_eq("sha512('abc')",
+    sha512("abc"),
+    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a" +
+    "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+
+// Hash bytes vs string consistency: hex('616263') == 'abc'
+test_eq("sha256_bytes(hex('616263')) == sha256('abc')",
+    sha256_bytes(hex_decode_bytes("616263")), sha256("abc"));
+
 // --- Summary -----------------------------------------------------------------
 println();
 println("===== SUMMARY =====");

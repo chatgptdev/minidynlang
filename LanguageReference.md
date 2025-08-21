@@ -241,73 +241,232 @@ println(m.sub(5,2));  // 3
 ````
 
 13. Standard library (built-ins)
-I/O and timing
-- print(...args): writes without newline; returns nil.
-- println(...args): writes with newline; returns nil.
-- gets(): reads a line from stdin; returns string or nil at EOF.
-- now_ms(): current UTC milliseconds since epoch.
-- sleep_ms(ms): blocks the thread for ms.
+Notes
+- All built-ins are available in the global scope.
+- Arity is shown as name(arg1, arg2=optional, ...varargs).
+- Unless stated, built-ins do not accept named arguments.
+- Nil is falsey; empty string is falsey; 0 is falsey; arrays/objects/functions are truthy.
+- Indices are 0-based. Functions that mention “negative index allowed” accept negative indices as “from the end”.
 
-Type and conversion
-- type(x): "nil" | "boolean" | "number" | "string" | "function" | "array" | "object"
-- to_number(x): number or nil (strings parsed to number; booleans to 0/1; nil -> 0)
+## Core
+- length(x): number
+  - String length; array length; object property count.
+  - Boolean/number/function => 1; nil => 0; otherwise 0.
+- type(x): string
+  - Returns "number", "string", "boolean", "nil", "function", "array", or "object".
+- to_number(x): number|nil
+  - String parsed as int/bigint/double; boolean => 1/0; nil => 0; other => 0.
 - to_string(x): string
+  - Stringifies value (arrays/objects printed with cycle-safe printer).
+- print(...args): nil
+  - Writes args joined by a single space, no newline.
+- println(...args): nil
+  - Writes args joined by a single space with trailing newline.
+- gets(): string|nil
+  - Reads a line from stdin (nil on EOF).
 
-Numbers and math
-- abs(x), floor(x), ceil(x), round(x), sqrt(x)
-- pow(a, b)
-- min(a, ...), max(a, ...)
-- random(): [0,1)
-- srand(seed): set RNG seed
-
-Strings
-- substring(s, start[, len])
-- index_of(s, sub)
-- contains(s, sub)
-- starts_with(s, prefix), ends_with(s, suffix)
-- to_upper(s), to_lower(s), trim(s)
-- split(s, sep)
-- replace(s, find, repl)
-- repeat(s, count)
-- pad_start(s, len[, pad=" "]), pad_end(s, len[, pad=" "])
-
-Parsing and JSON
-- parse_int(s): integer number or nil
-- parse_float(s): floating number or nil
-- json_stringify(value[, pretty=false]): JSON string; throws on cyclic structures.
-- json_parse(s): parses JSON (null → nil; arrays/objects mapped accordingly)
-
-Arrays and objects
-- array(...items): constructs array
-- length(x): string/array/object length; nil→0; scalars→1
-- push(arr, ...values): append; returns new length
-- pop(arr): remove last; returns value or nil
-- slice(arrOrString, start[, end]): negative indices allowed
-- join(arr, sep): string
-- at(arr, index): returns element or nil (negative allowed)
-- set_at(arr, index, value): assign; returns value
-- clone(x): shallow clone for array/object; otherwise returns x
-- keys(obj): array of keys (in insertion order)
-- values(obj): array of values (in insertion order)
-- entries(obj): array of [key, value]
-- from_entries(arrayOfPairs): object
+## Objects
+- keys(obj): array<string>
+- values(obj): array<any>
+- entries(obj): array< [string, any] >
+- from_entries(arrOfPairs): object
 - has_key(obj, key): boolean
 - remove_key(obj, key): boolean
-- merge(obj1, obj2): shallow merge; obj2 overrides
+- merge(a, b): object
+  - Shallow: properties from b overwrite a.
+- deep_merge(a, b): object|array|any
+  - Objects merged recursively; arrays concatenated; otherwise b.
 
-Higher-order and utility
-- map(arr, fn): array
-- filter(arr, fn): array
-- reduce(arr, fn[, initial]): value
-- sort(arr[, comparator]): returns new sorted array (stable not guaranteed); comparator(a,b) returns negative/0/positive; default compares numbers/strings, then falls back to type name.
-- unique(arr): returns new array with unique elements (by value equality)
-- deep_equal(a, b): deep structural equality (handles cycles)
-- range(n) | range(start, end) | range(start, end, step): array of ints
+## Arrays
+- array(...items): array<any>
+- push(arr, ...items): number
+  - Appends; returns new length.
+- pop(arr): any|nil
+  - Removes and returns last element or nil if empty.
+- at(arr, index): any|nil
+  - Negative index allowed; nil if OOB.
+- set_at(arr, index, value): any
+  - Negative index allowed; throws if OOB.
+- slice(arrOrStr, start, endOptional): array<any>|string
+  - Negative indices allowed; end is exclusive and optional.
+- join(arr, sep): string
+  - Joins by sep, stringifying elements.
+- clone(x): any
+  - Array/object shallow clone; other values returned as-is.
+- map(arr, fn): array<any>
+- filter(arr, fn): array<any>
+- reduce(arr, fn, initialOptional): any
+  - Without initial: uses first element and starts at index 1.
+- sort(arr, compareFnOptional): array<any>
+  - Returns sorted copy. Default compare sorts numbers numerically, strings ordinally, else by type name.
+  - compareFn(a,b) returns negative/zero/positive like JS.
+- unique(arr): array<any>
+  - Dedup by value identity (numbers/strings by value; arrays/objects by reference).
+- some(arr, fn): boolean
+- every(arr, fn): boolean
+- find(arr, fn): any|nil
+- find_index(arr, fn): number
+  - -1 when not found.
+- range(end) → [0..end)
+- range(start, end) → [start..end)
+- range(start, end, step): array<number>
+  - step cannot be 0; works for negative steps.
 
-Errors
-- error(msg): returns error object {name:"Error", message:msg}
-- raise(msg): throws error(msg)
-- require(specifier): loads module (see Modules)
+## Strings
+- substring(str, start, lengthOptional): string
+- index_of(str, search): number
+  - -1 when not found.
+- contains(str, search): boolean
+- starts_with(str, prefix): boolean
+- ends_with(str, suffix): boolean
+- to_upper(str): string
+- to_lower(str): string
+- trim(str): string
+- split(str, sep): array<string>
+- replace(str, find, repl): string
+- repeat(str, count): string
+  - count < 0 treated as 0.
+- pad_start(str, len, pad=" "): string
+- pad_end(str, len, pad=" "): string
+
+## Numbers and Math
+- abs(x): number
+- floor(x): number
+- ceil(x): number
+- round(x): number
+- sqrt(x): number
+- pow(x, y): number
+- min(...values): number|nil
+- max(...values): number|nil
+- sin(x), cos(x), tan(x): number
+- asin(x), acos(x), atan(x): number
+- log(x), exp(x): number
+- sign(x): number
+  - Returns -1, 0, or 1 based on sign.
+- clamp(x, lo, hi): number
+  - If lo > hi, arguments are swapped.
+- random(): number
+  - Uniform in [0,1).
+- random_int(min, max): number
+  - Inclusive range; min/max order doesn’t matter.
+- srand(seed): nil
+  - Sets random() seed for this process.
+
+## Time and Dates
+- now_ms(): number
+  - Unix time in milliseconds (UTC).
+- sleep_ms(ms): nil
+- format_date(ms, format): string
+  - ms since epoch (UTC). Format uses .NET format strings with invariant culture.
+- parse_date(text): number
+  - Parses date/time; returns ms since epoch (UTC). Throws on invalid date.
+- now_iso(): string
+  - ISO 8601 UTC timestamp.
+
+## JSON
+- json_stringify(value, pretty=false): string
+  - Throws on cyclic structures.
+- json_parse(text): any
+  - Parses JSON into MiniDyn values. Throws on invalid JSON.
+
+## URL and Regex
+- url_encode(text): string
+- url_decode(text): string
+- regex_match(text, pattern, flagsOptional): boolean
+- regex_replace(text, pattern, repl, flagsOptional): string
+- match(text, pattern, flagsOptional): array<string>
+  - Returns all full-match substrings (no capture groups).
+- Regex flags: i (ignore case), m (multiline), s (singleline). Culture-invariant.
+
+## Encoding, Bytes and Crypto
+Byte arrays are represented as arrays of numbers 0..255.
+
+- read_bytes(path): array<number>
+- write_bytes(path, bytes): nil
+  - Throws if any element is outside 0..255.
+- base64_encode(textUtf8): string
+- base64_decode(b64): string
+  - Throws "invalid base64" on error.
+- base64_encode_bytes(bytes): string
+- base64_decode_bytes(b64): array<number>
+  - Throws "invalid base64" on error.
+- hex_encode_bytes(bytes): string
+  - Lowercase hex.
+- hex_decode_bytes(hex): array<number>
+  - Even-length hex required; throws on invalid hex.
+- md5(text), sha1(text), sha256(text), sha512(text): string
+  - Returns lowercase hex of hash (UTF-8 of text).
+- md5_bytes(bytes), sha1_bytes(bytes), sha256_bytes(bytes), sha512_bytes(bytes): string
+  - Returns lowercase hex of hash.
+
+## UUID
+- uuid_v4(): string
+  - Lowercase 36-char canonical form.
+
+## File System
+- read_file(path): string
+- write_file(path, text): nil
+- exists(path): boolean
+  - True for existing file or directory.
+- copy_file(src, dst, overwrite=false): nil
+- move(src, dst): nil
+  - Works for files or directories. Throws if source does not exist.
+- remove(path, recursive=false): boolean
+  - Deletes file or directory; returns true if deleted, false if not found.
+- mkdir(path, recursive=false): boolean
+  - Non-recursive: returns false if already exists; true if created.
+  - Recursive: always creates (returns true).
+- list_dir(path, full=false): array<string>
+  - Throws if directory doesn’t exist. full=true returns absolute paths.
+- chdir(path): nil
+- cwd(): string
+
+## Paths
+- path_join(...parts): string
+- path_dirname(path): string
+- path_basename(path): string
+- path_extname(path): string
+- path_change_ext(path, newExt): string
+  - newExt may omit '.' (it will be added).
+- path_normalize(path): string
+  - Returns canonical full path.
+- path_resolve(path): string
+  - Alias of normalize.
+- path_is_absolute(path): boolean
+
+## Environment
+- env_get(name): string|nil
+- env_set(name, valueOrNil): nil
+  - Set to nil to unset.
+
+## Modules
+- require(specifier): any
+  - Resolves using the host module loader.
+  - Resolution: absolute path; or relative to the caller’s directory; supports implicit extensions ["", ".mdl", ".minidyn"]; index files inside directories (index, index.mdl, index.minidyn).
+  - Exposes CommonJS-like exports via `module.exports` or `exports`.
+
+## HTTP (host-provided, disabled by default)
+- http_get(url): string
+- http_post(url, body, contentType="application/json"): string
+  - Throws "HTTP is disabled" if no network client was configured by the host.
+
+## Errors and Exceptions
+- error(message): object
+  - Constructs an Error object { name, message }.
+- raise(message): never
+  - Throws an Error object created with error(message).
+
+## Equality and Utilities
+- deep_equal(a, b): boolean
+  - Structural deep equality with cycle detection.
+- pprint(x): nil
+  - Pretty-prints JSON when possible; falls back to string representation.
+
+## Parsing Helpers
+- parse_int(text): number|nil
+  - Parses int/bigint; returns nil on failure.
+- parse_float(text): number|nil
+  - Parses floating point; returns nil on failure.
 
 14. Semantics details and edge cases
 - let TDZ: reading a let/const name before its first assignment throws “Cannot access 'name' before initialization”.

@@ -9,6 +9,7 @@ using System.Text;
 using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
 
 namespace MiniDynLang
 {
@@ -4110,6 +4111,261 @@ namespace MiniDynLang
                 File.WriteAllBytes(p, bytes);
                 return Value.Nil();
             });
+
+            // path_join(...parts)
+            Def("path_join", 1, int.MaxValue, (interp, a) =>
+            {
+                var parts = a.Select(v => v.AsString()).ToArray();
+                return Value.String(Path.Combine(parts));
+            });
+
+            Def("path_dirname", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                var d = Path.GetDirectoryName(p) ?? "";
+                return Value.String(d);
+            });
+
+            Def("path_basename", 1, 1, (interp, a) => Value.String(Path.GetFileName(a[0].AsString())));
+
+            Def("path_extname", 1, 1, (interp, a) => Value.String(Path.GetExtension(a[0].AsString())));
+
+            Def("path_change_ext", 2, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                var ext = a[1].AsString();
+                if (!ext.StartsWith(".")) ext = "." + ext;
+                return Value.String(Path.ChangeExtension(p, ext));
+            });
+
+            Def("path_normalize", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                // Normalize to a canonical full path
+                return Value.String(Path.GetFullPath(p));
+            });
+
+            Def("path_is_absolute", 1, 1, (interp, a) => Value.Boolean(Path.IsPathRooted(a[0].AsString())));
+
+            Def("path_resolve", 1, 1, (interp, a) => Value.String(Path.GetFullPath(a[0].AsString())));
+
+            // chdir(path)
+            Def("chdir", 1, 1, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                Directory.SetCurrentDirectory(p);
+                return Value.Nil();
+            });
+
+            // mkdir(path, recursive=false)
+            Def("mkdir", 1, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                bool recursive = a.Count == 2 && Value.IsTruthy(a[1]);
+                if (recursive)
+                {
+                    Directory.CreateDirectory(p);
+                    return Value.Boolean(true);
+                }
+                else
+                {
+                    if (Directory.Exists(p)) return Value.Boolean(false);
+                    Directory.CreateDirectory(p);
+                    return Value.Boolean(true);
+                }
+            });
+
+            // remove(path, recursive=false)
+            Def("remove", 1, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                bool recursive = a.Count == 2 && Value.IsTruthy(a[1]);
+                if (File.Exists(p))
+                {
+                    File.Delete(p);
+                    return Value.Boolean(true);
+                }
+                if (Directory.Exists(p))
+                {
+                    Directory.Delete(p, recursive);
+                    return Value.Boolean(true);
+                }
+                return Value.Boolean(false);
+            });
+
+            // copy_file(src, dst, overwrite=false)
+            Def("copy_file", 2, 3, (interp, a) =>
+            {
+                var src = a[0].AsString();
+                var dst = a[1].AsString();
+                bool overwrite = a.Count == 3 && Value.IsTruthy(a[2]);
+                File.Copy(src, dst, overwrite);
+                return Value.Nil();
+            });
+
+            // move(src, dst) for files or directories
+            Def("move", 2, 2, (interp, a) =>
+            {
+                var src = a[0].AsString();
+                var dst = a[1].AsString();
+                if (File.Exists(src))
+                    File.Move(src, dst);
+                else if (Directory.Exists(src))
+                    Directory.Move(src, dst);
+                else
+                    throw new MiniDynRuntimeError("move: source does not exist");
+                return Value.Nil();
+            });
+
+            // list_dir(path, full=false)
+            Def("list_dir", 1, 2, (interp, a) =>
+            {
+                var p = a[0].AsString();
+                bool full = a.Count == 2 && Value.IsTruthy(a[1]);
+                if (!Directory.Exists(p)) throw new MiniDynRuntimeError("list_dir: directory does not exist");
+                var items = Directory.EnumerateFileSystemEntries(p);
+                var arr = new ArrayValue();
+                foreach (var it in items)
+                {
+                    arr.Items.Add(Value.String(full ? it : Path.GetFileName(it)));
+                }
+                return Value.Array(arr);
+            });
+
+            // format_date(ms, format)
+            Def("format_date", 2, 2, (interp, a) =>
+            {
+                var ms = (long)RuntimeOps.ToNumber(a[0]).ToDoubleNV().Dbl;
+                var fmt = a[1].AsString();
+                var dto = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+                return Value.String(dto.ToString(fmt, CultureInfo.InvariantCulture));
+            });
+
+            // parse_date(text) -> ms since epoch (UTC)
+            Def("parse_date", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                if (DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto))
+                {
+                    return Value.Number(NumberValue.FromLong(dto.ToUnixTimeMilliseconds()));
+                }
+                throw new MiniDynRuntimeError("Invalid date string");
+            });
+
+            // now_iso() -> ISO8601 UTC
+            Def("now_iso", 0, 0, (interp, a) => Value.String(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture)));
+
+            // URL encoding
+            Def("url_encode", 1, 1, (interp, a) => Value.String(Uri.EscapeDataString(a[0].AsString())));
+            Def("url_decode", 1, 1, (interp, a) => Value.String(Uri.UnescapeDataString(a[0].AsString())));
+
+            // helpers
+            Func<ArrayValue, byte[]> ToBytes = (arr) =>
+            {
+                var bytes = new byte[arr.Length];
+                for (int k = 0; k < arr.Length; k++)
+                {
+                    var d = RuntimeOps.ToNumber(arr[k]).ToDoubleNV().Dbl;
+                    if (d < 0 || d > 255) throw new MiniDynRuntimeError("byte value must be 0..255");
+                    bytes[k] = (byte)d;
+                }
+                return bytes;
+            };
+            Func<byte[], ArrayValue> FromBytes = (bytes) =>
+            {
+                var arr = new ArrayValue();
+                foreach (var b in bytes) arr.Items.Add(Value.Number(NumberValue.FromLong(b)));
+                return arr;
+            };
+            Func<byte[], string> ToHex = (bytes) =>
+            {
+                var sb = new StringBuilder(bytes.Length * 2);
+                foreach (var b in bytes) sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                return sb.ToString();
+            };
+            Func<string, byte[]> FromHex = (hex) =>
+            {
+                if (hex == null) hex = "";
+                if ((hex.Length & 1) != 0) throw new MiniDynRuntimeError("hex string must have even length");
+                var bytes = new byte[hex.Length / 2];
+                for (int i2 = 0; i2 < bytes.Length; i2++)
+                {
+                    string pair = hex.Substring(i2 * 2, 2);
+                    if (!byte.TryParse(pair, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var b))
+                        throw new MiniDynRuntimeError("invalid hex string");
+                    bytes[i2] = b;
+                }
+                return bytes;
+            };
+
+            // base64 for strings (UTF-8)
+            Def("base64_encode", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                return Value.String(Convert.ToBase64String(Encoding.UTF8.GetBytes(s)));
+            });
+            Def("base64_decode", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                try
+                {
+                    var bytes = Convert.FromBase64String(s);
+                    return Value.String(Encoding.UTF8.GetString(bytes));
+                }
+                catch { throw new MiniDynRuntimeError("invalid base64"); }
+            });
+
+            // base64 for bytes
+            Def("base64_encode_bytes", 1, 1, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                return Value.String(Convert.ToBase64String(ToBytes(arr)));
+            });
+            Def("base64_decode_bytes", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                try
+                {
+                    var bytes = Convert.FromBase64String(s);
+                    return Value.Array(FromBytes(bytes));
+                }
+                catch { throw new MiniDynRuntimeError("invalid base64"); }
+            });
+
+            // hex for bytes
+            Def("hex_encode_bytes", 1, 1, (interp, a) =>
+            {
+                var arr = a[0].AsArray();
+                return Value.String(ToHex(ToBytes(arr)));
+            });
+            Def("hex_decode_bytes", 1, 1, (interp, a) =>
+            {
+                var s = a[0].AsString();
+                return Value.Array(FromBytes(FromHex(s)));
+            });
+
+            // UUID v4
+            Def("uuid_v4", 0, 0, (interp, a) => Value.String(Guid.NewGuid().ToString("D")));
+
+            // Crypto hashes (string -> hex, UTF-8)
+            Value HashString(string s, HashAlgorithm algo)
+            {
+                using (algo) { return Value.String(ToHex(algo.ComputeHash(Encoding.UTF8.GetBytes(s)))); }
+            }
+            Value HashBytes(ArrayValue arr, HashAlgorithm algo)
+            {
+                using (algo) { return Value.String(ToHex(algo.ComputeHash(ToBytes(arr)))); }
+            }
+            Def("md5", 1, 1, (interp, a) => HashString(a[0].AsString(), MD5.Create()));
+            Def("sha1", 1, 1, (interp, a) => HashString(a[0].AsString(), SHA1.Create()));
+            Def("sha256", 1, 1, (interp, a) => HashString(a[0].AsString(), SHA256.Create()));
+            Def("sha512", 1, 1, (interp, a) => HashString(a[0].AsString(), SHA512.Create()));
+
+            Def("md5_bytes", 1, 1, (interp, a) => HashBytes(a[0].AsArray(), MD5.Create()));
+            Def("sha1_bytes", 1, 1, (interp, a) => HashBytes(a[0].AsArray(), SHA1.Create()));
+            Def("sha256_bytes", 1, 1, (interp, a) => HashBytes(a[0].AsArray(), SHA256.Create()));
+            Def("sha512_bytes", 1, 1, (interp, a) => HashBytes(a[0].AsArray(), SHA512.Create()));
 
             // === Paths / Env ===
             Def("cwd", 0, 0, (interp, a) => Value.String(Directory.GetCurrentDirectory()));
@@ -8442,7 +8698,7 @@ namespace MiniDynLang
 
     class Program
     {
-        static void RunFile(string filePath)
+        static void RunFile(string filePath, string[] scriptArgs)
         {
             if (!File.Exists(filePath))
             {
@@ -8456,6 +8712,13 @@ namespace MiniDynLang
             var loader = new FileSystemModuleLoader();
             var net = new HttpWebClient();
             var interp = new Interpreter(loader, net);
+
+            // Inject process args and script path
+            var argvArr = new ArrayValue();
+            foreach (var s in (scriptArgs ?? Array.Empty<string>())) argvArr.Items.Add(Value.String(s));
+            interp.Globals.DefineVar("argv", Value.Array(argvArr));
+            interp.Globals.DefineVar("script_path", Value.String(filePath));
+
             interp.Interpret(program);
         }
 
@@ -8465,6 +8728,12 @@ namespace MiniDynLang
             var loader = new FileSystemModuleLoader();
             var net = new HttpWebClient();
             var interp = new Interpreter(loader, net);
+
+            // Inject empty argv and a virtual script_path for REPL
+            var argvArr = new ArrayValue();
+            interp.Globals.DefineVar("argv", Value.Array(argvArr));
+            interp.Globals.DefineVar("script_path", Value.String("<repl>"));
+
             while (true)
             {
                 Console.Write("> ");
@@ -8512,7 +8781,8 @@ namespace MiniDynLang
                 }
                 else
                 {
-                    RunFile(args[0]);
+                    // args[0] is script path; the rest become argv
+                    RunFile(args[0], args.Skip(1).ToArray());
                 }
             }
             catch (Interpreter.ThrowSignal ex)
